@@ -17,9 +17,13 @@ Design-fit sonnet/high, Cleanliness sonnet/high) over that shared seed — each
 bounded by its own token cap and timeout — then runs a 4th synthesis ``claude -p``
 pass that dedups overlapping findings across lenses, ranks by severity, writes the
 verdict, and formats the review (findings grouped by severity, each tagged with the
-originating lens).  Exactly one PR review is posted.  A failure in any single lens
-is isolated (logged, that lens dropped); the pipeline only skips posting when every
-lens fails or the synthesis pass itself aborts.  Nothing here ever crashes the worker.
+originating lens).  Exactly one PR review is posted: findings on a changed diff line
+ride as inline comments in that same submission, while off-diff (or unparseable-
+location) findings are rendered in the review body.  On a new push the prior review's
+inline comments are deleted before the fresh set is posted.  A failure in any single
+lens is isolated (logged, that lens dropped); the pipeline only skips posting when
+every lens fails or the synthesis pass itself aborts.  Nothing here ever crashes the
+worker.
 
 The whole review pipeline is wrapped in a per-review wall-clock timeout (distinct
 from, and looser than, the per-lens timeout) and retried exactly once on any
@@ -51,6 +55,12 @@ from heimdall.db import (
     get_posted_review,
     set_last_reviewed_sha,
     set_posted_review,
+)
+from heimdall.diff_anchor import (
+    build_inline_comments,
+    commentable_lines,
+    render_body_for_offdiff,
+    split_findings,
 )
 from heimdall.github import GitHubClient
 from heimdall.lens import (
@@ -117,8 +127,10 @@ async def run_review(
     by severity, writes the verdict (REQUEST_CHANGES for a high/critical survivor,
     else COMMENT), and formats the severity-grouped, lens-tagged review body — under
     a per-review wall-clock timeout, retrying the whole pipeline exactly once on any
-    failure/timeout.  On success it retires any prior Heimdall review, posts exactly
-    one PR review, and records the SHA.  If every lens fails, the synthesis pass
+    failure/timeout.  On success it retires any prior Heimdall review and deletes its
+    inline comments, posts exactly one PR review (findings on changed diff lines as
+    inline comments in the same submission, off-diff findings in the body), and
+    records the SHA.  If every lens fails, the synthesis pass
     aborts, or the retry also times out/fails, a terse "review failed" COMMENT note
     is posted and the SHA recorded so the failed commit is not endlessly re-reviewed.
 
@@ -176,27 +188,38 @@ async def run_review(
             return
 
         # Across-push lifecycle: retire the prior Heimdall review (dismiss a
-        # REQUEST_CHANGES, minimize a COMMENT) before posting so only the latest
-        # review stays active.
+        # REQUEST_CHANGES, minimize a COMMENT) and delete its now-stale inline
+        # comments before posting, so only the latest review stays active.
         await _refresh_prior_review(
             github_client,
             db,
             repo_full_name=repo_full_name,
             pr_number=pr_number,
         )
+        # Anchor findings to changed diff lines: those on a changed line become
+        # inline comments in the same submission; off-diff (or unparseable) ones
+        # fall back to the review body.
+        body, inline_comments = await _build_inline_split(
+            github_client,
+            synthesis,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+        )
         logger.info(
-            "Posting %s review for %s#%d @ %s",
+            "Posting %s review for %s#%d @ %s (%d inline comments)",
             synthesis.verdict,
             repo_full_name,
             pr_number,
             head_sha,
+            len(inline_comments),
         )
         posted = await github_client.post_review(
             repo_full_name=repo_full_name,
             pr_number=pr_number,
             commit_id=head_sha,
-            body=synthesis.body,
+            body=body,
             event=synthesis.verdict,
+            comments=inline_comments,
         )
         await set_posted_review(
             db,
@@ -236,6 +259,16 @@ async def _refresh_prior_review(
     if prior is None:
         return
 
+    # Inline comments are review-comment objects separate from the review body, so
+    # retiring the body does not remove them — delete the prior review's inline
+    # comments explicitly so stale comments don't accumulate across pushes.
+    await _delete_prior_inline_comments(
+        github_client,
+        repo_full_name=repo_full_name,
+        pr_number=pr_number,
+        review_id=int(prior["review_id"]),
+    )
+
     if prior["verdict"] == "REQUEST_CHANGES":
         await github_client.dismiss_review(
             repo_full_name=repo_full_name,
@@ -245,6 +278,58 @@ async def _refresh_prior_review(
         )
     else:
         await github_client.minimize_review(node_id=str(prior["node_id"]))
+
+
+async def _delete_prior_inline_comments(
+    github_client: GitHubClient,
+    *,
+    repo_full_name: str,
+    pr_number: int,
+    review_id: int,
+) -> None:
+    """Delete every inline comment attached to a prior review.
+
+    Lists the prior review's inline comments by its REST id and deletes each one,
+    so the fresh push starts from a clean slate of inline comments.  A failure to
+    delete an individual comment is logged and skipped rather than aborting the
+    post — a leftover stale comment is preferable to a missing fresh review.
+    """
+    comments = await github_client.list_review_comments(
+        repo_full_name=repo_full_name,
+        pr_number=pr_number,
+        review_id=review_id,
+    )
+    for comment in comments:
+        await github_client.delete_review_comment(
+            repo_full_name=repo_full_name,
+            comment_id=int(comment["id"]),
+        )
+
+
+async def _build_inline_split(
+    github_client: GitHubClient,
+    synthesis: SynthesisResult,
+    *,
+    repo_full_name: str,
+    pr_number: int,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Split synthesis findings into a body + inline-comment array for the post.
+
+    Fetches the PR's unified diff, parses the lines a comment can anchor to, then
+    routes each survivor: findings on a changed line become inline comments
+    attached to the same review submission; off-diff or unparseable-location
+    findings are rendered into the body.
+
+    Returns:
+        ``(body, comments)`` ready for :meth:`GitHubClient.post_review`.
+    """
+    diff = await github_client.get_pr_diff(
+        repo_full_name=repo_full_name, pr_number=pr_number
+    )
+    commentable = commentable_lines(diff)
+    inline, body_findings = split_findings(synthesis.tagged_findings, commentable)
+    body = render_body_for_offdiff(body_findings)
+    return body, build_inline_comments(inline)
 
 
 async def _run_pipeline_with_retry(

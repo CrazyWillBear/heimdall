@@ -131,8 +131,15 @@ class GitHubClient:
         commit_id: str,
         body: str,
         event: str,
+        comments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Post a pull-request review via the GitHub REST API.
+
+        The optional ``comments`` array attaches line-anchored inline comments in
+        the SAME review submission (GitHub's create-review ``comments`` field), so
+        the body and its inline comments land atomically rather than as separate
+        calls.  Each entry is a dict with ``path``, ``line``, ``side``, and ``body``
+        (the shape produced by :func:`heimdall.diff_anchor.build_inline_comments`).
 
         Args:
             repo_full_name: e.g. "owner/repo".
@@ -140,12 +147,20 @@ class GitHubClient:
             commit_id: The head commit SHA the review targets.
             body: Review body text.
             event: One of APPROVE, REQUEST_CHANGES, COMMENT.
+            comments: Optional inline comments to attach to this submission.
 
         Returns:
             The parsed JSON response from GitHub.
         """
         token = await self.get_installation_token()
         url = f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/reviews"
+        payload: dict[str, Any] = {
+            "commit_id": commit_id,
+            "body": body,
+            "event": event,
+        }
+        if comments:
+            payload["comments"] = comments
         response = await self._http.post(
             url,
             headers={
@@ -153,7 +168,7 @@ class GitHubClient:
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
-            json={"commit_id": commit_id, "body": body, "event": event},
+            json=payload,
         )
         response.raise_for_status()
         result: dict[str, Any] = response.json()
@@ -218,6 +233,67 @@ class GitHubClient:
         payload: dict[str, Any] = response.json()
         if payload.get("errors"):
             raise RuntimeError(f"GraphQL minimizeComment failed: {payload['errors']}")
+
+    async def list_review_comments(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+        review_id: int,
+    ) -> list[dict[str, Any]]:
+        """List the inline comments attached to a specific PR review.
+
+        Used on a new push to find the prior review's inline comments so they can
+        be deleted before the fresh set is posted.  Follows pagination so every
+        comment is returned even for a large prior review.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+            review_id: The REST review id whose comments to list.
+
+        Returns:
+            All inline-comment objects (each carrying an ``id``) for the review.
+        """
+        url: str | None = (
+            f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}"
+            f"/reviews/{review_id}/comments"
+        )
+        headers = await self._gh_headers()
+        all_comments: list[dict[str, Any]] = []
+        first_page = True
+        while url is not None:
+            kwargs: dict[str, Any] = {"headers": headers}
+            if first_page:
+                kwargs["params"] = {"per_page": 100}
+                first_page = False
+            response = await self._http.get(url, **kwargs)
+            response.raise_for_status()
+            all_comments.extend(response.json())
+            url = self._next_page_url(response.headers.get("link", ""))
+        return all_comments
+
+    async def delete_review_comment(
+        self,
+        *,
+        repo_full_name: str,
+        comment_id: int,
+    ) -> None:
+        """Delete a single PR review (inline) comment by its id.
+
+        Inline comments are review-comment objects distinct from the review body,
+        so retiring the prior review does not remove them — they must be deleted
+        explicitly on a new push to stop stale inline comments accumulating.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            comment_id: The id of the review comment to delete.
+        """
+        url = (
+            f"{self._BASE}/repos/{repo_full_name}/pulls/comments/{comment_id}"
+        )
+        response = await self._http.delete(url, headers=await self._gh_headers())
+        response.raise_for_status()
 
     async def _gh_headers(self) -> dict[str, str]:
         """Return GitHub API headers with a fresh installation token."""

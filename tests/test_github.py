@@ -72,6 +72,113 @@ async def test_post_review() -> None:
     assert sent_json["event"] == "COMMENT"
 
 
+@pytest.mark.asyncio
+async def test_post_review_attaches_inline_comments_in_same_submission() -> None:
+    """post_review attaches the comments array to the single create-review call."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value={"id": 1})
+
+    mock_http = AsyncMock()
+    mock_http.post = AsyncMock(return_value=mock_response)
+
+    comments = [{"path": "a.py", "line": 3, "side": "RIGHT", "body": "x"}]
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        await client.post_review(
+            repo_full_name="owner/repo",
+            pr_number=5,
+            commit_id="sha999",
+            body="body",
+            event="COMMENT",
+            comments=comments,
+        )
+
+    # Exactly one POST: the comments ride in the same create-review submission.
+    assert mock_http.post.await_count == 1
+    sent_json = mock_http.post.call_args[1]["json"]
+    assert sent_json["comments"] == comments
+
+
+@pytest.mark.asyncio
+async def test_post_review_omits_comments_key_when_none() -> None:
+    """With no inline comments, the JSON payload carries no ``comments`` key."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value={"id": 1})
+
+    mock_http = AsyncMock()
+    mock_http.post = AsyncMock(return_value=mock_response)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        await client.post_review(
+            repo_full_name="owner/repo",
+            pr_number=5,
+            commit_id="sha999",
+            body="body",
+            event="COMMENT",
+        )
+
+    assert "comments" not in mock_http.post.call_args[1]["json"]
+
+
+@pytest.mark.asyncio
+async def test_list_review_comments_hits_review_comments_endpoint() -> None:
+    """list_review_comments GETs the review's comments endpoint and returns the rows."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value=[{"id": 11}, {"id": 12}])
+    mock_response.headers = {}
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=mock_response)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        rows = await client.list_review_comments(
+            repo_full_name="owner/repo", pr_number=5, review_id=77
+        )
+
+    assert "pulls/5/reviews/77/comments" in mock_http.get.call_args[0][0]
+    assert rows == [{"id": 11}, {"id": 12}]
+
+
+@pytest.mark.asyncio
+async def test_delete_review_comment_hits_pulls_comments_endpoint() -> None:
+    """delete_review_comment DELETEs the pull review comment by id."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+
+    mock_http = AsyncMock()
+    mock_http.delete = AsyncMock(return_value=mock_response)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        await client.delete_review_comment(
+            repo_full_name="owner/repo", comment_id=101
+        )
+
+    assert "pulls/comments/101" in mock_http.delete.call_args[0][0]
+    mock_response.raise_for_status.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # Across-push review lifecycle: dismiss (REQUEST_CHANGES) / minimize (COMMENT)
 # ---------------------------------------------------------------------------

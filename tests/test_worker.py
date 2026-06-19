@@ -89,10 +89,21 @@ def _patch_review_pipeline(
     return stack, synth_mock
 
 
-def _gh_client(*, review_id: int = 1, node_id: str = "NODE") -> AsyncMock:
-    """Return a mock GitHubClient whose post_review yields an id and node_id."""
+def _gh_client(
+    *, review_id: int = 1, node_id: str = "NODE", diff: str = ""
+) -> AsyncMock:
+    """Return a mock GitHubClient whose post_review yields an id and node_id.
+
+    ``get_pr_diff`` returns ``diff`` (empty by default, i.e. no commentable lines so
+    every finding falls back to the body) and ``list_review_comments`` returns no
+    prior inline comments, so the post step's inline-comment split is exercised
+    without requiring each test to wire the diff API.
+    """
     client = AsyncMock()
     client.post_review = AsyncMock(return_value={"id": review_id, "node_id": node_id})
+    client.get_pr_diff = AsyncMock(return_value=diff)
+    client.list_review_comments = AsyncMock(return_value=[])
+    client.delete_review_comment = AsyncMock()
     return client
 
 
@@ -219,7 +230,7 @@ async def test_run_review_body_is_severity_grouped_and_lens_tagged() -> None:
 @pytest.mark.asyncio
 async def test_run_review_verdict_reflects_highest_surviving_severity() -> None:
     """A high/critical survivor of synthesis posts event=REQUEST_CHANGES."""
-    mock_gh_client = AsyncMock()
+    mock_gh_client = _gh_client()
     ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
 
     synthesis = _synthesis_from([_tagged(Severity.HIGH, "design", "x")])
@@ -677,6 +688,175 @@ async def test_run_review_first_review_does_not_refresh() -> None:
     mock_gh_client.dismiss_review.assert_not_called()
     mock_gh_client.minimize_review.assert_not_called()
     mock_gh_client.post_review.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Inline comments: anchor findings on changed lines; off-diff falls back to body;
+# a new push deletes prior inline comments then posts the fresh set.
+# ---------------------------------------------------------------------------
+
+_INLINE_DIFF = """\
+diff --git a/app/db.py b/app/db.py
+index 1111111..2222222 100644
+--- a/app/db.py
++++ b/app/db.py
+@@ -10,3 +10,4 @@ def q():
+     conn = get()
++    cur.execute("SELECT * FROM t WHERE id=" + id)
+     return cur
+"""
+
+
+@pytest.mark.asyncio
+async def test_run_review_anchors_changed_line_finding_as_inline_comment() -> None:
+    """A finding on a changed line is posted as an inline comment at that path:line."""
+    mock_gh_client = _gh_client(diff=_INLINE_DIFF)
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    # The added line in the diff is new-file line 11; anchor the finding there.
+    synthesis = _synthesis_from(
+        [
+            TaggedFinding(
+                lens="security",
+                finding=Finding(Severity.HIGH, "SQLi", "raw concat", "app/db.py:11"),
+            )
+        ]
+    )
+    with (
+        _patch_review_pipeline(synthesis_result=synthesis)[0],
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    posted = mock_gh_client.post_review.await_args.kwargs
+    comments = posted["comments"]
+    assert len(comments) == 1
+    assert comments[0]["path"] == "app/db.py"
+    assert comments[0]["line"] == 11
+    assert comments[0]["side"] == "RIGHT"
+    assert "SQLi" in comments[0]["body"]
+    # The anchored finding lives inline, not in the body.
+    assert "SQLi" not in posted["body"]
+
+
+@pytest.mark.asyncio
+async def test_run_review_off_diff_finding_falls_back_to_body() -> None:
+    """A finding on a line not present in the diff is rendered in the body, not inline."""
+    mock_gh_client = _gh_client(diff=_INLINE_DIFF)
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    # Line 999 is not in the diff -> body fallback.
+    synthesis = _synthesis_from(
+        [
+            TaggedFinding(
+                lens="design",
+                finding=Finding(Severity.MEDIUM, "OffDiff", "elsewhere", "app/db.py:999"),
+            )
+        ]
+    )
+    with (
+        _patch_review_pipeline(synthesis_result=synthesis)[0],
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    posted = mock_gh_client.post_review.await_args.kwargs
+    assert posted["comments"] == []
+    assert "OffDiff" in posted["body"]
+
+
+@pytest.mark.asyncio
+async def test_run_review_unparseable_location_falls_back_to_body() -> None:
+    """A finding with no/unparseable location is rendered in the body, never inline."""
+    mock_gh_client = _gh_client(diff=_INLINE_DIFF)
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    synthesis = _synthesis_from(
+        [
+            TaggedFinding(
+                lens="cleanliness",
+                finding=Finding(Severity.LOW, "NoLoc", "no location", None),
+            )
+        ]
+    )
+    with (
+        _patch_review_pipeline(synthesis_result=synthesis)[0],
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    posted = mock_gh_client.post_review.await_args.kwargs
+    assert posted["comments"] == []
+    assert "NoLoc" in posted["body"]
+
+
+@pytest.mark.asyncio
+async def test_run_review_push_deletes_prior_inline_comments_then_posts_fresh() -> None:
+    """A new push lists+deletes the prior review's inline comments before posting fresh."""
+    mock_gh_client = _gh_client(review_id=2, node_id="NODE2", diff=_INLINE_DIFF)
+    mock_gh_client.list_review_comments = AsyncMock(
+        return_value=[{"id": 101}, {"id": 102}]
+    )
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    prior = {"review_id": 1, "node_id": "NODE1", "verdict": "COMMENT"}
+    synthesis = _synthesis_from(
+        [
+            TaggedFinding(
+                lens="security",
+                finding=Finding(Severity.HIGH, "SQLi", "raw concat", "app/db.py:11"),
+            )
+        ]
+    )
+    with (
+        _patch_review_pipeline(synthesis_result=synthesis, prior_review=prior)[0],
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    # Prior inline comments listed by the prior review id and each deleted.
+    mock_gh_client.list_review_comments.assert_awaited_once()
+    assert mock_gh_client.list_review_comments.await_args.kwargs["review_id"] == 1
+    deleted = {
+        call.kwargs["comment_id"]
+        for call in mock_gh_client.delete_review_comment.await_args_list
+    }
+    assert deleted == {101, 102}
+    # Then the fresh review (with its inline comment) is posted exactly once.
+    mock_gh_client.post_review.assert_awaited_once()
+    assert len(mock_gh_client.post_review.await_args.kwargs["comments"]) == 1
 
 
 # ---------------------------------------------------------------------------
