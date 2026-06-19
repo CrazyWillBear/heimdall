@@ -434,3 +434,129 @@ def test_context_module_does_not_import_subprocess() -> None:
     assert not hasattr(ctx_mod, "subprocess"), (
         "heimdall.context imported subprocess — no code execution allowed"
     )
+
+
+# ---------------------------------------------------------------------------
+# Robustness: binary and oversize files are skipped, not crashing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_skips_binary_file() -> None:
+    """A binary changed file is skipped; assembly does not crash."""
+    binary_files = [
+        {"filename": "logo.png", "status": "modified"},
+        {"filename": "foo.py", "status": "modified"},
+    ]
+
+    def _file_content_side_effect(
+        *, repo_full_name: str, path: str, ref: str
+    ) -> str:
+        if path == "logo.png":
+            raise UnicodeDecodeError("utf-8", b"\x89PNG", 0, 1, "invalid start byte")
+        return _FILE_CONTENT
+
+    mock_client = _make_mock_github_client(files=binary_files)
+    mock_client.get_file_content = AsyncMock(side_effect=_file_content_side_effect)
+
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+
+    # Normal file is present
+    assert "foo.py" in ctx.file_contents
+    assert ctx.file_contents["foo.py"] == _FILE_CONTENT
+    # Binary file is skipped (placeholder or absent — not a crash)
+    assert "logo.png" not in ctx.file_contents or ctx.file_contents["logo.png"] != _FILE_CONTENT
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_skips_oversize_file() -> None:
+    """A >1 MB changed file (GitHub Contents API 404) is skipped; assembly does not crash."""
+    import httpx
+
+    large_files = [
+        {"filename": "huge.bin", "status": "modified"},
+        {"filename": "foo.py", "status": "modified"},
+    ]
+
+    def _file_content_side_effect(
+        *, repo_full_name: str, path: str, ref: str
+    ) -> str:
+        if path == "huge.bin":
+            response = httpx.Response(404, request=httpx.Request("GET", "https://api.github.com/"))
+            raise httpx.HTTPStatusError(
+                "404 Not Found",
+                request=response.request,
+                response=response,
+            )
+        return _FILE_CONTENT
+
+    mock_client = _make_mock_github_client(files=large_files)
+    mock_client.get_file_content = AsyncMock(side_effect=_file_content_side_effect)
+
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+
+    # Normal file is present
+    assert "foo.py" in ctx.file_contents
+    assert ctx.file_contents["foo.py"] == _FILE_CONTENT
+    # Oversize file is not in contents (skipped)
+    assert "huge.bin" not in ctx.file_contents
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_normal_files_fetched_alongside_bad() -> None:
+    """When one file is binary and another errors, remaining normal files are still fetched."""
+    import httpx
+
+    mixed_files = [
+        {"filename": "image.jpg", "status": "modified"},
+        {"filename": "huge.dat", "status": "modified"},
+        {"filename": "foo.py", "status": "modified"},
+        {"filename": "bar.py", "status": "modified"},
+    ]
+
+    def _file_content_side_effect(
+        *, repo_full_name: str, path: str, ref: str
+    ) -> str:
+        if path == "image.jpg":
+            raise UnicodeDecodeError("utf-8", b"\xff\xd8", 0, 1, "invalid start byte")
+        if path == "huge.dat":
+            response = httpx.Response(404, request=httpx.Request("GET", "https://api.github.com/"))
+            raise httpx.HTTPStatusError(
+                "404 Not Found",
+                request=response.request,
+                response=response,
+            )
+        return _FILE_CONTENT
+
+    mock_client = _make_mock_github_client(files=mixed_files)
+    mock_client.get_file_content = AsyncMock(side_effect=_file_content_side_effect)
+
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+
+    # Both normal files survive
+    assert ctx.file_contents["foo.py"] == _FILE_CONTENT
+    assert ctx.file_contents["bar.py"] == _FILE_CONTENT
+    # Problem files are absent
+    assert "image.jpg" not in ctx.file_contents
+    assert "huge.dat" not in ctx.file_contents

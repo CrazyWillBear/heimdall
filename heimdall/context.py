@@ -12,13 +12,18 @@ calls only.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from heimdall.github import GitHubClient
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -177,11 +182,13 @@ async def _fetch_file_contents(
 ) -> dict[str, str]:
     """Fetch full contents for all non-deleted changed files.
 
-    Files with status "removed" or "renamed" (where the new name is covered
-    separately) are skipped — we only read files that exist at ``ref``.
+    Files with status "removed" are skipped — we only read files that exist at
+    ``ref``.  Per-file failures are isolated: binary files (UnicodeDecodeError)
+    and oversize/unavailable files (HTTPStatusError) are logged and omitted from
+    the result rather than aborting the whole gather.
 
     Returns:
-        Dict mapping filename → decoded text content.
+        Dict mapping filename → decoded text content, with unreadable files omitted.
     """
     import asyncio
 
@@ -196,8 +203,34 @@ async def _fetch_file_contents(
         )
         return filename, content
 
-    results = await asyncio.gather(*(_fetch_one(f["filename"]) for f in fetchable))
-    return dict(results)
+    # return_exceptions=True prevents one bad file from aborting the gather.
+    raw_results = await asyncio.gather(
+        *(_fetch_one(f["filename"]) for f in fetchable),
+        return_exceptions=True,
+    )
+
+    contents: dict[str, str] = {}
+    for item in raw_results:
+        if isinstance(item, UnicodeDecodeError):
+            # Binary file — can't decode as UTF-8; skip with a log entry.
+            logger.warning(
+                "Skipping binary file in PR context (UnicodeDecodeError): %s", item
+            )
+        elif isinstance(item, httpx.HTTPStatusError):
+            # Oversize or unavailable file — GitHub Contents API returned an error.
+            logger.warning(
+                "Skipping file in PR context (HTTP %s): %s",
+                item.response.status_code,
+                item.request.url,
+            )
+        elif isinstance(item, BaseException):
+            # Unexpected error — re-raise so it isn't silently swallowed.
+            raise item
+        else:
+            filename, content = item
+            contents[filename] = content
+
+    return contents
 
 
 def _materialize(ctx: PRContext, directory: str) -> None:
