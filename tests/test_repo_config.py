@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from heimdall.lens import Severity
+from heimdall.lens import DESIGN_LENS, SECURITY_LENS, Severity
 from heimdall.repo_config import (
     CONFIG_PATH,
     RepoConfig,
@@ -295,3 +295,125 @@ def test_opt_out_label_absent_proceeds() -> None:
     config = parse_repo_config("scope:\n  opt_out_label: heimdall-skip\n")
     reason = skip_reason(config, pr=_pr(labels=["bug"]), changed_paths=["a.py"])
     assert reason is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #9 — custom lenses run alongside built-ins and reach synthesis
+# ---------------------------------------------------------------------------
+
+
+def test_custom_lens_runs_alongside_builtins() -> None:
+    """A custom lens defined in config joins the built-ins in the tuned set."""
+    config = parse_repo_config(
+        "custom_lenses:\n"
+        "  - name: licensing\n"
+        "    system_prompt: Review the PR for license-header compliance.\n"
+    )
+    lenses = tuned_lenses(config)
+    names = {lens.name for lens in lenses}
+    assert names == {"security", "design", "cleanliness", "licensing"}
+    custom = next(lens for lens in lenses if lens.name == "licensing")
+    assert custom.system_prompt == "Review the PR for license-header compliance."
+
+
+def test_custom_lens_defaults_model_and_effort() -> None:
+    """A custom lens omitting model/effort defaults to sonnet/high."""
+    config = parse_repo_config(
+        "custom_lenses:\n"
+        "  - name: licensing\n"
+        "    system_prompt: Check licenses.\n"
+    )
+    custom = next(lens for lens in tuned_lenses(config) if lens.name == "licensing")
+    assert custom.model == "sonnet"
+    assert custom.effort == "high"
+
+
+def test_custom_lens_honors_model_and_effort_overrides() -> None:
+    """A custom lens may pin its own model/effort."""
+    config = parse_repo_config(
+        "custom_lenses:\n"
+        "  - name: licensing\n"
+        "    system_prompt: Check licenses.\n"
+        "    model: opus\n"
+        "    effort: max\n"
+    )
+    custom = next(lens for lens in tuned_lenses(config) if lens.name == "licensing")
+    assert custom.model == "opus"
+    assert custom.effort == "max"
+
+
+def test_custom_lens_requires_name_and_prompt() -> None:
+    """A custom lens missing its required name/system_prompt is rejected."""
+    with pytest.raises(RepoConfigError):
+        parse_repo_config("custom_lenses:\n  - model: opus\n")
+
+
+def test_custom_lens_rejects_unknown_key() -> None:
+    """An unknown key on a custom lens is a typo signal — reject it."""
+    with pytest.raises(RepoConfigError):
+        parse_repo_config(
+            "custom_lenses:\n"
+            "  - name: licensing\n"
+            "    system_prompt: Check.\n"
+            "    bogus: 1\n"
+        )
+
+
+def test_custom_lens_name_colliding_with_builtin_rejected() -> None:
+    """A custom lens may not shadow a built-in lens name."""
+    with pytest.raises(RepoConfigError):
+        parse_repo_config(
+            "custom_lenses:\n"
+            "  - name: security\n"
+            "    system_prompt: Shadow attempt.\n"
+        )
+
+
+def test_duplicate_custom_lens_names_rejected() -> None:
+    """Two custom lenses sharing a name are rejected (ambiguous tagging)."""
+    with pytest.raises(RepoConfigError):
+        parse_repo_config(
+            "custom_lenses:\n"
+            "  - name: licensing\n"
+            "    system_prompt: First.\n"
+            "  - name: licensing\n"
+            "    system_prompt: Second.\n"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #9 — per-lens custom instructions appended to a built-in prompt
+# ---------------------------------------------------------------------------
+
+
+def test_per_lens_instructions_appended_to_builtin_prompt() -> None:
+    """Per-lens instructions extend (not replace) the built-in system prompt."""
+    config = parse_repo_config(
+        "lenses:\n"
+        "  security:\n"
+        "    instructions: Pay special attention to SSRF in our proxy layer.\n"
+    )
+    security = next(lens for lens in tuned_lenses(config) if lens.name == "security")
+    assert security.system_prompt.startswith(SECURITY_LENS.system_prompt)
+    assert "Pay special attention to SSRF in our proxy layer." in security.system_prompt
+    # The appended guidance is separated from the built-in identity prompt.
+    assert security.system_prompt != SECURITY_LENS.system_prompt
+
+
+def test_per_lens_instructions_preserve_model_and_effort() -> None:
+    """Appending instructions keeps the built-in (or overridden) model/effort."""
+    config = parse_repo_config(
+        "lenses:\n"
+        "  design:\n"
+        "    instructions: Enforce the hexagonal-architecture boundary.\n"
+    )
+    design = next(lens for lens in tuned_lenses(config) if lens.name == "design")
+    assert design.model == DESIGN_LENS.model
+    assert design.effort == DESIGN_LENS.effort
+
+
+def test_no_instructions_leaves_builtin_prompt_unchanged() -> None:
+    """Without instructions, the built-in prompt is untouched."""
+    config = parse_repo_config("lenses:\n  security:\n    model: sonnet\n")
+    security = next(lens for lens in tuned_lenses(config) if lens.name == "security")
+    assert security.system_prompt == SECURITY_LENS.system_prompt

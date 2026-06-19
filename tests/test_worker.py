@@ -1167,6 +1167,139 @@ async def test_run_review_fork_reads_config_from_base_ref() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_review_custom_lens_reaches_synthesis() -> None:
+    """Issue #9: a custom lens defined in config runs and reaches synthesis."""
+    client = _gating_gh_client(
+        config_yaml=(
+            "custom_lenses:\n"
+            "  - name: licensing\n"
+            "    system_prompt: Review license headers.\n"
+        )
+    )
+    run_lens_mock = AsyncMock(return_value=_lens_result([]))
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    stack = ExitStack()
+    stack.enter_context(
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock()))
+    )
+    stack.enter_context(patch("heimdall.worker.run_lens", new=run_lens_mock))
+    stack.enter_context(patch("heimdall.worker.run_synthesis", new=synth_mock))
+    stack.enter_context(patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.set_posted_review", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.GitHubClient", return_value=client))
+    with stack:
+        await _drive(client)
+
+    ran = {call.kwargs["lens"].name for call in run_lens_mock.await_args_list}
+    assert "licensing" in ran
+    assert ran == {"security", "design", "cleanliness", "licensing"}
+    custom = next(
+        call.kwargs["lens"]
+        for call in run_lens_mock.await_args_list
+        if call.kwargs["lens"].name == "licensing"
+    )
+    assert custom.system_prompt == "Review license headers."
+    synth_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_review_fork_custom_lens_prompt_from_base_ref() -> None:
+    """Issue #9 (SECURITY): a fork PR's custom-lens prompt comes from BASE, not head.
+
+    The config (custom-lens prompt included) is read once from the BASE sha for a
+    fork, so the head ref is never consulted for the prompt text.
+    """
+    client = _gating_gh_client(
+        config_yaml=(
+            "custom_lenses:\n"
+            "  - name: licensing\n"
+            "    system_prompt: BASE-TRUSTED license prompt.\n"
+        ),
+        head_repo="attacker/repo",
+    )
+    run_lens_mock = AsyncMock(return_value=_lens_result([]))
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    stack = ExitStack()
+    stack.enter_context(
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock()))
+    )
+    stack.enter_context(patch("heimdall.worker.run_lens", new=run_lens_mock))
+    stack.enter_context(patch("heimdall.worker.run_synthesis", new=synth_mock))
+    stack.enter_context(patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.set_posted_review", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.GitHubClient", return_value=client))
+    with stack:
+        await _drive(client)
+
+    # Config (and thus the custom-lens prompt) is read only from the BASE sha.
+    client.get_file_content.assert_awaited_once_with(
+        repo_full_name=_REPO,
+        path=".github/heimdall.yml",
+        ref="BASE_SHA",
+        tolerate_missing=True,
+    )
+    custom = next(
+        call.kwargs["lens"]
+        for call in run_lens_mock.await_args_list
+        if call.kwargs["lens"].name == "licensing"
+    )
+    assert custom.system_prompt == "BASE-TRUSTED license prompt."
+
+
+@pytest.mark.asyncio
+async def test_run_review_per_lens_instructions_modify_builtin_prompt() -> None:
+    """Issue #9: per-lens instructions append to the built-in lens's prompt."""
+    from heimdall.lens import SECURITY_LENS
+
+    client = _gating_gh_client(
+        config_yaml=(
+            "lenses:\n"
+            "  security:\n"
+            "    instructions: Focus on our auth token handling.\n"
+        )
+    )
+    run_lens_mock = AsyncMock(return_value=_lens_result([]))
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    stack = ExitStack()
+    stack.enter_context(
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock()))
+    )
+    stack.enter_context(patch("heimdall.worker.run_lens", new=run_lens_mock))
+    stack.enter_context(patch("heimdall.worker.run_synthesis", new=synth_mock))
+    stack.enter_context(patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.set_posted_review", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.GitHubClient", return_value=client))
+    with stack:
+        await _drive(client)
+
+    security = next(
+        call.kwargs["lens"]
+        for call in run_lens_mock.await_args_list
+        if call.kwargs["lens"].name == "security"
+    )
+    assert security.system_prompt.startswith(SECURITY_LENS.system_prompt)
+    assert "Focus on our auth token handling." in security.system_prompt
+
+
+@pytest.mark.asyncio
 async def test_run_review_disabled_lens_does_not_run() -> None:
     """Acceptance #3: a lens disabled in config never runs (not in fanout)."""
     client = _gating_gh_client(config_yaml="lenses:\n  design:\n    enabled: false\n")

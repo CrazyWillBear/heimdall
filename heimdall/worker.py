@@ -18,7 +18,8 @@ has not opted in, so nothing is reviewed — then applies scope filters (base-br
 allowlist, path globs, skip drafts/bot authors, opt-out label).  If it proceeds, it
 assembles the PR seed context into a temporary workspace once, fans out the
 config-tuned lenses (built-ins Security opus/max, Design-fit sonnet/high, Cleanliness
-sonnet/high, each with per-lens model/effort/enable overrides) over that shared seed —
+sonnet/high, each with per-lens model/effort/enable overrides plus optional appended
+instructions, alongside any custom lenses defined in the config) over that shared seed —
 each bounded by its own token cap and timeout — then runs a 4th synthesis ``claude -p``
 pass that dedups overlapping findings across lenses, ranks by severity, writes the
 verdict, and formats the review (findings grouped by severity, each tagged with the
@@ -540,8 +541,10 @@ async def _run_lenses(
 ) -> list[LensResult]:
     """Run the config-tuned lenses over the shared workspace, isolating failures.
 
-    The repo config decides which lenses run and with what model/effort (a disabled
-    lens never runs and never reaches synthesis).  Each surviving lens is bounded
+    The repo config decides which lenses run and with what model/effort/prompt: a
+    disabled built-in never runs, a built-in may carry appended per-lens instructions,
+    and any custom lenses defined in the config run here too (all via tuned_lenses).
+    A disabled lens never reaches synthesis.  Each surviving lens is bounded
     independently (its own token cap + timeout via run_lens).  A lens that aborts
     (timeout or token-cap breach) is logged and dropped so the remaining lenses
     still reach synthesis; an unexpected error in one lens is likewise contained

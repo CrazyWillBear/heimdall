@@ -26,7 +26,7 @@ import logging
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from heimdall.lens import (
     CLEANLINESS_LENS,
@@ -62,6 +62,10 @@ class LensConfig(BaseModel):
             synthesis.
         model: Overrides the lens's default Claude model when set.
         effort: Overrides the lens's default reasoning effort when set.
+        instructions: Extra guidance appended to the built-in lens's system prompt
+            when set; the lens keeps its built-in identity and runs with the
+            appended instructions.  Read only from the trusted config ref, so a fork
+            cannot inject prompt text (see the module docstring's trust note).
     """
 
     model_config = {"extra": "forbid"}
@@ -69,6 +73,33 @@ class LensConfig(BaseModel):
     enabled: bool = True
     model: str | None = None
     effort: str | None = None
+    instructions: str | None = None
+
+
+class CustomLensConfig(BaseModel):
+    """A user-defined lens that runs alongside the built-ins.
+
+    A custom lens is just another :class:`~heimdall.lens.LensSpec` built from config:
+    it runs over the same shared seed via the same ``run_lens`` path (bounded by the
+    same token cap + timeout) and its findings flow into synthesis tagged by ``name``.
+    Like every other config field its ``system_prompt`` is sourced from the trusted
+    ref (base for forks), so a fork PR can never inject a custom-lens prompt.
+
+    Attributes:
+        name: Stable lens identifier; must not collide with a built-in lens name and
+            must be unique across custom lenses (it tags the lens's findings).
+        system_prompt: The lens's review instructions (required).
+        model: Claude model for the pass; defaults to "sonnet" like the non-security
+            built-ins.
+        effort: Reasoning effort for the pass; defaults to "high".
+    """
+
+    model_config = {"extra": "forbid"}
+
+    name: str
+    system_prompt: str
+    model: str = "sonnet"
+    effort: str = "high"
 
 
 class ScopeFilters(BaseModel):
@@ -99,6 +130,8 @@ class RepoConfig(BaseModel):
     Attributes:
         lenses: Per-lens overrides keyed by lens name (security/design/cleanliness).
             Lenses absent from the map keep their built-in defaults.
+        custom_lenses: User-defined lenses that run alongside the built-ins and whose
+            findings reach synthesis tagged by their name.
         severity_threshold: The lowest severity that blocks the PR
             (REQUEST_CHANGES); findings below it only comment.
         scope: Scope filters deciding whether the PR is reviewed at all.
@@ -107,8 +140,27 @@ class RepoConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
     lenses: dict[str, LensConfig] = Field(default_factory=dict)
+    custom_lenses: list[CustomLensConfig] = Field(default_factory=list)
     severity_threshold: Severity = Severity.HIGH
     scope: ScopeFilters = Field(default_factory=ScopeFilters)
+
+    @model_validator(mode="after")
+    def _validate_custom_lens_names(self) -> RepoConfig:
+        """Reject custom-lens names that shadow a built-in or duplicate each other.
+
+        A custom lens tags its findings by name, so a name collision would make the
+        synthesized review ambiguous about which lens raised a finding.
+        """
+        seen: set[str] = set()
+        for lens in self.custom_lenses:
+            if lens.name in _BUILTIN_LENSES:
+                raise ValueError(
+                    f"custom lens {lens.name!r} collides with a built-in lens name"
+                )
+            if lens.name in seen:
+                raise ValueError(f"duplicate custom lens name {lens.name!r}")
+            seen.add(lens.name)
+        return self
 
 
 def parse_repo_config(text: str) -> RepoConfig:
@@ -284,19 +336,43 @@ def skip_reason(
     return None
 
 
-def tuned_lenses(config: RepoConfig) -> tuple[LensSpec, ...]:
-    """Return the lenses to run, with per-lens model/effort overrides applied.
+def _tuned_builtin(spec: LensSpec, lens_cfg: LensConfig) -> LensSpec:
+    """Apply a :class:`LensConfig`'s overrides to a built-in :class:`LensSpec`.
 
-    A lens disabled in the config is dropped (it never runs and never reaches
-    synthesis).  An enabled lens keeps its built-in spec unless the config
-    overrides its model and/or effort.  Lenses not mentioned in the config keep
-    their built-in defaults and stay enabled.
+    Per-lens ``instructions`` are appended to (not a replacement for) the built-in
+    system prompt, so the lens keeps its built-in identity plus the extra guidance.
+    """
+    system_prompt = spec.system_prompt
+    if lens_cfg.instructions:
+        system_prompt = f"{spec.system_prompt}\n\n{lens_cfg.instructions}"
+    return LensSpec(
+        name=spec.name,
+        system_prompt=system_prompt,
+        model=lens_cfg.model or spec.model,
+        effort=lens_cfg.effort or spec.effort,
+    )
+
+
+def tuned_lenses(config: RepoConfig) -> tuple[LensSpec, ...]:
+    """Return the lenses to run: tuned built-ins plus any custom lenses.
+
+    A built-in disabled in the config is dropped (it never runs and never reaches
+    synthesis).  An enabled built-in keeps its spec unless the config overrides its
+    model/effort or appends per-lens ``instructions`` to its system prompt.  Built-ins
+    not mentioned keep their defaults and stay enabled.  Custom lenses (from
+    ``config.custom_lenses``) are appended after the built-ins, each turned into a
+    :class:`LensSpec`, so they run over the same shared seed via the same ``run_lens``
+    path and their findings reach synthesis tagged by their name.
+
+    All prompts come from the already-loaded :class:`RepoConfig`, which was read from
+    the trust-resolved ref (base for forks); this function never re-reads the head, so
+    fork safety is inherited.
 
     Args:
         config: The repo configuration.
 
     Returns:
-        The tuned, enabled lenses in stable built-in order.
+        The tuned, enabled built-in lenses followed by the custom lenses.
     """
     tuned: list[LensSpec] = []
     for name, spec in _BUILTIN_LENSES.items():
@@ -306,12 +382,14 @@ def tuned_lenses(config: RepoConfig) -> tuple[LensSpec, ...]:
             continue
         if not lens_cfg.enabled:
             continue
+        tuned.append(_tuned_builtin(spec, lens_cfg))
+    for custom in config.custom_lenses:
         tuned.append(
             LensSpec(
-                name=spec.name,
-                system_prompt=spec.system_prompt,
-                model=lens_cfg.model or spec.model,
-                effort=lens_cfg.effort or spec.effort,
+                name=custom.name,
+                system_prompt=custom.system_prompt,
+                model=custom.model,
+                effort=custom.effort,
             )
         )
     return tuple(tuned)
