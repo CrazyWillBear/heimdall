@@ -118,7 +118,10 @@ and the `bwrap` path via `BWRAP_BINARY`. Defence in depth still holds beneath th
 keeps secrets out of the child's environment, and PR code is never *executed*.
 
 > **Requires `bwrap` on the worker host.** Install bubblewrap (it works in either setuid or
-> unprivileged-userns mode). Without it, every lens fails closed and no review is produced.
+> unprivileged-userns mode). At startup the worker runs a trivial `bwrap` **exec-probe** and
+> **refuses to boot** if the sandbox can't actually run (`bwrap` missing, unprivileged
+> userns/seccomp blocked, or setuid defeated by `--security-opt no-new-privileges`) — so the
+> failure surfaces immediately instead of every review silently failing closed at lens-spawn time.
 
 Each run is bounded by a **per-agent cumulative-token cap** (default 400k) and a **per-lens
 wall-clock timeout** (default 1800s); exceeding either kills the subprocess and drops that

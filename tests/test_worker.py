@@ -1052,6 +1052,7 @@ async def test_on_startup_populates_ctx() -> None:
     mock_db = AsyncMock()
 
     with (
+        patch("heimdall.worker.sandbox_exec_probe", new=AsyncMock()),
         patch("heimdall.worker.Database", return_value=mock_db),
         patch("heimdall.worker.settings") as mock_settings,
     ):
@@ -1066,6 +1067,57 @@ async def test_on_startup_populates_ctx() -> None:
     assert ctx["db"] is mock_db
     assert ctx["app_id"] == _APP_ID
     assert ctx["private_key"] == _PRIVATE_KEY
+
+
+@pytest.mark.asyncio
+async def test_on_startup_runs_sandbox_probe_with_configured_bwrap() -> None:
+    """on_startup runs the sandbox exec-probe with the configured bwrap binary."""
+    ctx: dict[str, object] = {}
+    probe = AsyncMock()
+
+    with (
+        patch("heimdall.worker.sandbox_exec_probe", new=probe),
+        patch("heimdall.worker.Database", return_value=AsyncMock()),
+        patch("heimdall.worker.settings") as mock_settings,
+    ):
+        mock_settings.database_url = "sqlite+aiosqlite:///./test.db"
+        mock_settings.redis_url = "redis://localhost:6379"
+        mock_settings.github_app_id = _APP_ID
+        mock_settings.github_app_private_key = _PRIVATE_KEY
+        mock_settings.bwrap_binary = "/custom/bwrap"
+
+        await WorkerSettings.on_startup(ctx)
+
+    probe.assert_awaited_once_with("/custom/bwrap")
+
+
+@pytest.mark.asyncio
+async def test_on_startup_aborts_when_sandbox_probe_fails() -> None:
+    """A failing sandbox exec-probe aborts startup; the DB is never opened."""
+    from heimdall.lens import SandboxError
+
+    ctx: dict[str, object] = {}
+    db_cls = MagicMock()
+
+    with (
+        patch(
+            "heimdall.worker.sandbox_exec_probe",
+            new=AsyncMock(side_effect=SandboxError("bwrap cannot run here")),
+        ),
+        patch("heimdall.worker.Database", new=db_cls),
+        patch("heimdall.worker.settings") as mock_settings,
+    ):
+        mock_settings.database_url = "sqlite+aiosqlite:///./test.db"
+        mock_settings.redis_url = "redis://localhost:6379"
+        mock_settings.github_app_id = _APP_ID
+        mock_settings.github_app_private_key = _PRIVATE_KEY
+        mock_settings.bwrap_binary = "bwrap"
+
+        with pytest.raises(SandboxError):
+            await WorkerSettings.on_startup(ctx)
+
+    db_cls.assert_not_called()
+    assert "db" not in ctx
 
 
 @pytest.mark.asyncio
@@ -1087,6 +1139,7 @@ async def test_on_startup_strips_sqlalchemy_prefix() -> None:
     mock_db.initialize = AsyncMock()
 
     with (
+        patch("heimdall.worker.sandbox_exec_probe", new=AsyncMock()),
         patch("heimdall.worker.Database", return_value=mock_db) as mock_cls,
         patch("heimdall.worker.settings") as mock_settings,
     ):

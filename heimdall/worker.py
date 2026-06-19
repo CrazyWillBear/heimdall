@@ -45,6 +45,11 @@ Logging is metadata-only by default — repo/PR/SHA/timing/verdict — and never
 tokens or secrets.  Findings and code text are logged only when ``debug_logging`` is
 set in ctx.
 
+At startup the worker runs a trivial bwrap exec-probe (see
+:func:`heimdall.lens.sandbox_exec_probe`) and refuses to boot if the sandbox can't
+run, so a broken sandbox is caught once at boot rather than failing every review
+closed at lens-spawn time.
+
 Launch the worker with:
     arq heimdall.worker.WorkerSettings
 """
@@ -89,6 +94,7 @@ from heimdall.lens import (
     SynthesisResult,
     run_lens,
     run_synthesis,
+    sandbox_exec_probe,
 )
 from heimdall.repo_config import (
     GuardrailCaps,
@@ -821,10 +827,11 @@ class WorkerSettings:
 
     @staticmethod
     async def on_startup(ctx: dict[str, Any]) -> None:
-        """Open the database and store app credentials in ctx.
+        """Probe the sandbox, open the database, and store app credentials in ctx.
 
-        Reads Settings from the environment, overrides redis_settings on the
-        class, then populates ctx with:
+        Reads Settings from the environment, runs a trivial bwrap exec-probe that
+        aborts startup (raising :class:`SandboxError`) on a host where the sandbox
+        cannot run, overrides redis_settings on the class, then populates ctx with:
             db:                     initialised Database instance
             app_id:                 GitHub App numeric ID
             private_key:            PEM-encoded RSA private key
@@ -840,6 +847,12 @@ class WorkerSettings:
         global settings
         if settings is None:
             settings = _load_settings()
+
+        # Fail fast on a host where the sandbox can't run: run a trivial bwrap
+        # exec-probe before any review work is registered.  Every lens fails closed
+        # at spawn time without a working sandbox (#26), so refuse to boot here and
+        # surface the cause immediately rather than per-review.
+        await sandbox_exec_probe(settings.bwrap_binary)
 
         # Update redis_settings from the live config so the running worker uses
         # the correct Redis URL even if the default was overridden in .env.

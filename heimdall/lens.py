@@ -851,6 +851,82 @@ def build_bwrap_prefix(
     return prefix
 
 
+# Wall-clock ceiling for the startup exec-probe.  The probe runs ``true`` inside the
+# sandbox (milliseconds); a few seconds is generous and keeps a wedged bwrap from
+# hanging worker boot indefinitely.
+_SANDBOX_PROBE_TIMEOUT_SECONDS = 10.0
+
+
+def build_sandbox_probe_argv(bwrap_binary: str = DEFAULT_BWRAP_BINARY) -> list[str]:
+    """Build the trivial bwrap exec-probe argv used at worker startup.
+
+    Exercises the SAME unshare / share-net machinery a real lens wrap uses
+    (:func:`build_bwrap_prefix`) so a broken sandbox — bwrap missing, unprivileged
+    userns or seccomp blocked, setuid defeated by ``no-new-privileges`` — is caught
+    here rather than failing closed at lens-spawn time.  The probe binds ``/`` read-only,
+    unshares every namespace, keeps the network, and runs ``true``.  argv is consumed by
+    ``create_subprocess_exec`` (no shell), so none of these strings are shell-interpreted.
+
+    Args:
+        bwrap_binary: Path/name of the bwrap executable (default: found on PATH).
+
+    Returns:
+        The full probe argv (``[bwrap, --ro-bind, /, /, --unshare-all, --share-net,
+        --, true]``).
+
+    Raises:
+        SandboxError: bwrap could not be resolved — fail closed, never spawn unsandboxed.
+    """
+    bwrap = _resolve_bwrap(bwrap_binary)
+    if bwrap is None:
+        raise SandboxError(
+            f"bwrap executable {bwrap_binary!r} not found; refusing to start the worker "
+            "with a sandbox that cannot run"
+        )
+    return [bwrap, "--ro-bind", "/", "/", "--unshare-all", "--share-net", "--", "true"]
+
+
+async def sandbox_exec_probe(bwrap_binary: str = DEFAULT_BWRAP_BINARY) -> None:
+    """Run a trivial bwrap exec-probe, raising :class:`SandboxError` if it fails.
+
+    Spawns the :func:`build_sandbox_probe_argv` command once (no shell) and waits for it
+    to exit.  A missing bwrap, a non-zero exit (unprivileged userns / seccomp blocked,
+    setuid defeated by ``--security-opt no-new-privileges``), or a hang past the short
+    timeout all raise :class:`SandboxError` so the worker refuses to boot on a host where
+    the sandbox cannot actually run — instead of every review silently failing closed at
+    lens-spawn time.
+
+    Args:
+        bwrap_binary: Path/name of the bwrap executable (default: found on PATH).
+
+    Raises:
+        SandboxError: bwrap is missing, the probe exited non-zero, or it timed out.
+    """
+    argv = build_sandbox_probe_argv(bwrap_binary)
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=_SANDBOX_PROBE_TIMEOUT_SECONDS
+        )
+    except TimeoutError as exc:
+        await _kill(proc)
+        raise SandboxError(
+            f"sandbox exec-probe timed out after {_SANDBOX_PROBE_TIMEOUT_SECONDS}s; "
+            "refusing to start the worker with a sandbox that cannot run"
+        ) from exc
+    if proc.returncode != 0:
+        detail = stderr_bytes.decode("utf-8", errors="replace").strip()
+        raise SandboxError(
+            f"sandbox exec-probe failed (exit {proc.returncode}): {detail}; refusing "
+            "to start the worker — bwrap cannot run here (unprivileged userns/seccomp "
+            "blocked, or setuid defeated by no-new-privileges)"
+        )
+
+
 async def run_claude_subprocess(
     argv: list[str],
     *,

@@ -21,7 +21,9 @@ from heimdall.lens import (
     SANDBOX_WORKSPACE_PATH,
     SandboxError,
     build_bwrap_prefix,
+    build_sandbox_probe_argv,
     run_claude_subprocess,
+    sandbox_exec_probe,
 )
 
 _FAKE_BWRAP = "/usr/bin/bwrap"
@@ -156,5 +158,73 @@ async def test_subprocess_fails_closed_when_bwrap_unavailable() -> None:
             token_cap=400_000,
             cwd="/srv/seed",
         )
+
+    exec_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Startup sandbox exec-probe (issue #29)
+# ---------------------------------------------------------------------------
+
+
+def test_probe_argv_unshares_and_shares_net() -> None:
+    """The probe exercises the same unshare/share-net machinery a lens wrap uses."""
+    with _patch_bwrap_found():
+        argv = build_sandbox_probe_argv()
+
+    assert argv[0] == _FAKE_BWRAP
+    assert argv[1:4] == ["--ro-bind", "/", "/"]
+    assert "--unshare-all" in argv
+    assert "--share-net" in argv
+    # Everything after the -- separator is the command run inside the sandbox.
+    assert argv[argv.index("--") + 1:] == ["true"]
+
+
+def test_probe_argv_fails_closed_when_bwrap_unavailable() -> None:
+    """An unresolvable bwrap raises SandboxError before any probe is spawned."""
+    with patch("heimdall.lens._resolve_bwrap", return_value=None), pytest.raises(
+        SandboxError
+    ):
+        build_sandbox_probe_argv()
+
+
+def _fake_probe_proc(returncode: int, stderr: bytes = b"") -> MagicMock:
+    """Build a fake subprocess whose communicate() yields the given exit/stderr."""
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
+    proc.communicate = AsyncMock(return_value=(b"", stderr))
+    return proc
+
+
+@pytest.mark.asyncio
+async def test_exec_probe_passes_on_zero_exit() -> None:
+    """A probe that exits 0 returns without raising."""
+    proc = _fake_probe_proc(returncode=0)
+    with _patch_bwrap_found(), patch(
+        "heimdall.lens.asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ):
+        await sandbox_exec_probe()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_exec_probe_aborts_on_nonzero_exit() -> None:
+    """A probe that exits non-zero raises SandboxError so the worker refuses to boot."""
+    proc = _fake_probe_proc(returncode=1, stderr=b"bwrap: setting up uid map failed")
+    with _patch_bwrap_found(), patch(
+        "heimdall.lens.asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)
+    ), pytest.raises(SandboxError):
+        await sandbox_exec_probe()
+
+
+@pytest.mark.asyncio
+async def test_exec_probe_fails_closed_when_bwrap_unavailable() -> None:
+    """A missing bwrap raises SandboxError and never spawns a probe."""
+    exec_mock = AsyncMock()
+    with patch("heimdall.lens._resolve_bwrap", return_value=None), patch(
+        "heimdall.lens.asyncio.create_subprocess_exec", new=exec_mock
+    ), pytest.raises(SandboxError):
+        await sandbox_exec_probe()
 
     exec_mock.assert_not_called()
