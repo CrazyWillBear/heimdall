@@ -7,11 +7,40 @@ fetching PR metadata, diffs, file lists, and file contents for seed-context asse
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
 import httpx
 import jwt
+
+
+def parse_linked_issues_from_body(body: str) -> list[dict[str, Any]]:
+    """Extract issues referenced by closing keywords in a PR body.
+
+    Recognises the GitHub closing keywords (closes, fixes, resolves) followed
+    by ``#N`` anywhere in the body.  Matching is case-insensitive.  Duplicate
+    issue numbers are collapsed to a single entry.
+
+    Args:
+        body: PR description text.
+
+    Returns:
+        List of dicts with a ``number`` key for each uniquely referenced issue,
+        in the order first seen.
+    """
+    pattern = re.compile(
+        r"(?:closes|fixes|resolves)\s+#(\d+)",
+        re.IGNORECASE,
+    )
+    seen: set[int] = set()
+    results: list[dict[str, Any]] = []
+    for match in pattern.finditer(body):
+        number = int(match.group(1))
+        if number not in seen:
+            seen.add(number)
+            results.append({"number": number})
+    return results
 
 
 def make_jwt(*, app_id: int, private_key: str) -> str:
@@ -238,16 +267,19 @@ class GitHubClient:
         repo_full_name: str,
         path: str,
         ref: str,
-    ) -> str:
+        tolerate_missing: bool = False,
+    ) -> str | None:
         """Fetch the decoded text content of a file at a specific ref.
 
         Args:
             repo_full_name: e.g. "owner/repo".
             path: File path within the repository.
             ref: Git ref (branch, tag, or commit SHA) to read from.
+            tolerate_missing: When True, return None on a 404 instead of raising.
 
         Returns:
-            The decoded UTF-8 content of the file.
+            The decoded UTF-8 content of the file, or None if the file is absent
+            and ``tolerate_missing`` is True.
         """
         import base64
 
@@ -257,6 +289,8 @@ class GitHubClient:
             headers=await self._gh_headers(),
             params={"ref": ref},
         )
+        if tolerate_missing and response.status_code == 404:
+            return None
         response.raise_for_status()
         data: dict[str, Any] = response.json()
         # GitHub returns base64-encoded content with embedded newlines
@@ -269,21 +303,18 @@ class GitHubClient:
         repo_full_name: str,
         pr_number: int,
     ) -> list[dict[str, Any]]:
-        """Return issues mentioned in the PR body via closing keywords.
+        """Return issues referenced by closing keywords in the PR body.
 
-        GitHub does not expose a direct "linked issues" API endpoint, so we use
-        the GraphQL timeline API to surface cross-references.  For now we return
-        an empty list and leave the GraphQL implementation as a future extension;
-        the seed-context caller can fill this via the PR body parser if needed.
+        GitHub has no direct REST "linked issues" endpoint, so we fetch the PR
+        and parse closing keywords (closes/fixes/resolves #N) from its body.
 
         Args:
             repo_full_name: e.g. "owner/repo".
             pr_number: The PR number.
 
         Returns:
-            List of linked issue dicts (may be empty if none found).
+            List of dicts with a ``number`` key for each linked issue.
         """
-        # The REST API has no direct "linked issues" endpoint.
-        # Return empty list; a future issue can wire GraphQL here.
-        _ = repo_full_name, pr_number  # acknowledged unused for now
-        return []
+        pr_data = await self.get_pr(repo_full_name=repo_full_name, pr_number=pr_number)
+        body: str = pr_data.get("body") or ""
+        return parse_linked_issues_from_body(body)

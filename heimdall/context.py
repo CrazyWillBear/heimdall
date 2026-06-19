@@ -103,11 +103,12 @@ async def assemble_pr_context(
         pr_meta, diff, files, linked = await _fetch_pr_data(
             github, repo_full_name=repo_full_name, pr_number=pr_number
         )
-        file_contents = await _fetch_file_contents(
+        head_sha = pr_meta["head"]["sha"]
+        file_contents, convention_docs = await _fetch_file_contents_and_conventions(
             github,
             repo_full_name=repo_full_name,
             files=files,
-            ref=pr_meta["head"]["sha"],
+            ref=head_sha,
         )
     finally:
         await github.aclose()
@@ -119,14 +120,14 @@ async def assemble_pr_context(
         body=pr_meta.get("body") or "",
         author=pr_meta["user"]["login"],
         base_sha=pr_meta["base"]["sha"],
-        head_sha=pr_meta["head"]["sha"],
+        head_sha=head_sha,
         base_ref=pr_meta["base"]["ref"],
         head_ref=pr_meta["head"]["ref"],
         linked_issues=linked,
         diff=diff,
         changed_files=files,
         file_contents=file_contents,
-        convention_docs={},
+        convention_docs=convention_docs,
     )
 
     if workspace_dir is not None:
@@ -173,29 +174,39 @@ async def _fetch_pr_data(
     return pr_meta, diff, files, linked
 
 
-async def _fetch_file_contents(
+_CONVENTION_DOC_NAMES = ("STYLEGUIDE.md", "CLAUDE.md", "README.md")
+
+
+async def _fetch_file_contents_and_conventions(
     github: GitHubClient,
     *,
     repo_full_name: str,
     files: list[dict[str, Any]],
     ref: str,
-) -> dict[str, str]:
-    """Fetch full contents for all non-deleted changed files.
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Fetch changed-file contents and repo convention docs in parallel.
 
-    Files with status "removed" are skipped — we only read files that exist at
-    ``ref``.  Per-file failures are isolated: binary files (UnicodeDecodeError)
-    and oversize/unavailable files (HTTPStatusError) are logged and omitted from
-    the result rather than aborting the whole gather.
+    Changed files with status "removed" are skipped.  Per-file failures for
+    changed files are isolated: binary files (UnicodeDecodeError) and
+    oversize/unavailable files (HTTPStatusError) are logged and omitted rather
+    than aborting the whole gather.  Convention docs absent from the repo are
+    silently omitted (404 is tolerated via ``tolerate_missing``).
+
+    Args:
+        github: Authenticated GitHub API client.
+        repo_full_name: e.g. "owner/repo".
+        files: Changed-file objects from the PR files API.
+        ref: Git ref (commit SHA) to read from.
 
     Returns:
-        Dict mapping filename → decoded text content, with unreadable files omitted.
+        A ``(file_contents, convention_docs)`` tuple where each value maps
+        a path/name to the decoded file content, with unreadable files omitted.
     """
     import asyncio
 
-    # Only fetch files that exist at the head ref; skip deletions.
     fetchable = [f for f in files if f.get("status") != "removed"]
 
-    async def _fetch_one(filename: str) -> tuple[str, str]:
+    async def _fetch_changed(filename: str) -> tuple[str, str | None]:
         content = await github.get_file_content(
             repo_full_name=repo_full_name,
             path=filename,
@@ -203,14 +214,33 @@ async def _fetch_file_contents(
         )
         return filename, content
 
-    # return_exceptions=True prevents one bad file from aborting the gather.
-    raw_results = await asyncio.gather(
-        *(_fetch_one(f["filename"]) for f in fetchable),
+    async def _fetch_convention(name: str) -> tuple[str, str | None]:
+        content = await github.get_file_content(
+            repo_full_name=repo_full_name,
+            path=name,
+            ref=ref,
+            tolerate_missing=True,
+        )
+        return name, content
+
+    n_changed = len(fetchable)
+    changed_tasks = [_fetch_changed(f["filename"]) for f in fetchable]
+    convention_tasks = [_fetch_convention(name) for name in _CONVENTION_DOC_NAMES]
+
+    # Gather all tasks in one shot. return_exceptions=True isolates per-file
+    # errors in the changed-file slice so one bad file cannot abort the whole
+    # gather; convention tasks handle missing-file 404s via tolerate_missing.
+    all_results: list[object] = await asyncio.gather(
+        *changed_tasks,
+        *convention_tasks,
         return_exceptions=True,
     )
 
-    contents: dict[str, str] = {}
-    for item in raw_results:
+    changed_raw = all_results[:n_changed]
+    convention_raw = all_results[n_changed:]
+
+    file_contents: dict[str, str] = {}
+    for item in changed_raw:
         if isinstance(item, UnicodeDecodeError):
             # Binary file — can't decode as UTF-8; skip with a log entry.
             logger.warning(
@@ -227,10 +257,19 @@ async def _fetch_file_contents(
             # Unexpected error — re-raise so it isn't silently swallowed.
             raise item
         else:
-            filename, content = item
-            contents[filename] = content
+            filename, content = item  # type: ignore[misc]
+            if content is not None:
+                file_contents[filename] = content
 
-    return contents
+    convention_docs: dict[str, str] = {}
+    for item in convention_raw:
+        if isinstance(item, BaseException):
+            raise item
+        name, content = item  # type: ignore[misc]
+        if content is not None:
+            convention_docs[name] = content
+
+    return file_contents, convention_docs
 
 
 def _safe_file_path(files_root: Path, filename: str) -> Path | None:
@@ -273,9 +312,10 @@ def _materialize(ctx: PRContext, directory: str) -> None:
     """Write the assembled context to disk in ``directory``.
 
     Produces:
-      <directory>/diff.patch          — unified diff
-      <directory>/pr_metadata.json    — PR metadata as JSON
-      <directory>/files/<path>        — full content of each changed file
+      <directory>/diff.patch               — unified diff
+      <directory>/pr_metadata.json         — PR metadata as JSON
+      <directory>/files/<path>             — full content of each changed file
+      <directory>/conventions/<name>       — repo convention docs (if any)
     """
     root = Path(directory)
 
@@ -306,3 +346,9 @@ def _materialize(ctx: PRContext, directory: str) -> None:
             continue
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
+
+    if ctx.convention_docs:
+        conventions_root = root / "conventions"
+        conventions_root.mkdir(exist_ok=True)
+        for name, content in ctx.convention_docs.items():
+            (conventions_root / name).write_text(content, encoding="utf-8")
