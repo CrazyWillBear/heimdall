@@ -4,10 +4,10 @@ Provides subcommands:
   heimdall-context diff  <workspace>            — print the unified diff
   heimdall-context pr    <workspace>            — print PR metadata as JSON
   heimdall-context file  <workspace> <path>     — print a materialized file's content
-  heimdall-context conventions <workspace>      — print all repo convention docs
+  heimdall-context docs  <workspace>            — print all repo docs
 
 The workspace must be a directory previously produced by assemble_pr_context()
-(i.e. it contains diff.patch, pr_metadata.json, files/, and optionally conventions/).
+(i.e. it contains diff.patch, pr_metadata.json, files/, and optionally docs/).
 
 This wrapper is the ONLY allowlisted Bash command used during AI-driven lens review
 sessions — it reads from pre-materialized data and executes nothing.  The ``file``
@@ -79,21 +79,21 @@ def cmd_file(workspace: str, path: str) -> None:
     print(target.read_text(encoding="utf-8"))
 
 
-def cmd_conventions(workspace: str) -> None:
-    """Print all materialized repo convention docs from the workspace.
+def cmd_docs(workspace: str) -> None:
+    """Print all materialized repo docs from the workspace.
 
     Each doc is printed with a header showing its filename followed by its
-    content.  When no ``conventions/`` directory is present the command exits
+    content.  When no ``docs/`` directory is present the command exits
     cleanly with no output.
 
     Args:
         workspace: Path to the directory written by assemble_pr_context().
     """
-    conventions_root = Path(workspace) / "conventions"
-    if not conventions_root.exists():
+    docs_root = Path(workspace) / "docs"
+    if not docs_root.exists():
         return
 
-    for doc_path in sorted(conventions_root.iterdir()):
+    for doc_path in sorted(docs_root.iterdir()):
         if doc_path.is_file():
             print(f"=== {doc_path.name} ===")
             print(doc_path.read_text(encoding="utf-8"))
@@ -124,10 +124,8 @@ def main(argv: list[str] | None = None) -> None:
     file_parser.add_argument("workspace", help="Path to the materialized workspace")
     file_parser.add_argument("path", help="Relative path within the files/ subdirectory")
 
-    conventions_parser = sub.add_parser(
-        "conventions", help="Print all repo convention docs"
-    )
-    conventions_parser.add_argument("workspace", help="Path to the materialized workspace")
+    docs_parser = sub.add_parser("docs", help="Print all repo docs")
+    docs_parser.add_argument("workspace", help="Path to the materialized workspace")
 
     args = parser.parse_args(argv)
 
@@ -137,8 +135,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_pr(args.workspace)
     elif args.subcommand == "file":
         cmd_file(args.workspace, args.path)
-    elif args.subcommand == "conventions":
-        cmd_conventions(args.workspace)
+    elif args.subcommand == "docs":
+        cmd_docs(args.workspace)
     else:
         # argparse makes this unreachable, but keeps mypy happy
         parser.print_help()

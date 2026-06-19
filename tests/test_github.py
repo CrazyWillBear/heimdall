@@ -554,7 +554,7 @@ async def test_get_linked_issues_empty_when_no_keywords() -> None:
 
 
 # ---------------------------------------------------------------------------
-# get_file_content: 404 tolerance for convention doc fetching
+# get_file_content: 404 tolerance for doc fetching
 # ---------------------------------------------------------------------------
 
 
