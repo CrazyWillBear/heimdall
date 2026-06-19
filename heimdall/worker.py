@@ -1,14 +1,19 @@
 """Arq worker: the run_review task function and WorkerSettings.
 
 Context keys populated by WorkerSettings.on_startup:
-    db:          heimdall.db.Database instance
-    app_id:      GitHub App numeric ID (int)
-    private_key: PEM-encoded RSA private key (str)
+    db:                   heimdall.db.Database instance
+    app_id:               GitHub App numeric ID (int)
+    private_key:          PEM-encoded RSA private key (str)
+    claude_binary:        path/name of the claude CLI (str)
+    lens_token_cap:       per-agent cumulative-token cap (int)
+    lens_timeout_seconds: wall-clock timeout for a lens run (float)
 
 run_review builds a GitHubClient per-job using ctx["app_id"], ctx["private_key"],
-and the per-job installation_id argument.  This sidesteps the single-installation
-constraint of GitHubClient.__init__ and is consistent with future issues (#3, #4)
-where each job may target a different installation.
+and the per-job installation_id argument.  It assembles the PR seed context into
+a temporary workspace, runs the Security lens (``claude -p``) over it, maps the
+findings to a verdict, and posts exactly one PR review.  A lens failure (timeout
+or token-cap abort) is logged and the job ends without posting — it never crashes
+the worker.
 
 Launch the worker with:
     arq heimdall.worker.WorkerSettings
@@ -17,16 +22,26 @@ Launch the worker with:
 from __future__ import annotations
 
 import logging
+import shutil
+import tempfile
 from typing import Any
 
 from arq.connections import RedisSettings
 
+from heimdall.context import assemble_pr_context
 from heimdall.db import Database, get_last_reviewed_sha, set_last_reviewed_sha
 from heimdall.github import GitHubClient
+from heimdall.lens import (
+    DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_TOKEN_CAP,
+    SECURITY_LENS,
+    LensError,
+    format_review_body,
+    run_lens,
+    verdict_for,
+)
 
 logger = logging.getLogger(__name__)
-
-_REVIEW_BODY = "Heimdall received this PR"
 
 
 def _db_path_from_url(database_url: str) -> str:
@@ -51,16 +66,20 @@ async def run_review(
     pr_number: int,
     head_sha: str,
 ) -> None:
-    """Arq task: post a hardcoded review comment for the given PR.
+    """Arq task: run the Security lens over the PR and post one review.
 
-    Skips if the same head SHA was already reviewed (idempotency guard).
-    Records the head SHA after a successful review so it is not re-posted.
+    Skips if the same head SHA was already reviewed (idempotency guard).  On a
+    fresh SHA it assembles the seed context, runs the Security lens, maps the
+    findings to a verdict (REQUEST_CHANGES for any high/critical finding, else
+    COMMENT), posts exactly one PR review, and records the SHA.  A lens failure
+    (timeout or token-cap abort) is logged and the job returns without posting.
 
     A GitHubClient is constructed per-job from the app credentials in ctx so
     that each job can target a different GitHub App installation.
 
     Args:
-        ctx: Arq worker context carrying ``db``, ``app_id``, and ``private_key``.
+        ctx: Arq worker context carrying ``db``, ``app_id``, ``private_key``,
+            and the optional lens knobs.
         installation_id: GitHub App installation ID for this PR.
         repo_full_name: e.g. "owner/repo".
         pr_number: The pull-request number.
@@ -85,15 +104,29 @@ async def run_review(
             )
             return
 
+        review = await _run_security_lens(
+            ctx,
+            installation_id=installation_id,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+        )
+        if review is None:
+            return  # Lens failed; failure already logged. Do not post or record SHA.
+
+        body, event = review
         logger.info(
-            "Posting review for %s#%d @ %s", repo_full_name, pr_number, head_sha
+            "Posting %s review for %s#%d @ %s",
+            event,
+            repo_full_name,
+            pr_number,
+            head_sha,
         )
         await github_client.post_review(
             repo_full_name=repo_full_name,
             pr_number=pr_number,
             commit_id=head_sha,
-            body=_REVIEW_BODY,
-            event="COMMENT",
+            body=body,
+            event=event,
         )
         await set_last_reviewed_sha(
             db, repo_full_name=repo_full_name, pr_number=pr_number, sha=head_sha
@@ -103,6 +136,52 @@ async def run_review(
         )
     finally:
         await github_client.aclose()
+
+
+async def _run_security_lens(
+    ctx: dict[str, Any],
+    *,
+    installation_id: int,
+    repo_full_name: str,
+    pr_number: int,
+) -> tuple[str, str] | None:
+    """Assemble seed context and run the Security lens, returning (body, event).
+
+    The seed context is materialized into a temporary workspace that the lens
+    reads via the heimdall-context wrapper; the workspace is removed afterwards.
+
+    Returns:
+        A ``(review_body, review_event)`` tuple, or None when the lens aborts
+        (timeout or token-cap breach) — the caller then skips posting.
+    """
+    workspace = tempfile.mkdtemp(prefix="heimdall-lens-")
+    try:
+        await assemble_pr_context(
+            app_id=ctx["app_id"],
+            private_key=ctx["private_key"],
+            installation_id=installation_id,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            workspace_dir=workspace,
+        )
+        result = await run_lens(
+            lens=SECURITY_LENS,
+            workspace_dir=workspace,
+            claude_binary=ctx.get("claude_binary", "claude"),
+            token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
+            timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+        )
+    except LensError:
+        logger.exception(
+            "Security lens aborted for %s#%d; skipping review",
+            repo_full_name,
+            pr_number,
+        )
+        return None
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    return format_review_body(result.findings), verdict_for(result.findings)
 
 
 def _load_settings() -> Any:
@@ -148,9 +227,12 @@ class WorkerSettings:
 
         Reads Settings from the environment, overrides redis_settings on the
         class, then populates ctx with:
-            db:          initialised Database instance
-            app_id:      GitHub App numeric ID
-            private_key: PEM-encoded RSA private key
+            db:                   initialised Database instance
+            app_id:               GitHub App numeric ID
+            private_key:          PEM-encoded RSA private key
+            claude_binary:        path/name of the claude CLI
+            lens_token_cap:       per-agent cumulative-token cap
+            lens_timeout_seconds: wall-clock timeout for a lens run
         """
         global settings
         if settings is None:
@@ -165,6 +247,9 @@ class WorkerSettings:
         ctx["db"] = db
         ctx["app_id"] = settings.github_app_id
         ctx["private_key"] = settings.github_app_private_key
+        ctx["claude_binary"] = settings.claude_binary
+        ctx["lens_token_cap"] = settings.lens_token_cap
+        ctx["lens_timeout_seconds"] = settings.lens_timeout_seconds
 
     @staticmethod
     async def on_shutdown(ctx: dict[str, Any]) -> None:

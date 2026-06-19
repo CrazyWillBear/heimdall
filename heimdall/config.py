@@ -20,5 +20,14 @@ class Settings(BaseSettings):
     database_url: str = Field(
         default="sqlite+aiosqlite:///./heimdall.db", description="SQLite DB URL"
     )
+    claude_binary: str = Field(
+        default="claude", description="Path or name of the claude CLI executable"
+    )
+    lens_token_cap: int = Field(
+        default=400_000, description="Per-agent cumulative-token cap for a lens run"
+    )
+    lens_timeout_seconds: float = Field(
+        default=1_800.0, description="Wall-clock timeout (s) before a lens subprocess is killed"
+    )
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}

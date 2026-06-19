@@ -1,11 +1,18 @@
-"""Tests for the Arq worker: posts exactly one review, updates last SHA."""
+"""Tests for the Arq worker: runs the security lens and posts one review."""
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from heimdall.lens import (
+    Finding,
+    LensResult,
+    LensTimeoutError,
+    Severity,
+)
 from heimdall.worker import WorkerSettings, run_review
 
 _REPO = "owner/repo"
@@ -14,6 +21,35 @@ _SHA = "sha1234"
 _INSTALL_ID = 42
 _APP_ID = 1
 _PRIVATE_KEY = "key"
+
+
+def _lens_result(findings: list[Finding]) -> LensResult:
+    return LensResult(lens_name="security", findings=findings)
+
+
+def _patch_review_pipeline(
+    *,
+    lens_result: LensResult | None = None,
+    lens_side_effect: BaseException | None = None,
+    last_sha: str | None = None,
+) -> ExitStack:
+    """Patch the worker's seed-assembly, lens run, and SHA helpers in one block.
+
+    Returns an ExitStack-managed context manager; callers use it under ``with``.
+    """
+    stack = ExitStack()
+    stack.enter_context(
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=last_sha))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock()))
+    )
+    if lens_side_effect is not None:
+        run_lens_mock: AsyncMock = AsyncMock(side_effect=lens_side_effect)
+    else:
+        run_lens_mock = AsyncMock(return_value=lens_result)
+    stack.enter_context(patch("heimdall.worker.run_lens", new=run_lens_mock))
+    return stack
 
 
 # ---------------------------------------------------------------------------
@@ -34,8 +70,9 @@ async def test_run_review_posts_exactly_one_review() -> None:
         "private_key": _PRIVATE_KEY,
     }
 
+    findings = [Finding(severity=Severity.LOW, title="nit", message="style", location=None)]
     with (
-        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
+        _patch_review_pipeline(lens_result=_lens_result(findings)),
         patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()) as mock_set,
         patch("heimdall.worker.GitHubClient", return_value=mock_gh_client) as mock_cls,
     ):
@@ -52,32 +89,123 @@ async def test_run_review_posts_exactly_one_review() -> None:
         private_key=_PRIVATE_KEY,
         installation_id=_INSTALL_ID,
     )
-    mock_gh_client.post_review.assert_awaited_once_with(
-        repo_full_name=_REPO,
-        pr_number=_PR,
-        commit_id=_SHA,
-        body="Heimdall received this PR",
-        event="COMMENT",
-    )
+    mock_gh_client.post_review.assert_awaited_once()
+    assert mock_gh_client.post_review.await_count == 1
     mock_set.assert_awaited_once_with(
         mock_db, repo_full_name=_REPO, pr_number=_PR, sha=_SHA
     )
 
 
 @pytest.mark.asyncio
-async def test_run_review_skips_already_reviewed_sha() -> None:
-    """Worker skips posting if the head SHA was already reviewed."""
-    mock_db = AsyncMock()
+async def test_run_review_reflects_planted_finding_in_body() -> None:
+    """A planted security finding (mocked lens output) shows up in the review body."""
     mock_gh_client = AsyncMock()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
 
-    ctx: dict[str, object] = {
-        "db": mock_db,
-        "app_id": _APP_ID,
-        "private_key": _PRIVATE_KEY,
-    }
+    findings = [
+        Finding(
+            severity=Severity.HIGH,
+            title="SQL injection",
+            message="User input concatenated into a query",
+            location="app/db.py:12",
+        )
+    ]
+    with (
+        _patch_review_pipeline(lens_result=_lens_result(findings)),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    posted = mock_gh_client.post_review.await_args.kwargs
+    assert "SQL injection" in posted["body"]
+    assert "app/db.py:12" in posted["body"]
+
+
+@pytest.mark.asyncio
+async def test_run_review_high_finding_requests_changes() -> None:
+    """A high/critical finding posts event=REQUEST_CHANGES."""
+    mock_gh_client = AsyncMock()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    findings = [Finding(severity=Severity.HIGH, title="x", message="m", location=None)]
+    with (
+        _patch_review_pipeline(lens_result=_lens_result(findings)),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    assert mock_gh_client.post_review.await_args.kwargs["event"] == "REQUEST_CHANGES"
+
+
+@pytest.mark.asyncio
+async def test_run_review_no_findings_posts_comment() -> None:
+    """No findings posts event=COMMENT."""
+    mock_gh_client = AsyncMock()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
 
     with (
-        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=_SHA)),
+        _patch_review_pipeline(lens_result=_lens_result([])),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    assert mock_gh_client.post_review.await_args.kwargs["event"] == "COMMENT"
+
+
+@pytest.mark.asyncio
+async def test_run_review_handles_lens_failure_without_crashing() -> None:
+    """A lens timeout is handled: no crash, no review posted, SHA not recorded."""
+    mock_gh_client = AsyncMock()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    with (
+        _patch_review_pipeline(lens_side_effect=LensTimeoutError("killed")),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()) as mock_set,
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        # Must not raise — the worker swallows lens failures gracefully.
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    mock_gh_client.post_review.assert_not_called()
+    mock_set.assert_not_called()
+    mock_gh_client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_review_skips_already_reviewed_sha() -> None:
+    """Worker skips posting (and the lens) if the head SHA was already reviewed."""
+    mock_gh_client = AsyncMock()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    with (
+        _patch_review_pipeline(lens_result=_lens_result([]), last_sha=_SHA),
         patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
     ):
         await run_review(
@@ -94,18 +222,12 @@ async def test_run_review_skips_already_reviewed_sha() -> None:
 @pytest.mark.asyncio
 async def test_run_review_closes_github_client_after_posting() -> None:
     """run_review closes the GitHubClient after posting a review (no FD leak)."""
-    mock_db = AsyncMock()
     mock_gh_client = AsyncMock()
     mock_gh_client.post_review = AsyncMock()
-
-    ctx: dict[str, object] = {
-        "db": mock_db,
-        "app_id": _APP_ID,
-        "private_key": _PRIVATE_KEY,
-    }
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
 
     with (
-        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
+        _patch_review_pipeline(lens_result=_lens_result([])),
         patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
         patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
     ):
@@ -123,17 +245,11 @@ async def test_run_review_closes_github_client_after_posting() -> None:
 @pytest.mark.asyncio
 async def test_run_review_closes_github_client_on_skip_path() -> None:
     """run_review closes the GitHubClient even when the review is skipped."""
-    mock_db = AsyncMock()
     mock_gh_client = AsyncMock()
-
-    ctx: dict[str, object] = {
-        "db": mock_db,
-        "app_id": _APP_ID,
-        "private_key": _PRIVATE_KEY,
-    }
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
 
     with (
-        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=_SHA)),
+        _patch_review_pipeline(lens_result=_lens_result([]), last_sha=_SHA),
         patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
     ):
         await run_review(
