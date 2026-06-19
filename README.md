@@ -120,6 +120,15 @@ lenses:                         # per-lens model/effort/enable overrides
     effort: max
   design:
     enabled: false              # a disabled lens never runs and never reaches synthesis
+  cleanliness:
+    instructions: |             # APPENDED to (not a replacement for) the built-in prompt
+      Flag TODO/FIXME comments left in the diff.
+custom_lenses:                  # user-defined lenses that run alongside the built-ins
+  - name: accessibility         # must be unique and not collide with a built-in name
+    system_prompt: |            # required; the lens's review instructions
+      Review the diff for web accessibility (WCAG) regressions.
+    model: sonnet               # optional, default sonnet
+    effort: high                # optional, default high
 scope:                          # filters that skip the PR entirely
   base_branches: [main]         # allowlist; empty = any base branch
   paths: ['src/**']             # glob allowlist of changed paths; empty = any path
@@ -137,6 +146,27 @@ caps:                           # guardrail caps; every field has a SAFE default
 The worker gate (`_gate_review` in `heimdall/worker.py`) loads this config, applies the
 scope filters (`skip_reason`), then threads lens tuning (`tuned_lenses`) and the blocking
 threshold (`blocking_severities`) into the pipeline.
+
+**Per-lens `instructions`** (`LensConfig.instructions` in `heimdall/repo_config.py`) — an
+optional field on each entry under `lenses:`. Its text is **appended to** (not a replacement
+for) that built-in lens's system prompt, so the lens keeps its built-in identity and runs with
+the extra guidance (`tuned_lenses` / `_tuned_builtin`). Like all config it is read from the
+trust-resolved ref (**base for forks**), so a fork PR can never inject prompt text.
+
+**Custom lenses** (`custom_lenses` / `CustomLensConfig` in `heimdall/repo_config.py`) — a list
+of user-defined lenses that run **alongside** the built-ins over the same shared seed, each
+turned into a `LensSpec` by `tuned_lenses` and run via the same `run_lens` path (same token cap
+and timeout); their findings reach synthesis **tagged by `name`**. Each entry takes:
+
+- `name` — required; **must not collide** with a built-in lens name (`security`/`design`/
+  `cleanliness`) and **must be unique** across custom lenses (the names tag findings, so a
+  collision is rejected at load time by `RepoConfig`'s validator).
+- `system_prompt` — **required**; the lens's review instructions.
+- `model` — optional, default **`sonnet`**.
+- `effort` — optional, default **`high`**.
+
+Like the built-in prompts, a custom lens's `system_prompt` is read from the trust-resolved ref
+(**base for forks**), so a fork PR can never inject a custom-lens prompt.
 
 **Guardrail caps** (`GuardrailCaps` in `heimdall/repo_config.py`) bound review cost; every
 cap has a safe, non-unbounded default so an absent `caps` block still has ceilings. They are
