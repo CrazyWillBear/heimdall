@@ -54,12 +54,15 @@ def _build_job(body: dict[str, Any]) -> ReviewJob:
     )
 
 
-def make_webhook_router(*, webhook_secret: str, arq_pool: Any) -> APIRouter:
+def make_webhook_router(*, webhook_secret: str) -> APIRouter:
     """Return a configured APIRouter with the /webhook POST endpoint.
+
+    The handler reads the Arq pool from ``request.app.state.arq_pool`` at
+    request time so it picks up the pool created by the app's lifespan hook,
+    even though the router is built before the lifespan runs.
 
     Args:
         webhook_secret: The HMAC secret to verify incoming requests.
-        arq_pool: The connected Arq Redis pool used for enqueuing jobs.
     """
     router = APIRouter()
 
@@ -88,8 +91,11 @@ def make_webhook_router(*, webhook_secret: str, arq_pool: Any) -> APIRouter:
             return Response(status_code=204)
 
         job = _build_job(body)
+        # Resolve the pool at request time from app.state so the lifespan-created
+        # pool is always used, regardless of when the router was constructed.
+        pool = request.app.state.arq_pool
         # Enqueue in background so this handler acks immediately.
-        background_tasks.add_task(enqueue_review, arq_pool, job)
+        background_tasks.add_task(enqueue_review, pool, job)
 
         logger.info(
             "Enqueuing review for %s#%d action=%s sha=%s",

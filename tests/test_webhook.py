@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from heimdall.app import create_app
 from heimdall.config import Settings
+from heimdall.queue import ReviewJob
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -157,3 +158,61 @@ def test_irrelevant_action_ignored(app_client: tuple[TestClient, MagicMock]) -> 
     response = client.post("/webhook", content=payload, headers=headers)
     assert response.status_code == 204
     mock_enqueue.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Lifespan / app.state pool wiring tests
+# ---------------------------------------------------------------------------
+
+
+def test_lifespan_creates_and_closes_pool() -> None:
+    """The lifespan creates an Arq pool on startup and closes it on shutdown."""
+    settings = _make_settings()
+    mock_pool = AsyncMock()
+    mock_pool.close = AsyncMock()
+
+    with (
+        patch("arq.create_pool", return_value=mock_pool) as mock_create,
+        patch("heimdall.webhook.enqueue_review", AsyncMock(return_value="jid")),
+    ):
+        app = create_app(settings)
+        with TestClient(app, raise_server_exceptions=True):
+            # Inside the context manager the lifespan startup has run.
+            mock_create.assert_called_once()
+        # After exiting the context manager the lifespan shutdown has run.
+        mock_pool.close.assert_called_once()
+
+
+def test_webhook_reads_pool_from_app_state() -> None:
+    """The webhook handler uses the pool from app.state, not a captured closure value.
+
+    Patches arq.create_pool so the lifespan doesn't need a real Redis.  The pool
+    placed on app.state by the lifespan is what the handler must receive.
+    """
+    settings = _make_settings()
+    mock_pool = AsyncMock()
+    mock_pool.close = AsyncMock()
+    captured_pools: list[object] = []
+
+    async def fake_enqueue(pool: object, job: ReviewJob) -> str:
+        captured_pools.append(pool)
+        return "jid"
+
+    payload = json.dumps(_pr_payload()).encode()
+    headers = {
+        "X-GitHub-Event": "pull_request",
+        "X-Hub-Signature-256": _sign(payload, _SECRET),
+        "Content-Type": "application/json",
+    }
+    with (
+        patch("arq.create_pool", return_value=mock_pool),
+        patch("heimdall.webhook.enqueue_review", side_effect=fake_enqueue),
+    ):
+        app = create_app(settings)
+        with TestClient(app, raise_server_exceptions=True) as client:
+            response = client.post("/webhook", content=payload, headers=headers)
+
+    assert response.status_code == 202
+    assert len(captured_pools) == 1
+    # The handler must have received the pool the lifespan put on app.state.
+    assert captured_pools[0] is mock_pool
