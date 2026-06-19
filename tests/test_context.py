@@ -434,3 +434,92 @@ def test_context_module_does_not_import_subprocess() -> None:
     assert not hasattr(ctx_mod, "subprocess"), (
         "heimdall.context imported subprocess — no code execution allowed"
     )
+
+
+# ---------------------------------------------------------------------------
+# Path traversal: _materialize must reject attacker-controlled filenames
+# ---------------------------------------------------------------------------
+
+
+def _make_context_with_files(file_contents: dict[str, str]) -> PRContext:
+    """Build a minimal PRContext with the given file_contents mapping."""
+    return PRContext(
+        repo_full_name=_REPO,
+        pr_number=_PR_NUMBER,
+        title=_TITLE,
+        body=_BODY,
+        author=_AUTHOR,
+        base_sha=_BASE_SHA,
+        head_sha=_HEAD_SHA,
+        base_ref=_BASE_REF,
+        head_ref=_HEAD_REF,
+        linked_issues=[],
+        diff="",
+        changed_files=[],
+        file_contents=file_contents,
+        convention_docs={},
+    )
+
+
+def test_materialize_rejects_absolute_filename(tmp_path: Path) -> None:
+    """_materialize must not write files whose filename is an absolute path."""
+    from heimdall.context import _materialize
+
+    ctx = _make_context_with_files({"/etc/cron.d/x": "evil content"})
+    # Must complete without raising, but must not write outside the workspace.
+    _materialize(ctx, str(tmp_path))
+
+    # Confirm nothing escaped: scan everything materialized under files/
+    files_root = tmp_path / "files"
+    workspace_root = str(tmp_path.resolve())
+    if files_root.exists():
+        for p in files_root.rglob("*"):
+            if p.is_file():
+                assert str(p.resolve()).startswith(workspace_root), (
+                    f"File escaped workspace: {p}"
+                )
+    # The hostile absolute target must not have been written (or has different size
+    # if it pre-existed, which indicates we did not overwrite it).
+    hostile = Path("/etc/cron.d/x")
+    assert not hostile.exists() or hostile.stat().st_size != len("evil content")
+
+
+def test_materialize_rejects_traversal_filename(tmp_path: Path) -> None:
+    """_materialize must not write files that escape via ../ traversal."""
+    from heimdall.context import _materialize
+
+    # Place the workspace one level deep so ../evil.txt would escape it.
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    escape_target = tmp_path / "evil.txt"
+
+    # ../evil.txt relative to files_root (<workspace>/files/) resolves to
+    # <workspace>/evil.txt — still inside workspace — so use ../../evil.txt
+    # to reach tmp_path/evil.txt which is outside the workspace directory.
+    ctx = _make_context_with_files({"../../evil.txt": "evil content"})
+    _materialize(ctx, str(workspace))
+
+    assert not escape_target.exists(), (
+        "Traversal escaped the workspace: evil.txt found outside workspace dir"
+    )
+    # Verify all written files are within the workspace
+    files_root = workspace / "files"
+    workspace_root = str(workspace.resolve())
+    if files_root.exists():
+        for p in files_root.rglob("*"):
+            if p.is_file():
+                assert str(p.resolve()).startswith(workspace_root), (
+                    f"File escaped workspace: {p}"
+                )
+
+
+def test_materialize_normal_nested_path(tmp_path: Path) -> None:
+    """_materialize writes normal nested paths correctly under files/."""
+    from heimdall.context import _materialize
+
+    ctx = _make_context_with_files({"pkg/mod/foo.py": "# content\n"})
+    _materialize(ctx, str(tmp_path))
+
+    expected = tmp_path / "files" / "pkg" / "mod" / "foo.py"
+    assert expected.exists(), f"Expected file not found: {expected}"
+    assert expected.read_text() == "# content\n"

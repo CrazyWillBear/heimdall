@@ -200,6 +200,42 @@ async def _fetch_file_contents(
     return dict(results)
 
 
+def _safe_file_path(files_root: Path, filename: str) -> Path | None:
+    """Return the resolved path for ``filename`` inside ``files_root``, or None.
+
+    Rejects filenames that would escape ``files_root`` — including absolute
+    paths (e.g. ``/etc/passwd``) and relative traversals (e.g. ``../../x``).
+    The check resolves symlinks so that a cleverly crafted path cannot bypass
+    the guard via a symlink outside the tree.
+
+    Args:
+        files_root: The directory all changed files must be written under.
+        filename: The PR-supplied filename (attacker-controlled).
+
+    Returns:
+        The safe resolved ``Path`` if ``filename`` stays inside ``files_root``,
+        or ``None`` if it would escape.
+    """
+    # Resolve files_root once; this is our confinement boundary.
+    resolved_root = files_root.resolve()
+
+    # Reject absolute paths outright — Path('/foo') / Path('/etc/passwd') would
+    # discard the base entirely and write to /etc/passwd.
+    raw = Path(filename)
+    if raw.is_absolute():
+        return None
+
+    candidate = (files_root / raw).resolve()
+
+    # Verify the resolved path is still inside files_root.
+    try:
+        candidate.relative_to(resolved_root)
+    except ValueError:
+        return None
+
+    return candidate
+
+
 def _materialize(ctx: PRContext, directory: str) -> None:
     """Write the assembled context to disk in ``directory``.
 
@@ -231,6 +267,9 @@ def _materialize(ctx: PRContext, directory: str) -> None:
     files_root = root / "files"
     files_root.mkdir(exist_ok=True)
     for filename, content in ctx.file_contents.items():
-        file_path = files_root / Path(filename)
+        file_path = _safe_file_path(files_root, filename)
+        if file_path is None:
+            # Reject filenames that would escape the workspace (absolute or traversal).
+            continue
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
