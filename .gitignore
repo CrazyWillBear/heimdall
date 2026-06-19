@@ -13,3 +13,6 @@ dist/
 .env
 secrets/
 *.db
+
+# local dogfood override (subscription auth)
+docker-compose.override.yml
