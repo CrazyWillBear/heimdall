@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from heimdall.context import PRContext, assemble_pr_context
-from heimdall.context_cli import cmd_diff, cmd_pr, main
+from heimdall.context_cli import cmd_conventions, cmd_diff, cmd_file, cmd_pr, main
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -434,3 +434,210 @@ def test_context_module_does_not_import_subprocess() -> None:
     assert not hasattr(ctx_mod, "subprocess"), (
         "heimdall.context imported subprocess — no code execution allowed"
     )
+
+
+# ---------------------------------------------------------------------------
+# convention_docs: populated from repo at head_sha
+# ---------------------------------------------------------------------------
+
+_CONVENTION_DOCS = {
+    "STYLEGUIDE.md": "# Style Guide\n\nBe consistent.",
+    "CLAUDE.md": "# CLAUDE\n\nWorkflow rules.",
+}
+
+
+def _make_mock_github_client_with_conventions(
+    convention_docs: dict[str, str] | None = None,
+) -> AsyncMock:
+    """Build a mocked GitHubClient that returns convention docs."""
+    docs = convention_docs if convention_docs is not None else _CONVENTION_DOCS
+
+    async def _get_file_content(
+        *,
+        repo_full_name: str,
+        path: str,
+        ref: str,
+        tolerate_missing: bool = False,
+    ) -> str | None:
+        return docs.get(path)  # returns None for missing docs
+
+    client = AsyncMock()
+    client.get_pr_diff = AsyncMock(return_value=_DIFF)
+    client.get_pr_files = AsyncMock(return_value=_FILES)
+    client.get_pr = AsyncMock(return_value=_PR_METADATA)
+    client.get_file_content = _get_file_content
+    client.get_linked_issues = AsyncMock(return_value=_LINKED_ISSUES)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_convention_docs_populated() -> None:
+    """Assembled seed includes convention docs from the repo."""
+    mock_client = _make_mock_github_client_with_conventions()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    assert "STYLEGUIDE.md" in ctx.convention_docs
+    assert "CLAUDE.md" in ctx.convention_docs
+    assert ctx.convention_docs["STYLEGUIDE.md"] == _CONVENTION_DOCS["STYLEGUIDE.md"]
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_convention_docs_missing_tolerated() -> None:
+    """Convention docs missing from the repo (None) are omitted, not an error."""
+    # Only CLAUDE.md present, STYLEGUIDE.md and README.md missing
+    mock_client = _make_mock_github_client_with_conventions({"CLAUDE.md": "rules"})
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    assert "CLAUDE.md" in ctx.convention_docs
+    assert "STYLEGUIDE.md" not in ctx.convention_docs
+    assert "README.md" not in ctx.convention_docs
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_materializes_convention_docs() -> None:
+    """assemble_pr_context materializes convention docs under conventions/."""
+    mock_client = _make_mock_github_client_with_conventions()
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        conventions_dir = Path(tmp_dir) / "conventions"
+        assert conventions_dir.exists()
+        assert (conventions_dir / "STYLEGUIDE.md").exists()
+        assert (conventions_dir / "STYLEGUIDE.md").read_text() == _CONVENTION_DOCS["STYLEGUIDE.md"]
+
+
+# ---------------------------------------------------------------------------
+# heimdall-context CLI: file subcommand (with path sanitization)
+# ---------------------------------------------------------------------------
+
+
+def _make_context_with_conventions() -> PRContext:
+    return PRContext(
+        repo_full_name=_REPO,
+        pr_number=_PR_NUMBER,
+        title=_TITLE,
+        body=_BODY,
+        author=_AUTHOR,
+        base_sha=_BASE_SHA,
+        head_sha=_HEAD_SHA,
+        base_ref=_BASE_REF,
+        head_ref=_HEAD_REF,
+        linked_issues=_LINKED_ISSUES,
+        diff=_DIFF,
+        changed_files=_FILES,
+        file_contents={"foo.py": _FILE_CONTENT},
+        convention_docs=_CONVENTION_DOCS,
+    )
+
+
+def _write_workspace_with_conventions(tmp_path: Path, ctx: PRContext) -> Path:
+    """Write a full materialized workspace including convention docs."""
+    ws = _write_workspace(tmp_path, ctx)
+    conventions_dir = tmp_path / "conventions"
+    conventions_dir.mkdir()
+    for name, content in ctx.convention_docs.items():
+        (conventions_dir / name).write_text(content)
+    return ws
+
+
+def test_cmd_file_reads_changed_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """heimdall-context file prints the content of a materialized changed file."""
+    ctx = _make_context_with_conventions()
+    workspace = _write_workspace_with_conventions(tmp_path, ctx)
+    cmd_file(str(workspace), "foo.py")
+    captured = capsys.readouterr()
+    assert _FILE_CONTENT in captured.out
+
+
+def test_cmd_file_rejects_path_traversal(tmp_path: Path) -> None:
+    """heimdall-context file rejects paths that escape the workspace."""
+    ctx = _make_context_with_conventions()
+    workspace = _write_workspace_with_conventions(tmp_path, ctx)
+    with pytest.raises(SystemExit):
+        cmd_file(str(workspace), "../secret.txt")
+
+
+def test_cmd_file_rejects_absolute_path(tmp_path: Path) -> None:
+    """heimdall-context file rejects absolute paths."""
+    ctx = _make_context_with_conventions()
+    workspace = _write_workspace_with_conventions(tmp_path, ctx)
+    with pytest.raises(SystemExit):
+        cmd_file(str(workspace), "/etc/passwd")
+
+
+def test_cmd_file_missing_file_exits(tmp_path: Path) -> None:
+    """heimdall-context file exits non-zero when the requested file doesn't exist."""
+    ctx = _make_context_with_conventions()
+    workspace = _write_workspace_with_conventions(tmp_path, ctx)
+    with pytest.raises(SystemExit):
+        cmd_file(str(workspace), "nonexistent.py")
+
+
+def test_main_file_subcommand(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """main() dispatches 'file' subcommand correctly."""
+    ctx = _make_context_with_conventions()
+    workspace = _write_workspace_with_conventions(tmp_path, ctx)
+    main(["file", str(workspace), "foo.py"])
+    captured = capsys.readouterr()
+    assert _FILE_CONTENT in captured.out
+
+
+# ---------------------------------------------------------------------------
+# heimdall-context CLI: conventions subcommand
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_conventions_reads_convention_docs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """heimdall-context conventions prints all convention docs."""
+    ctx = _make_context_with_conventions()
+    workspace = _write_workspace_with_conventions(tmp_path, ctx)
+    cmd_conventions(str(workspace))
+    captured = capsys.readouterr()
+    # Both docs must appear in the output
+    assert "STYLEGUIDE.md" in captured.out
+    assert "Be consistent" in captured.out
+    assert "CLAUDE.md" in captured.out
+
+
+def test_cmd_conventions_empty_when_no_docs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """heimdall-context conventions outputs nothing when conventions/ is absent."""
+    ctx = _make_context()  # no convention docs materialized
+    workspace = _write_workspace(tmp_path, ctx)
+    cmd_conventions(str(workspace))
+    captured = capsys.readouterr()
+    # Should not raise; output may be empty or a notice
+    assert isinstance(captured.out, str)
+
+
+def test_main_conventions_subcommand(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """main() dispatches 'conventions' subcommand correctly."""
+    ctx = _make_context_with_conventions()
+    workspace = _write_workspace_with_conventions(tmp_path, ctx)
+    main(["conventions", str(workspace)])
+    captured = capsys.readouterr()
+    assert "STYLEGUIDE.md" in captured.out

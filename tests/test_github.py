@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from heimdall.github import GitHubClient, make_jwt
+from heimdall.github import GitHubClient, make_jwt, parse_linked_issues_from_body
 
 
 def test_make_jwt_returns_string() -> None:
@@ -123,3 +123,154 @@ async def test_async_context_manager_does_not_close_injected_client() -> None:
         pass
 
     mock_http.aclose.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# parse_linked_issues_from_body: closing-keyword parser
+# ---------------------------------------------------------------------------
+
+
+def test_parse_linked_issues_closes_keyword() -> None:
+    """'closes #N' extracts issue number N."""
+    results = parse_linked_issues_from_body("closes #42")
+    assert results == [{"number": 42}]
+
+
+def test_parse_linked_issues_fixes_keyword() -> None:
+    """'fixes #N' extracts issue number N."""
+    results = parse_linked_issues_from_body("Fixes #7")
+    assert results == [{"number": 7}]
+
+
+def test_parse_linked_issues_resolves_keyword() -> None:
+    """'resolves #N' extracts issue number N."""
+    results = parse_linked_issues_from_body("resolves #100")
+    assert results == [{"number": 100}]
+
+
+def test_parse_linked_issues_multiple() -> None:
+    """Multiple closing references in one body are all extracted."""
+    body = "This PR closes #1 and fixes #2.\nAlso resolves #3."
+    results = parse_linked_issues_from_body(body)
+    numbers = [r["number"] for r in results]
+    assert sorted(numbers) == [1, 2, 3]
+
+
+def test_parse_linked_issues_deduplicates() -> None:
+    """The same issue referenced twice yields one entry."""
+    body = "closes #5\ncloses #5"
+    results = parse_linked_issues_from_body(body)
+    assert results == [{"number": 5}]
+
+
+def test_parse_linked_issues_empty_body() -> None:
+    """An empty body yields no linked issues."""
+    assert parse_linked_issues_from_body("") == []
+
+
+def test_parse_linked_issues_no_keywords() -> None:
+    """A body with no closing keywords yields an empty list."""
+    assert parse_linked_issues_from_body("Just a plain description with #5 but no keyword.") == []
+
+
+def test_parse_linked_issues_case_insensitive() -> None:
+    """Keyword matching is case-insensitive."""
+    results = parse_linked_issues_from_body("CLOSES #10")
+    assert results == [{"number": 10}]
+
+
+# ---------------------------------------------------------------------------
+# get_linked_issues: integration with PR body
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_linked_issues_parses_pr_body() -> None:
+    """get_linked_issues fetches the PR and parses closing keywords from the body."""
+    mock_pr_response = MagicMock()
+    mock_pr_response.raise_for_status = MagicMock()
+    mock_pr_response.json = MagicMock(
+        return_value={
+            "number": 1,
+            "title": "Test PR",
+            "body": "Fixes #99 and closes #100.",
+            "user": {"login": "dev"},
+            "base": {"sha": "aaa", "ref": "main", "repo": {"full_name": "owner/repo"}},
+            "head": {"sha": "bbb", "ref": "feat"},
+        }
+    )
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=mock_pr_response)
+
+    with patch("heimdall.github.make_jwt", return_value="fake.jwt"), patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        results = await client.get_linked_issues(repo_full_name="owner/repo", pr_number=1)
+
+    numbers = sorted(r["number"] for r in results)
+    assert numbers == [99, 100]
+
+
+@pytest.mark.asyncio
+async def test_get_linked_issues_empty_when_no_keywords() -> None:
+    """get_linked_issues returns [] when the PR body has no closing keywords."""
+    mock_pr_response = MagicMock()
+    mock_pr_response.raise_for_status = MagicMock()
+    mock_pr_response.json = MagicMock(
+        return_value={
+            "number": 2,
+            "title": "No issues",
+            "body": "Just a description.",
+            "user": {"login": "dev"},
+            "base": {"sha": "aaa", "ref": "main", "repo": {"full_name": "owner/repo"}},
+            "head": {"sha": "bbb", "ref": "feat"},
+        }
+    )
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=mock_pr_response)
+
+    with patch("heimdall.github.make_jwt", return_value="fake.jwt"), patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        results = await client.get_linked_issues(repo_full_name="owner/repo", pr_number=2)
+
+    assert results == []
+
+
+# ---------------------------------------------------------------------------
+# get_file_content: 404 tolerance for convention doc fetching
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_returns_none_on_404() -> None:
+    """get_file_content returns None when the file does not exist (404)."""
+    mock_response = MagicMock()
+    mock_response.status_code = 404
+    mock_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError("Not Found", request=MagicMock(), response=mock_response)
+    )
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=mock_response)
+
+    with patch("heimdall.github.make_jwt", return_value="fake.jwt"), patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        result = await client.get_file_content(
+            repo_full_name="owner/repo",
+            path="MISSING.md",
+            ref="abc123",
+            tolerate_missing=True,
+        )
+
+    assert result is None
