@@ -1,0 +1,9 @@
+# Heimdall review config for this repo.
+#
+# The mere presence of this file is the opt-in: with it, Heimdall reviews PRs
+# here; without it, the repo is never reviewed. Everything below is optional —
+# an empty file (just this comment) runs all three built-in lenses
+# (security, design, cleanliness) with safe defaults.
+#
+# See heimdall/repo_config.py for the full schema (per-lens model/effort,
+# severity_threshold, scope filters, guardrail caps, docs list).
