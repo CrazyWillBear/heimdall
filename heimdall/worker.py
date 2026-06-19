@@ -67,11 +67,11 @@ from heimdall.db import (
     get_last_reviewed_sha,
     get_posted_review,
     prune_review_events,
-    record_review_event,
     release_inflight,
     set_last_reviewed_sha,
     set_posted_review,
     try_acquire_inflight,
+    try_record_review_event,
 )
 from heimdall.diff_anchor import (
     build_inline_comments,
@@ -222,9 +222,25 @@ async def run_review(
         # The slot is now held; release it on EVERY exit path (success, skip,
         # failure, exception) so the counter cannot leak.
         try:
-            await record_review_event(
-                db, repo_full_name=repo_full_name, occurred_at=time.time()
-            )
+            # Atomically reserve a rate slot. This is the authoritative race-free
+            # guard (the _over_rate_budget check above is only a cheap fast-fail): a
+            # concurrent review could have filled the window between that read and
+            # here, so the slot is recorded only if still under the window budget.
+            now = time.time()
+            if not await try_record_review_event(
+                db,
+                repo_full_name=repo_full_name,
+                occurred_at=now,
+                cutoff=now - config.caps.rate_window_seconds,
+                max_reviews=config.caps.max_reviews_per_window,
+            ):
+                logger.info(
+                    "Skipping review for %s#%d: per-repo rate/budget exceeded (raced "
+                    "past the fast-fail gate)",
+                    repo_full_name,
+                    pr_number,
+                )
+                return
             await _review_and_post(
                 ctx,
                 github_client,

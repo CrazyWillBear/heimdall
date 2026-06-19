@@ -235,6 +235,52 @@ async def record_review_event(
     await db.conn.commit()
 
 
+async def try_record_review_event(
+    db: Database,
+    *,
+    repo_full_name: str,
+    occurred_at: float,
+    cutoff: float,
+    max_reviews: int,
+) -> bool:
+    """Atomically reserve a per-repo rate slot, recording the event only if under cap.
+
+    Inserts one ``review_events`` row only when the count within the rolling window
+    (``occurred_at >= cutoff``) is below ``max_reviews``.  The count-and-insert is a
+    SINGLE SQL statement (an ``INSERT ... SELECT ... WHERE (subquery count) < cap``), so
+    there is no read-then-write window another coroutine can interleave through — unlike
+    a separate :func:`count_recent_reviews` + :func:`record_review_event`, the window
+    budget can never be overshot.  Mirrors :func:`try_acquire_inflight`.
+
+    Args:
+        db: The database.
+        repo_full_name: The repo whose rolling-window budget is gated.
+        occurred_at: Unix-epoch timestamp recorded for the reserved event.
+        cutoff: Window start (typically ``now - rate_window_seconds``); only events
+            at/after it count toward the budget.
+        max_reviews: The maximum reviews allowed within the window.
+
+    Returns:
+        True when a slot was reserved (caller may proceed), False when the repo is
+        already at the window budget (caller must skip).
+    """
+    cursor = await db.conn.execute(
+        """
+        INSERT INTO review_events (repo_full_name, occurred_at)
+        SELECT ?, ?
+        WHERE (
+            SELECT COUNT(*) FROM review_events
+            WHERE repo_full_name = ? AND occurred_at >= ?
+        ) < ?
+        """,
+        (repo_full_name, occurred_at, repo_full_name, cutoff, max_reviews),
+    )
+    await db.conn.commit()
+    # rowcount is 1 when the WHERE guard held and the row was inserted; 0 when the
+    # window was already at the budget.
+    return cursor.rowcount == 1
+
+
 async def count_recent_reviews(
     db: Database,
     *,

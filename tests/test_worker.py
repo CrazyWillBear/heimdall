@@ -61,7 +61,7 @@ def _patch_guardrails(stack: ExitStack) -> None:
         patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True))
     )
     stack.enter_context(
-        patch("heimdall.worker.record_review_event", new=AsyncMock())
+        patch("heimdall.worker.try_record_review_event", new=AsyncMock())
     )
     stack.enter_context(
         patch("heimdall.worker.release_inflight", new=AsyncMock())
@@ -455,7 +455,7 @@ async def test_run_review_retries_lens_exactly_once_then_posts_terse_note() -> N
         patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig())),
         patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False)),
         patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True)),
-        patch("heimdall.worker.record_review_event", new=AsyncMock()),
+        patch("heimdall.worker.try_record_review_event", new=AsyncMock()),
         patch("heimdall.worker.release_inflight", new=AsyncMock()),
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
         patch("heimdall.worker._synthesize_review", new=synthesize_mock),
@@ -494,7 +494,7 @@ async def test_run_review_retry_succeeds_posts_real_review() -> None:
         patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig())),
         patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False)),
         patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True)),
-        patch("heimdall.worker.record_review_event", new=AsyncMock()),
+        patch("heimdall.worker.try_record_review_event", new=AsyncMock()),
         patch("heimdall.worker.release_inflight", new=AsyncMock()),
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
         patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None)),
@@ -541,7 +541,7 @@ async def test_run_review_pipeline_timeout_surfaced_as_failure() -> None:
         patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig())),
         patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False)),
         patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True)),
-        patch("heimdall.worker.record_review_event", new=AsyncMock()),
+        patch("heimdall.worker.try_record_review_event", new=AsyncMock()),
         patch("heimdall.worker.release_inflight", new=AsyncMock()),
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
         patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock())),
@@ -1513,7 +1513,7 @@ async def test_oversized_pr_skipped_with_posted_note() -> None:
     stack.enter_context(
         patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True))
     )
-    stack.enter_context(patch("heimdall.worker.record_review_event", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.try_record_review_event", new=AsyncMock()))
     stack.enter_context(patch("heimdall.worker.release_inflight", new=AsyncMock()))
     stack.enter_context(
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
@@ -1550,7 +1550,7 @@ async def test_oversized_diff_lines_skipped_with_posted_note() -> None:
     stack.enter_context(
         patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True))
     )
-    stack.enter_context(patch("heimdall.worker.record_review_event", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.try_record_review_event", new=AsyncMock()))
     stack.enter_context(patch("heimdall.worker.release_inflight", new=AsyncMock()))
     stack.enter_context(
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
@@ -1592,7 +1592,7 @@ async def test_rate_budget_exceeded_skips_without_posting() -> None:
     )
     acquire_mock = AsyncMock(return_value=True)
     stack.enter_context(patch("heimdall.worker.try_acquire_inflight", new=acquire_mock))
-    stack.enter_context(patch("heimdall.worker.record_review_event", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.try_record_review_event", new=AsyncMock()))
     stack.enter_context(patch("heimdall.worker.release_inflight", new=AsyncMock()))
     stack.enter_context(
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
@@ -1663,7 +1663,7 @@ async def test_concurrency_cap_defers_when_at_limit() -> None:
     stack.enter_context(
         patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=False))
     )
-    stack.enter_context(patch("heimdall.worker.record_review_event", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.try_record_review_event", new=AsyncMock()))
     stack.enter_context(patch("heimdall.worker.release_inflight", new=release_mock))
     stack.enter_context(
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
@@ -1698,7 +1698,7 @@ async def test_concurrency_slot_released_on_every_path() -> None:
     stack.enter_context(
         patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True))
     )
-    stack.enter_context(patch("heimdall.worker.record_review_event", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.try_record_review_event", new=AsyncMock()))
     stack.enter_context(patch("heimdall.worker.release_inflight", new=release_mock))
     stack.enter_context(
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
@@ -1728,7 +1728,7 @@ async def test_concurrency_records_event_and_releases_on_success() -> None:
     stack.enter_context(
         patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True))
     )
-    stack.enter_context(patch("heimdall.worker.record_review_event", new=record_mock))
+    stack.enter_context(patch("heimdall.worker.try_record_review_event", new=record_mock))
     stack.enter_context(patch("heimdall.worker.release_inflight", new=release_mock))
     stack.enter_context(
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))

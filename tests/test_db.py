@@ -20,6 +20,7 @@ from heimdall.db import (
     set_last_reviewed_sha,
     set_posted_review,
     try_acquire_inflight,
+    try_record_review_event,
     upsert_job,
 )
 
@@ -179,6 +180,40 @@ async def test_prune_review_events_drops_old_rows(db: Database) -> None:
     await prune_review_events(db, repo_full_name="owner/repo", before=200.0)
 
     assert await count_recent_reviews(db, repo_full_name="owner/repo", since=0.0) == 1
+
+
+@pytest.mark.asyncio
+async def test_try_record_review_event_reserves_until_cap(db: Database) -> None:
+    """try_record_review_event records a slot only while under the window budget."""
+    repo = "owner/repo"
+    # Cap 2 in the window [cutoff=0]: the first two reserve, the third is refused.
+    assert await try_record_review_event(
+        db, repo_full_name=repo, occurred_at=10.0, cutoff=0.0, max_reviews=2
+    )
+    assert await try_record_review_event(
+        db, repo_full_name=repo, occurred_at=11.0, cutoff=0.0, max_reviews=2
+    )
+    assert not await try_record_review_event(
+        db, repo_full_name=repo, occurred_at=12.0, cutoff=0.0, max_reviews=2
+    )
+    # The refused attempt recorded nothing — exactly two events exist.
+    assert await count_recent_reviews(db, repo_full_name=repo, since=0.0) == 2
+
+
+@pytest.mark.asyncio
+async def test_try_record_review_event_ignores_events_outside_window(db: Database) -> None:
+    """Events older than the cutoff don't count toward the budget."""
+    repo = "owner/repo"
+    # Two events outside the window (< cutoff 100) must not consume the budget.
+    await record_review_event(db, repo_full_name=repo, occurred_at=10.0)
+    await record_review_event(db, repo_full_name=repo, occurred_at=20.0)
+    assert await try_record_review_event(
+        db, repo_full_name=repo, occurred_at=150.0, cutoff=100.0, max_reviews=1
+    )
+    # Now one in-window event exists -> at cap -> the next is refused.
+    assert not await try_record_review_event(
+        db, repo_full_name=repo, occurred_at=160.0, cutoff=100.0, max_reviews=1
+    )
 
 
 @pytest.mark.asyncio
