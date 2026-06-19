@@ -75,14 +75,19 @@ def commentable_lines(diff: str) -> set[tuple[str, int]]:
     in_hunk = False
 
     for raw in diff.splitlines():
-        if raw.startswith("+++ "):
+        # The `+++ ` / `--- ` file-header pair only appears in the pre-hunk preamble.
+        # Inside a hunk a `+`-prefixed line is added content — even `+++ ...`, whose
+        # text is `++ ...` — so we must classify by first char there, not as a header.
+        if not in_hunk and raw.startswith("+++ "):
             current_path = _strip_diff_path(raw[len("+++ ") :])
-            in_hunk = False
             continue
         header = _HUNK_HEADER.match(raw)
         if header is not None:
             new_line = int(header.group(1))
             in_hunk = True
+            continue
+        if raw.startswith("diff --git "):
+            in_hunk = False
             continue
         if not in_hunk or current_path is None:
             continue

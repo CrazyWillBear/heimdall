@@ -80,6 +80,22 @@ def test_commentable_lines_tolerates_empty_diff() -> None:
     assert commentable_lines("   \n\n") == set()
 
 
+def test_commentable_lines_added_content_starting_with_plus_plus() -> None:
+    """An added line whose content begins with '++ ' is not a file header.
+
+    The diff line ``+++ x`` is an ADDED content line (its text is ``++ x``), not a
+    new-file ``+++ `` header. It and every later added line in the same hunk must
+    stay commentable — a header misread would silently drop them.
+    """
+    diff = (
+        "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n"
+        "@@ -1,1 +1,3 @@\n a\n+++ x\n+after\n"
+    )
+    pairs = commentable_lines(diff)
+    # The '++ x' content line is new-file line 2; 'after' is line 3 — both added.
+    assert pairs == {("f.py", 2), ("f.py", 3)}
+
+
 # ---------------------------------------------------------------------------
 # split_findings: anchorable -> inline; off-diff / unparseable -> body
 # ---------------------------------------------------------------------------
