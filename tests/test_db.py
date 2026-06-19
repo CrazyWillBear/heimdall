@@ -9,11 +9,17 @@ import pytest_asyncio
 
 from heimdall.db import (
     Database,
+    count_recent_reviews,
+    get_inflight_count,
     get_job,
     get_last_reviewed_sha,
     get_posted_review,
+    prune_review_events,
+    record_review_event,
+    release_inflight,
     set_last_reviewed_sha,
     set_posted_review,
+    try_acquire_inflight,
     upsert_job,
 )
 
@@ -133,3 +139,138 @@ async def test_posted_review_survives_reopen(tmp_path: Path) -> None:
     assert review["review_id"] == 555
     assert review["node_id"] == "NODE7"
     assert review["verdict"] == "COMMENT"
+
+
+# ---------------------------------------------------------------------------
+# Guardrail: per-repo rate/budget via review_events
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_count_recent_reviews_counts_within_window(db: Database) -> None:
+    """count_recent_reviews counts only events at/after the cutoff."""
+    await record_review_event(db, repo_full_name="owner/repo", occurred_at=100.0)
+    await record_review_event(db, repo_full_name="owner/repo", occurred_at=200.0)
+    await record_review_event(db, repo_full_name="owner/repo", occurred_at=300.0)
+
+    # Cutoff 150 keeps the events at 200 and 300.
+    assert await count_recent_reviews(db, repo_full_name="owner/repo", since=150.0) == 2
+    # A cutoff before all of them keeps all three.
+    assert await count_recent_reviews(db, repo_full_name="owner/repo", since=0.0) == 3
+
+
+@pytest.mark.asyncio
+async def test_review_events_are_per_repo(db: Database) -> None:
+    """Events are scoped per repo: one repo's count never includes another's."""
+    await record_review_event(db, repo_full_name="owner/a", occurred_at=10.0)
+    await record_review_event(db, repo_full_name="owner/b", occurred_at=10.0)
+    await record_review_event(db, repo_full_name="owner/b", occurred_at=11.0)
+
+    assert await count_recent_reviews(db, repo_full_name="owner/a", since=0.0) == 1
+    assert await count_recent_reviews(db, repo_full_name="owner/b", since=0.0) == 2
+
+
+@pytest.mark.asyncio
+async def test_prune_review_events_drops_old_rows(db: Database) -> None:
+    """prune_review_events deletes events older than the cutoff, keeps newer ones."""
+    await record_review_event(db, repo_full_name="owner/repo", occurred_at=100.0)
+    await record_review_event(db, repo_full_name="owner/repo", occurred_at=300.0)
+
+    await prune_review_events(db, repo_full_name="owner/repo", before=200.0)
+
+    assert await count_recent_reviews(db, repo_full_name="owner/repo", since=0.0) == 1
+
+
+@pytest.mark.asyncio
+async def test_review_events_survive_reopen(tmp_path: Path) -> None:
+    """Recorded review events survive a service restart (DB reopened from disk)."""
+    db_file = str(tmp_path / "rate.db")
+    first = Database(db_file)
+    await first.initialize()
+    await record_review_event(first, repo_full_name="owner/repo", occurred_at=42.0)
+    await first.close()
+
+    reopened = Database(db_file)
+    await reopened.initialize()
+    count = await count_recent_reviews(reopened, repo_full_name="owner/repo", since=0.0)
+    await reopened.close()
+
+    assert count == 1
+
+
+# ---------------------------------------------------------------------------
+# Guardrail: per-installation concurrency via inflight_reviews
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acquire_inflight_increments_until_cap(db: Database) -> None:
+    """Acquire succeeds up to the cap, then refuses; the count never exceeds it."""
+    assert await try_acquire_inflight(db, installation_id=1, cap=2) is True
+    assert await get_inflight_count(db, installation_id=1) == 1
+    assert await try_acquire_inflight(db, installation_id=1, cap=2) is True
+    assert await get_inflight_count(db, installation_id=1) == 2
+    # At cap: the third acquire is refused and the counter stays at the cap.
+    assert await try_acquire_inflight(db, installation_id=1, cap=2) is False
+    assert await get_inflight_count(db, installation_id=1) == 2
+
+
+@pytest.mark.asyncio
+async def test_release_inflight_frees_a_slot(db: Database) -> None:
+    """Releasing a slot lets a subsequent acquire succeed again."""
+    await try_acquire_inflight(db, installation_id=5, cap=1)
+    assert await try_acquire_inflight(db, installation_id=5, cap=1) is False
+    await release_inflight(db, installation_id=5)
+    assert await get_inflight_count(db, installation_id=5) == 0
+    assert await try_acquire_inflight(db, installation_id=5, cap=1) is True
+
+
+@pytest.mark.asyncio
+async def test_release_inflight_clamps_at_zero(db: Database) -> None:
+    """A release on a zero/absent counter never drives it negative."""
+    await release_inflight(db, installation_id=99)
+    assert await get_inflight_count(db, installation_id=99) == 0
+
+
+@pytest.mark.asyncio
+async def test_inflight_is_per_installation(db: Database) -> None:
+    """One installation at its cap does not block a different installation."""
+    assert await try_acquire_inflight(db, installation_id=1, cap=1) is True
+    assert await try_acquire_inflight(db, installation_id=1, cap=1) is False
+    # A different installation has its own independent counter.
+    assert await try_acquire_inflight(db, installation_id=2, cap=1) is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_acquire_never_exceeds_cap(db: Database) -> None:
+    """N concurrent acquirers against a cap admit at most ``cap`` of them.
+
+    Drives the acquire under asyncio.gather to simulate concurrent reviews and
+    asserts the DB-backed counter never overshoots the cap.
+    """
+    import asyncio
+
+    cap = 3
+    results = await asyncio.gather(
+        *(try_acquire_inflight(db, installation_id=7, cap=cap) for _ in range(10))
+    )
+    assert sum(1 for granted in results if granted) == cap
+    assert await get_inflight_count(db, installation_id=7) == cap
+
+
+@pytest.mark.asyncio
+async def test_inflight_count_survives_reopen(tmp_path: Path) -> None:
+    """The in-flight counter survives a restart (it is DB-backed, not in-process)."""
+    db_file = str(tmp_path / "inflight.db")
+    first = Database(db_file)
+    await first.initialize()
+    await try_acquire_inflight(first, installation_id=3, cap=5)
+    await try_acquire_inflight(first, installation_id=3, cap=5)
+    await first.close()
+
+    reopened = Database(db_file)
+    await reopened.initialize()
+    count = await get_inflight_count(reopened, installation_id=3)
+    await reopened.close()
+
+    assert count == 2

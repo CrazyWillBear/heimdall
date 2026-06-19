@@ -1,4 +1,9 @@
-"""SQLite persistence for in-flight jobs and last-reviewed head SHAs.
+"""SQLite persistence for job tracking, posted reviews, and guardrail state.
+
+Tables: in-flight jobs, last-reviewed head SHAs, posted reviews, plus the
+guardrail state — per-repo review timestamps (``review_events``, for the rate/
+budget cap) and a per-installation in-flight counter (``inflight_reviews``, for
+the concurrency cap).  All of it is SQLite-backed so the caps survive restarts.
 
 Uses aiosqlite for async access. The Database class owns the connection lifecycle;
 helper functions receive a Database instance so they can be tested with an
@@ -63,6 +68,26 @@ CREATE TABLE IF NOT EXISTS posted_reviews (
     verdict        TEXT NOT NULL,
     updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (repo_full_name, pr_number)
+);
+
+-- Guardrail: per-repo rate/budget.  One row per review actually started, keyed
+-- by repo with a unix-epoch timestamp, so a rolling-window count can decide
+-- whether a fresh review is within the per-repo budget.  Survives restart.
+CREATE TABLE IF NOT EXISTS review_events (
+    repo_full_name TEXT NOT NULL,
+    occurred_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_events_repo_time
+    ON review_events (repo_full_name, occurred_at);
+
+-- Guardrail: per-installation concurrency.  A single in-flight counter per
+-- installation, incremented when a review starts and decremented when it ends,
+-- so concurrent reviews per installation never exceed the configured cap.  The
+-- counter is DB-backed (not in-process) so the cap holds across worker restarts
+-- and multiple worker processes sharing the same database.
+CREATE TABLE IF NOT EXISTS inflight_reviews (
+    installation_id INTEGER NOT NULL PRIMARY KEY,
+    in_flight       INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -189,3 +214,141 @@ async def get_posted_review(
         (repo_full_name, pr_number),
     ) as cursor:
         return await cursor.fetchone()
+
+
+async def record_review_event(
+    db: Database,
+    *,
+    repo_full_name: str,
+    occurred_at: float,
+) -> None:
+    """Record that a review for ``repo_full_name`` started at ``occurred_at``.
+
+    Appends one row to ``review_events`` (a unix-epoch timestamp). Together with
+    :func:`count_recent_reviews` this drives the per-repo rolling-window rate cap.
+    The caller supplies the timestamp so tests can drive a deterministic clock.
+    """
+    await db.conn.execute(
+        "INSERT INTO review_events (repo_full_name, occurred_at) VALUES (?, ?)",
+        (repo_full_name, occurred_at),
+    )
+    await db.conn.commit()
+
+
+async def count_recent_reviews(
+    db: Database,
+    *,
+    repo_full_name: str,
+    since: float,
+) -> int:
+    """Count reviews recorded for ``repo_full_name`` at or after ``since``.
+
+    ``since`` is a unix-epoch cutoff (typically ``now - window``), so the count
+    is the number of reviews within the rolling window — the value compared
+    against the per-repo budget before a fresh review is allowed.
+    """
+    async with db.conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM review_events
+        WHERE repo_full_name = ? AND occurred_at >= ?
+        """,
+        (repo_full_name, since),
+    ) as cursor:
+        row = await cursor.fetchone()
+        return int(row["n"]) if row is not None else 0
+
+
+async def prune_review_events(
+    db: Database,
+    *,
+    repo_full_name: str,
+    before: float,
+) -> None:
+    """Delete ``review_events`` rows for a repo older than ``before``.
+
+    Keeps the table bounded: once events fall outside the rolling window they can
+    never affect a future count, so they are pruned to stop unbounded growth.
+    """
+    await db.conn.execute(
+        "DELETE FROM review_events WHERE repo_full_name = ? AND occurred_at < ?",
+        (repo_full_name, before),
+    )
+    await db.conn.commit()
+
+
+async def try_acquire_inflight(
+    db: Database,
+    *,
+    installation_id: int,
+    cap: int,
+) -> bool:
+    """Atomically claim an in-flight review slot for an installation.
+
+    Increments the installation's in-flight counter only when it is below ``cap``,
+    and reports whether the slot was claimed.  The check-and-increment is a SINGLE
+    SQL statement (an upsert whose UPDATE has a ``WHERE in_flight < cap`` guard), so
+    there is no read-then-write window another coroutine could interleave through —
+    the cap can never be overshot.  ``rowcount`` reports whether a row was written,
+    which is the acquire result.  A successful acquire MUST be paired with exactly
+    one :func:`release_inflight` (in a ``finally``) so the counter cannot leak on
+    any exit path.
+
+    Args:
+        db: The database.
+        installation_id: The GitHub App installation to gate.
+        cap: The maximum concurrent reviews allowed for this installation.
+
+    Returns:
+        True when a slot was claimed (caller may proceed), False when the
+        installation is already at the cap (caller must defer/skip).
+    """
+    cursor = await db.conn.execute(
+        """
+        INSERT INTO inflight_reviews (installation_id, in_flight)
+        VALUES (?, 1)
+        ON CONFLICT(installation_id) DO UPDATE SET
+            in_flight = in_flight + 1
+        WHERE in_flight < ?
+        """,
+        (installation_id, cap),
+    )
+    await db.conn.commit()
+    # rowcount is 1 when a row was inserted (first acquire) or updated (the
+    # WHERE guard held); 0 when the guard failed because the cap was reached.
+    return cursor.rowcount == 1
+
+
+async def release_inflight(
+    db: Database,
+    *,
+    installation_id: int,
+) -> None:
+    """Release one in-flight review slot for an installation.
+
+    Decrements the counter, clamped at zero so a stray double-release can never
+    drive it negative (which would later over-admit reviews).  Idempotent for a
+    missing row (treated as already zero).
+    """
+    await db.conn.execute(
+        """
+        UPDATE inflight_reviews
+        SET in_flight = MAX(in_flight - 1, 0)
+        WHERE installation_id = ?
+        """,
+        (installation_id,),
+    )
+    await db.conn.commit()
+
+
+async def get_inflight_count(
+    db: Database,
+    *,
+    installation_id: int,
+) -> int:
+    """Return the current in-flight review count for an installation (0 if none)."""
+    async with db.conn.execute(
+        "SELECT in_flight FROM inflight_reviews WHERE installation_id = ?",
+        (installation_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+        return int(row["in_flight"]) if row is not None else 0

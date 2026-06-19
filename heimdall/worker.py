@@ -15,7 +15,11 @@ and the per-job installation_id argument.  Before any review work it gates the P
 (see heimdall.repo_config): it loads ``.github/heimdall.yml`` from the trust-resolved
 ref (base for forks, head for trusted same-repo PRs) — a missing file means the repo
 has not opted in, so nothing is reviewed — then applies scope filters (base-branch
-allowlist, path globs, skip drafts/bot authors, opt-out label).  If it proceeds, it
+allowlist, path globs, skip drafts/bot authors, opt-out label) and the guardrail caps:
+a PR over the diff-size/file-count cap is skipped WITH a posted note, a repo over its
+per-window review budget is skipped silently, and a review that would exceed the
+per-installation concurrency cap defers (a DB-backed in-flight slot, released on every
+exit path).  If it proceeds, it
 assembles the PR seed context into a temporary workspace once, fans out the
 config-tuned lenses (built-ins Security opus/max, Design-fit sonnet/high, Cleanliness
 sonnet/high, each with per-lens model/effort/enable overrides) over that shared seed —
@@ -49,6 +53,7 @@ import asyncio
 import logging
 import shutil
 import tempfile
+import time
 from typing import Any
 
 from arq.connections import RedisSettings
@@ -56,10 +61,15 @@ from arq.connections import RedisSettings
 from heimdall.context import assemble_pr_context
 from heimdall.db import (
     Database,
+    count_recent_reviews,
     get_last_reviewed_sha,
     get_posted_review,
+    prune_review_events,
+    record_review_event,
+    release_inflight,
     set_last_reviewed_sha,
     set_posted_review,
+    try_acquire_inflight,
 )
 from heimdall.diff_anchor import (
     build_inline_comments,
@@ -78,9 +88,11 @@ from heimdall.lens import (
     run_synthesis,
 )
 from heimdall.repo_config import (
+    GuardrailCaps,
     RepoConfig,
     RepoConfigError,
     blocking_severities,
+    diff_cap_skip_note,
     load_repo_config,
     skip_reason,
     tuned_lenses,
@@ -174,83 +186,169 @@ async def run_review(
             github_client, repo_full_name=repo_full_name, pr_number=pr_number
         )
         if config is None:
-            # Opt-in absent or scope filters excluded the PR — skip cleanly, posting
-            # nothing and recording no SHA (a later in-scope push still gets reviewed).
+            # Opt-in absent, scope filters excluded the PR, or the diff-size cap
+            # fired (which already posted its own note) — skip cleanly, recording
+            # no SHA (a later in-scope push still gets reviewed).
             return
 
-        synthesis = await _run_pipeline_with_retry(
-            ctx,
-            config=config,
+        # Per-repo budget/rate guardrail: too many reviews in the rolling window
+        # means skip this one (no SHA recorded, so a later push can still review).
+        if await _over_rate_budget(db, repo_full_name=repo_full_name, caps=config.caps):
+            logger.info(
+                "Skipping review for %s#%d: per-repo rate/budget exceeded",
+                repo_full_name,
+                pr_number,
+            )
+            return
+
+        # Per-installation concurrency guardrail: claim an in-flight slot, and if
+        # the installation is already at its cap, defer this run (skip without
+        # recording the SHA so a later delivery/push reviews the same commit).
+        if not await try_acquire_inflight(
+            db,
             installation_id=installation_id,
-            repo_full_name=repo_full_name,
-            pr_number=pr_number,
-            head_sha=head_sha,
-        )
-        if synthesis is None:
-            # Every lens failed, synthesis aborted, or the retry timed out/failed.
-            # Post a terse failure note and record the SHA so the failed commit is
-            # not endlessly re-reviewed.
-            await _post_review_failed_note(
+            cap=config.caps.max_concurrent_per_installation,
+        ):
+            logger.info(
+                "Deferring review for %s#%d: installation %d at concurrency cap %d",
+                repo_full_name,
+                pr_number,
+                installation_id,
+                config.caps.max_concurrent_per_installation,
+            )
+            return
+        # The slot is now held; release it on EVERY exit path (success, skip,
+        # failure, exception) so the counter cannot leak.
+        try:
+            await record_review_event(
+                db, repo_full_name=repo_full_name, occurred_at=time.time()
+            )
+            await _review_and_post(
+                ctx,
                 github_client,
+                db,
+                config=config,
+                installation_id=installation_id,
                 repo_full_name=repo_full_name,
                 pr_number=pr_number,
                 head_sha=head_sha,
             )
-            await set_last_reviewed_sha(
-                db, repo_full_name=repo_full_name, pr_number=pr_number, sha=head_sha
-            )
-            return
+        finally:
+            await release_inflight(db, installation_id=installation_id)
+    finally:
+        await github_client.aclose()
 
-        # Across-push lifecycle: retire the prior Heimdall review (dismiss a
-        # REQUEST_CHANGES, minimize a COMMENT) and delete its now-stale inline
-        # comments before posting, so only the latest review stays active.
-        await _refresh_prior_review(
+
+async def _over_rate_budget(
+    db: Database,
+    *,
+    repo_full_name: str,
+    caps: GuardrailCaps,
+) -> bool:
+    """Return True when the repo has hit its per-window review budget.
+
+    Counts reviews recorded for the repo within the rolling window
+    (``rate_window_seconds``); when that count is at or above
+    ``max_reviews_per_window`` a fresh review is over budget and is skipped.
+    Stale events outside the window are pruned first so the table stays bounded.
+    """
+    now = time.time()
+    cutoff = now - caps.rate_window_seconds
+    await prune_review_events(db, repo_full_name=repo_full_name, before=cutoff)
+    recent = await count_recent_reviews(db, repo_full_name=repo_full_name, since=cutoff)
+    return recent >= caps.max_reviews_per_window
+
+
+async def _review_and_post(
+    ctx: dict[str, Any],
+    github_client: GitHubClient,
+    db: Database,
+    *,
+    config: RepoConfig,
+    installation_id: int,
+    repo_full_name: str,
+    pr_number: int,
+    head_sha: str,
+) -> None:
+    """Run the retried pipeline and post exactly one review (or a failure note).
+
+    The core of run_review, extracted so the per-installation concurrency
+    acquire/release can wrap it in a clean try/finally.  Mirrors the prior inline
+    body: on a None synthesis it posts a terse failure note and records the SHA;
+    on success it retires the prior review, splits inline/body, posts once, and
+    records both the posted-review and last-reviewed SHA.
+    """
+    synthesis = await _run_pipeline_with_retry(
+        ctx,
+        config=config,
+        installation_id=installation_id,
+        repo_full_name=repo_full_name,
+        pr_number=pr_number,
+        head_sha=head_sha,
+    )
+    if synthesis is None:
+        # Every lens failed, synthesis aborted, or the retry timed out/failed.
+        # Post a terse failure note and record the SHA so the failed commit is
+        # not endlessly re-reviewed.
+        await _post_review_failed_note(
             github_client,
-            db,
             repo_full_name=repo_full_name,
             pr_number=pr_number,
-        )
-        # Anchor findings to changed diff lines: those on a changed line become
-        # inline comments in the same submission; off-diff (or unparseable) ones
-        # fall back to the review body.
-        body, inline_comments = await _build_inline_split(
-            github_client,
-            synthesis,
-            repo_full_name=repo_full_name,
-            pr_number=pr_number,
-        )
-        logger.info(
-            "Posting %s review for %s#%d @ %s (%d inline comments)",
-            synthesis.verdict,
-            repo_full_name,
-            pr_number,
-            head_sha,
-            len(inline_comments),
-        )
-        posted = await github_client.post_review(
-            repo_full_name=repo_full_name,
-            pr_number=pr_number,
-            commit_id=head_sha,
-            body=body,
-            event=synthesis.verdict,
-            comments=inline_comments,
-        )
-        await set_posted_review(
-            db,
-            repo_full_name=repo_full_name,
-            pr_number=pr_number,
-            review_id=int(posted["id"]),
-            node_id=str(posted["node_id"]),
-            verdict=synthesis.verdict,
+            head_sha=head_sha,
         )
         await set_last_reviewed_sha(
             db, repo_full_name=repo_full_name, pr_number=pr_number, sha=head_sha
         )
-        logger.info(
-            "Review posted for %s#%d @ %s", repo_full_name, pr_number, head_sha
-        )
-    finally:
-        await github_client.aclose()
+        return
+
+    # Across-push lifecycle: retire the prior Heimdall review (dismiss a
+    # REQUEST_CHANGES, minimize a COMMENT) and delete its now-stale inline
+    # comments before posting, so only the latest review stays active.
+    await _refresh_prior_review(
+        github_client,
+        db,
+        repo_full_name=repo_full_name,
+        pr_number=pr_number,
+    )
+    # Anchor findings to changed diff lines: those on a changed line become
+    # inline comments in the same submission; off-diff (or unparseable) ones
+    # fall back to the review body.
+    body, inline_comments = await _build_inline_split(
+        github_client,
+        synthesis,
+        repo_full_name=repo_full_name,
+        pr_number=pr_number,
+    )
+    logger.info(
+        "Posting %s review for %s#%d @ %s (%d inline comments)",
+        synthesis.verdict,
+        repo_full_name,
+        pr_number,
+        head_sha,
+        len(inline_comments),
+    )
+    posted = await github_client.post_review(
+        repo_full_name=repo_full_name,
+        pr_number=pr_number,
+        commit_id=head_sha,
+        body=body,
+        event=synthesis.verdict,
+        comments=inline_comments,
+    )
+    await set_posted_review(
+        db,
+        repo_full_name=repo_full_name,
+        pr_number=pr_number,
+        review_id=int(posted["id"]),
+        node_id=str(posted["node_id"]),
+        verdict=synthesis.verdict,
+    )
+    await set_last_reviewed_sha(
+        db, repo_full_name=repo_full_name, pr_number=pr_number, sha=head_sha
+    )
+    logger.info(
+        "Review posted for %s#%d @ %s", repo_full_name, pr_number, head_sha
+    )
 
 
 async def _gate_review(
@@ -293,7 +391,41 @@ async def _gate_review(
     if reason is not None:
         logger.info("Skipping review for %s#%d: %s", repo_full_name, pr_number, reason)
         return None
+
+    # Diff-size/file-count guardrail: an oversized PR is skipped, but UNLIKE the
+    # scope skips above it gets a POSTED note so the author learns why no review
+    # came back.  Recording the SHA happens in the caller's normal skip handling.
+    note = diff_cap_skip_note(
+        config.caps,
+        file_count=len(changed_paths),
+        diff_lines=_diff_line_count(files),
+    )
+    if note is not None:
+        logger.info(
+            "Skipping review for %s#%d: over size cap; posting note", repo_full_name, pr_number
+        )
+        await github_client.post_review(
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            commit_id=str((pr.get("head") or {}).get("sha", "")),
+            body=note,
+            event="COMMENT",
+        )
+        return None
     return config
+
+
+def _diff_line_count(files: list[dict[str, Any]]) -> int:
+    """Sum changed lines (additions + deletions) across a PR's file objects.
+
+    GitHub's PR-files payload reports per-file ``additions`` and ``deletions``;
+    their sum is the total churn the size cap is measured against.  Missing
+    counters (e.g. a renamed-only entry) contribute zero.
+    """
+    total = 0
+    for f in files:
+        total += int(f.get("additions") or 0) + int(f.get("deletions") or 0)
+    return total
 
 
 async def _refresh_prior_review(

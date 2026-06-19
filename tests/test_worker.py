@@ -47,6 +47,27 @@ def _synthesis_from(tagged: list[TaggedFinding]) -> SynthesisResult:
     )
 
 
+def _patch_guardrails(stack: ExitStack) -> None:
+    """Stub the issue-#10 guardrail DB helpers so the pipeline proceeds by default.
+
+    The rate/budget check is forced under-limit and the concurrency acquire is
+    forced to succeed, so tests not specifically about guardrails behave as before.
+    Tests that exercise a cap patch these names themselves.
+    """
+    stack.enter_context(
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.record_review_event", new=AsyncMock())
+    )
+    stack.enter_context(
+        patch("heimdall.worker.release_inflight", new=AsyncMock())
+    )
+
+
 def _patch_review_pipeline(
     *,
     lens_results: list[LensResult] | None = None,
@@ -73,6 +94,7 @@ def _patch_review_pipeline(
     stack.enter_context(
         patch("heimdall.worker._gate_review", new=AsyncMock(return_value=gate_config))
     )
+    _patch_guardrails(stack)
     stack.enter_context(
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=last_sha))
     )
@@ -303,6 +325,7 @@ async def test_run_review_isolates_one_lens_failure() -> None:
     stack.enter_context(
         patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig()))
     )
+    _patch_guardrails(stack)
     stack.enter_context(
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
     )
@@ -430,6 +453,10 @@ async def test_run_review_retries_lens_exactly_once_then_posts_terse_note() -> N
     synthesize_mock = AsyncMock(side_effect=LensError("boom"))
     with (
         patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig())),
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False)),
+        patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True)),
+        patch("heimdall.worker.record_review_event", new=AsyncMock()),
+        patch("heimdall.worker.release_inflight", new=AsyncMock()),
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
         patch("heimdall.worker._synthesize_review", new=synthesize_mock),
         patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()) as mock_set,
@@ -465,6 +492,10 @@ async def test_run_review_retry_succeeds_posts_real_review() -> None:
     synthesize_mock = AsyncMock(side_effect=[LensError("boom"), synthesis])
     with (
         patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig())),
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False)),
+        patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True)),
+        patch("heimdall.worker.record_review_event", new=AsyncMock()),
+        patch("heimdall.worker.release_inflight", new=AsyncMock()),
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
         patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None)),
         patch("heimdall.worker._synthesize_review", new=synthesize_mock),
@@ -508,6 +539,10 @@ async def test_run_review_pipeline_timeout_surfaced_as_failure() -> None:
     run_lens_mock = AsyncMock(side_effect=_slow_lens)
     with (
         patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig())),
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False)),
+        patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True)),
+        patch("heimdall.worker.record_review_event", new=AsyncMock()),
+        patch("heimdall.worker.release_inflight", new=AsyncMock()),
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
         patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock())),
         patch("heimdall.worker.run_lens", new=run_lens_mock),
@@ -1085,8 +1120,14 @@ def _gating_gh_client(
     base_ref: str = "main",
     labels: list[str] | None = None,
     changed_paths: list[str] | None = None,
+    files: list[dict[str, Any]] | None = None,
 ) -> AsyncMock:
-    """Mock GitHubClient for the real _gate_review path (get_pr/file/files)."""
+    """Mock GitHubClient for the real _gate_review path (get_pr/file/files).
+
+    ``files`` overrides the PR-files payload outright (used to drive the diff-size
+    guardrail with explicit additions/deletions); otherwise a minimal file list is
+    built from ``changed_paths``.
+    """
     client = _gh_client()
     client.get_pr = AsyncMock(
         return_value={
@@ -1099,15 +1140,17 @@ def _gating_gh_client(
         }
     )
     client.get_file_content = AsyncMock(return_value=config_yaml)
-    client.get_pr_files = AsyncMock(
-        return_value=[{"filename": p} for p in (changed_paths or ["src/app.py"])]
-    )
+    pr_files = files if files is not None else [
+        {"filename": p} for p in (changed_paths or ["src/app.py"])
+    ]
+    client.get_pr_files = AsyncMock(return_value=pr_files)
     return client
 
 
 def _run_with_real_gate(client: AsyncMock, synth_mock: AsyncMock) -> ExitStack:
     """ExitStack patching everything except the real _gate_review under test."""
     stack = ExitStack()
+    _patch_guardrails(stack)
     stack.enter_context(
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
     )
@@ -1173,6 +1216,7 @@ async def test_run_review_disabled_lens_does_not_run() -> None:
     run_lens_mock = AsyncMock(return_value=_lens_result([]))
     synth_mock = AsyncMock(return_value=_synthesis_from([]))
     stack = ExitStack()
+    _patch_guardrails(stack)
     stack.enter_context(
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
     )
@@ -1297,3 +1341,278 @@ def test_lens_config_and_scope_filters_constructible() -> None:
     )
     assert cfg.lenses["security"].model == "sonnet"
     assert cfg.scope.base_branches == ["main"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #10 — guardrail caps through run_review
+#   1. oversized PR skipped WITH a posted note
+#   2. per-repo rate/budget beyond limit -> skipped (no post)
+#   3. per-installation concurrency never exceeds the cap
+#   4. all three configurable; defaults applied when absent
+# ---------------------------------------------------------------------------
+
+
+def _big_files(n: int, *, additions: int = 1, deletions: int = 0) -> list[dict[str, Any]]:
+    """Build ``n`` PR-file objects each carrying the given additions/deletions."""
+    return [
+        {"filename": f"src/f{i}.py", "additions": additions, "deletions": deletions}
+        for i in range(n)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_oversized_pr_skipped_with_posted_note() -> None:
+    """Acceptance #1: a PR over the file cap is skipped, but a COMMENT note is posted."""
+    # Cap files at 2; the PR changes 5 -> over cap.
+    client = _gating_gh_client(
+        config_yaml="caps:\n  max_files: 2\n",
+        files=_big_files(5),
+    )
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    # The real _gate_review runs; only the per-repo/concurrency DB helpers are stubbed.
+    stack = ExitStack()
+    stack.enter_context(
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True))
+    )
+    stack.enter_context(patch("heimdall.worker.record_review_event", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.release_inflight", new=AsyncMock()))
+    stack.enter_context(
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(patch("heimdall.worker.run_synthesis", new=synth_mock))
+    stack.enter_context(patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.GitHubClient", return_value=client))
+    with stack:
+        await _drive(client)
+
+    # The pipeline never ran (the gate skipped it)...
+    synth_mock.assert_not_called()
+    # ...but a single terse COMMENT note WAS posted explaining the size skip.
+    client.post_review.assert_awaited_once()
+    posted = client.post_review.await_args.kwargs
+    assert posted["event"] == "COMMENT"
+    assert "too large" in posted["body"].lower()
+    assert "5 files" in posted["body"]
+
+
+@pytest.mark.asyncio
+async def test_oversized_diff_lines_skipped_with_posted_note() -> None:
+    """Acceptance #1: a PR over the diff-line cap is also skipped with a posted note."""
+    # Cap diff lines at 10; two files each with 8 additions -> 16 changed lines.
+    client = _gating_gh_client(
+        config_yaml="caps:\n  max_diff_lines: 10\n",
+        files=_big_files(2, additions=8),
+    )
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    stack = ExitStack()
+    stack.enter_context(
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True))
+    )
+    stack.enter_context(patch("heimdall.worker.record_review_event", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.release_inflight", new=AsyncMock()))
+    stack.enter_context(
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(patch("heimdall.worker.run_synthesis", new=synth_mock))
+    stack.enter_context(patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.GitHubClient", return_value=client))
+    with stack:
+        await _drive(client)
+
+    synth_mock.assert_not_called()
+    client.post_review.assert_awaited_once()
+    assert "changed lines" in client.post_review.await_args.kwargs["body"]
+
+
+@pytest.mark.asyncio
+async def test_small_pr_under_default_caps_is_reviewed() -> None:
+    """Acceptance #4: with no caps block, a small PR is NOT skipped (defaults are sane)."""
+    client = _gating_gh_client(config_yaml="", files=_big_files(2, additions=3))
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    with _run_with_real_gate(client, synth_mock):
+        await _drive(client)
+
+    # Default caps do not fire for a tiny PR: the pipeline runs and a review posts.
+    synth_mock.assert_called()
+    client.post_review.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rate_budget_exceeded_skips_without_posting() -> None:
+    """Acceptance #2: a review beyond the per-repo budget is skipped (no pipeline, no post)."""
+    client = _gating_gh_client(config_yaml="caps:\n  max_reviews_per_window: 1\n")
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    stack = ExitStack()
+    # Force the rate gate over-budget; concurrency acquire would succeed but is
+    # never reached because the rate gate returns first.
+    stack.enter_context(
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=True))
+    )
+    acquire_mock = AsyncMock(return_value=True)
+    stack.enter_context(patch("heimdall.worker.try_acquire_inflight", new=acquire_mock))
+    stack.enter_context(patch("heimdall.worker.record_review_event", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.release_inflight", new=AsyncMock()))
+    stack.enter_context(
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(patch("heimdall.worker.run_synthesis", new=synth_mock))
+    stack.enter_context(patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.GitHubClient", return_value=client))
+    with stack:
+        await _drive(client)
+
+    synth_mock.assert_not_called()
+    client.post_review.assert_not_called()
+    # Over budget short-circuits before claiming a concurrency slot.
+    acquire_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rate_budget_uses_real_db_window() -> None:
+    """Acceptance #2: the rate gate counts real DB events within the window.
+
+    Drives run_review with a real in-memory Database pre-loaded with events up to
+    the budget, so the next review is skipped purely from DB-backed state.
+    """
+    from heimdall.db import Database, record_review_event
+
+    db = Database(":memory:")
+    await db.initialize()
+    # Budget of 2 per (large) window; pre-record 2 recent events -> at the limit.
+    now = __import__("time").time()
+    await record_review_event(db, repo_full_name=_REPO, occurred_at=now)
+    await record_review_event(db, repo_full_name=_REPO, occurred_at=now)
+
+    client = _gating_gh_client(
+        config_yaml="caps:\n  max_reviews_per_window: 2\n  rate_window_seconds: 3600\n"
+    )
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    with (
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
+        patch("heimdall.worker.run_synthesis", new=synth_mock),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=client),
+    ):
+        await run_review(
+            {"db": db, "app_id": _APP_ID, "private_key": _PRIVATE_KEY},
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    await db.close()
+    # Already at the budget -> the fresh review is skipped, nothing posted.
+    synth_mock.assert_not_called()
+    client.post_review.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_concurrency_cap_defers_when_at_limit() -> None:
+    """Acceptance #3: when the installation is at its concurrency cap, the run defers."""
+    client = _gating_gh_client(config_yaml="caps:\n  max_concurrent_per_installation: 1\n")
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    release_mock = AsyncMock()
+    stack = ExitStack()
+    stack.enter_context(
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False))
+    )
+    # Acquire refused -> at cap.
+    stack.enter_context(
+        patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=False))
+    )
+    stack.enter_context(patch("heimdall.worker.record_review_event", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.release_inflight", new=release_mock))
+    stack.enter_context(
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(patch("heimdall.worker.run_synthesis", new=synth_mock))
+    stack.enter_context(patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.GitHubClient", return_value=client))
+    with stack:
+        await _drive(client)
+
+    synth_mock.assert_not_called()
+    client.post_review.assert_not_called()
+    # A slot was never claimed, so it must NOT be released (no leak the other way).
+    release_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_concurrency_slot_released_on_every_path() -> None:
+    """Acceptance #3: a claimed slot is released even when the pipeline raises.
+
+    A leaked slot would permanently shrink the installation's budget, so the
+    release MUST run in a finally regardless of how the review ends.
+    """
+    client = _gating_gh_client(config_yaml="")
+    release_mock = AsyncMock()
+    # The pipeline blows up after the slot is claimed.
+    boom = AsyncMock(side_effect=RuntimeError("pipeline exploded"))
+    stack = ExitStack()
+    stack.enter_context(
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True))
+    )
+    stack.enter_context(patch("heimdall.worker.record_review_event", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.release_inflight", new=release_mock))
+    stack.enter_context(
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(patch("heimdall.worker._review_and_post", new=boom))
+    stack.enter_context(patch("heimdall.worker.GitHubClient", return_value=client))
+    with stack, pytest.raises(RuntimeError):
+        await _drive(client)
+
+    # Even though the pipeline raised, the slot was released exactly once.
+    release_mock.assert_awaited_once()
+    assert release_mock.await_args is not None
+    assert release_mock.await_args.kwargs["installation_id"] == _INSTALL_ID
+
+
+@pytest.mark.asyncio
+async def test_concurrency_records_event_and_releases_on_success() -> None:
+    """Acceptance #3: a successful review records a rate event and releases its slot."""
+    client = _gating_gh_client(config_yaml="")
+    record_mock = AsyncMock()
+    release_mock = AsyncMock()
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    stack = ExitStack()
+    stack.enter_context(
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True))
+    )
+    stack.enter_context(patch("heimdall.worker.record_review_event", new=record_mock))
+    stack.enter_context(patch("heimdall.worker.release_inflight", new=release_mock))
+    stack.enter_context(
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock()))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.run_lens", new=AsyncMock(return_value=_lens_result([])))
+    )
+    stack.enter_context(patch("heimdall.worker.run_synthesis", new=synth_mock))
+    stack.enter_context(patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.set_posted_review", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.GitHubClient", return_value=client))
+    with stack:
+        await _drive(client)
+
+    record_mock.assert_awaited_once()
+    release_mock.assert_awaited_once()
+    client.post_review.assert_awaited_once()

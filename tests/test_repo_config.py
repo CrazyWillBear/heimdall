@@ -14,10 +14,12 @@ import pytest
 from heimdall.lens import Severity
 from heimdall.repo_config import (
     CONFIG_PATH,
+    GuardrailCaps,
     RepoConfig,
     RepoConfigError,
     blocking_severities,
     config_ref_for_pr,
+    diff_cap_skip_note,
     is_trusted_pr,
     load_repo_config,
     parse_repo_config,
@@ -295,3 +297,72 @@ def test_opt_out_label_absent_proceeds() -> None:
     config = parse_repo_config("scope:\n  opt_out_label: heimdall-skip\n")
     reason = skip_reason(config, pr=_pr(labels=["bug"]), changed_paths=["a.py"])
     assert reason is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #10 — guardrail caps: defaults, parsing, and the diff-size note
+# ---------------------------------------------------------------------------
+
+
+def test_caps_have_safe_defaults_when_absent() -> None:
+    """A config without a caps block gets safe, bounded (non-unlimited) defaults."""
+    config = parse_repo_config("")
+    caps = config.caps
+    assert caps.max_files > 0
+    assert caps.max_diff_lines > 0
+    assert caps.max_reviews_per_window > 0
+    assert caps.rate_window_seconds > 0
+    assert caps.max_concurrent_per_installation > 0
+
+
+def test_caps_are_configurable() -> None:
+    """Every cap can be overridden from heimdall.yml."""
+    config = parse_repo_config(
+        "caps:\n"
+        "  max_files: 5\n"
+        "  max_diff_lines: 100\n"
+        "  max_reviews_per_window: 3\n"
+        "  rate_window_seconds: 60\n"
+        "  max_concurrent_per_installation: 2\n"
+    )
+    caps = config.caps
+    assert caps.max_files == 5
+    assert caps.max_diff_lines == 100
+    assert caps.max_reviews_per_window == 3
+    assert caps.rate_window_seconds == 60
+    assert caps.max_concurrent_per_installation == 2
+
+
+def test_cap_zero_or_negative_rejected() -> None:
+    """A non-positive cap is meaningless (and unsafe) — reject it."""
+    with pytest.raises(RepoConfigError):
+        parse_repo_config("caps:\n  max_files: 0\n")
+
+
+def test_unknown_cap_key_rejected() -> None:
+    """An unknown caps key is a typo signal — reject rather than ignore."""
+    with pytest.raises(RepoConfigError):
+        parse_repo_config("caps:\n  max_lines: 100\n")
+
+
+def test_diff_cap_note_under_cap_returns_none() -> None:
+    """Within both caps, no skip note is produced (the PR is reviewed)."""
+    caps = GuardrailCaps(max_files=10, max_diff_lines=1000)
+    assert diff_cap_skip_note(caps, file_count=5, diff_lines=500) is None
+
+
+def test_diff_cap_note_over_file_cap() -> None:
+    """Over the file cap, a note naming the count and cap is returned."""
+    caps = GuardrailCaps(max_files=10, max_diff_lines=10_000)
+    note = diff_cap_skip_note(caps, file_count=11, diff_lines=50)
+    assert note is not None
+    assert "11 files" in note
+    assert "10" in note
+
+
+def test_diff_cap_note_over_line_cap() -> None:
+    """Over the diff-line cap, a note naming the line count and cap is returned."""
+    caps = GuardrailCaps(max_files=100, max_diff_lines=1000)
+    note = diff_cap_skip_note(caps, file_count=3, diff_lines=1001)
+    assert note is not None
+    assert "1001 changed lines" in note

@@ -93,6 +93,78 @@ class ScopeFilters(BaseModel):
     opt_out_label: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Issue #10 — guardrail caps (diff size, per-repo rate/budget, concurrency).
+# Kept in a self-contained block so it can be reconciled cleanly against the
+# concurrently-built custom-lenses change (#9) that also extends RepoConfig.
+# ---------------------------------------------------------------------------
+
+
+class GuardrailCaps(BaseModel):
+    """Resource guardrails bounding how much review work a repo can trigger.
+
+    Every cap has a SAFE non-unbounded default, so a repo that opts in without a
+    ``caps`` block still gets sensible ceilings — an absent cap never means
+    "unlimited".
+
+    Attributes:
+        max_files: Skip (with a posted note) a PR changing more than this many
+            files.  A huge PR is both expensive to review and low-signal.
+        max_diff_lines: Skip (with a posted note) a PR whose total changed lines
+            (additions + deletions across files) exceed this.
+        max_reviews_per_window: Per-repo budget — at most this many reviews may
+            START within ``rate_window_seconds``; beyond it a review is skipped.
+        rate_window_seconds: The rolling window (seconds) the per-repo budget is
+            measured over.
+        max_concurrent_per_installation: At most this many reviews may run
+            concurrently for one GitHub App installation; a review that would
+            exceed it is deferred/skipped rather than started.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    max_files: int = Field(default=75, gt=0)
+    max_diff_lines: int = Field(default=20_000, gt=0)
+    max_reviews_per_window: int = Field(default=20, gt=0)
+    rate_window_seconds: float = Field(default=3_600.0, gt=0)
+    max_concurrent_per_installation: int = Field(default=4, gt=0)
+
+
+def diff_cap_skip_note(
+    caps: GuardrailCaps,
+    *,
+    file_count: int,
+    diff_lines: int,
+) -> str | None:
+    """Return a terse skip note when a PR exceeds the size/file cap, else None.
+
+    Distinct from the silent scope skips: when this returns a string the worker
+    POSTS it as a COMMENT so the author learns the PR was skipped for size (and
+    what the cap is) rather than silently getting no review.
+
+    Args:
+        caps: The repo's guardrail caps.
+        file_count: Number of files changed in the PR.
+        diff_lines: Total changed lines (additions + deletions) in the PR.
+
+    Returns:
+        A human-readable note when over either cap, or None to proceed.
+    """
+    if file_count > caps.max_files:
+        return (
+            f"Heimdall skipped this PR: too large to review "
+            f"({file_count} files changed, cap {caps.max_files}). "
+            "Split it into smaller PRs to get a review."
+        )
+    if diff_lines > caps.max_diff_lines:
+        return (
+            f"Heimdall skipped this PR: too large to review "
+            f"({diff_lines} changed lines, cap {caps.max_diff_lines}). "
+            "Split it into smaller PRs to get a review."
+        )
+    return None
+
+
 class RepoConfig(BaseModel):
     """Parsed ``.github/heimdall.yml`` for one repository.
 
@@ -102,6 +174,8 @@ class RepoConfig(BaseModel):
         severity_threshold: The lowest severity that blocks the PR
             (REQUEST_CHANGES); findings below it only comment.
         scope: Scope filters deciding whether the PR is reviewed at all.
+        caps: Guardrail caps (diff size, per-repo rate/budget, per-installation
+            concurrency) with safe defaults when the block is absent.
     """
 
     model_config = {"extra": "forbid"}
@@ -109,6 +183,7 @@ class RepoConfig(BaseModel):
     lenses: dict[str, LensConfig] = Field(default_factory=dict)
     severity_threshold: Severity = Severity.HIGH
     scope: ScopeFilters = Field(default_factory=ScopeFilters)
+    caps: GuardrailCaps = Field(default_factory=GuardrailCaps)
 
 
 def parse_repo_config(text: str) -> RepoConfig:

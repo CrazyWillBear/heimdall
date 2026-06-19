@@ -126,11 +126,36 @@ scope:                          # filters that skip the PR entirely
   skip_drafts: true             # skip draft PRs
   skip_bot_authors: true        # skip PRs authored by a bot account
   opt_out_label: heimdall-skip  # skip a PR carrying this label
+caps:                           # guardrail caps; every field has a SAFE default
+  max_files: 75                 # skip (with a posted note) a PR over this many files
+  max_diff_lines: 20000         # skip (with a posted note) a PR over this many changed lines
+  max_reviews_per_window: 20    # per-repo budget: max reviews started per window
+  rate_window_seconds: 3600     # rolling window the per-repo budget is measured over
+  max_concurrent_per_installation: 4  # max reviews running at once per installation
 ```
 
 The worker gate (`_gate_review` in `heimdall/worker.py`) loads this config, applies the
 scope filters (`skip_reason`), then threads lens tuning (`tuned_lenses`) and the blocking
 threshold (`blocking_severities`) into the pipeline.
+
+**Guardrail caps** (`GuardrailCaps` in `heimdall/repo_config.py`) bound review cost; every
+cap has a safe, non-unbounded default so an absent `caps` block still has ceilings. They are
+enforced in three places, all in `run_review`:
+
+- **Diff size / file count** (`max_files`, `max_diff_lines`) — checked in `_gate_review` from
+  the PR-files payload. Over the cap the PR is **skipped with a posted COMMENT note**
+  (`diff_cap_skip_note`) — unlike the silent scope skips — so the author learns why.
+- **Per-repo rate / budget** (`max_reviews_per_window`, `rate_window_seconds`) — a DB-backed
+  rolling-window count of review starts (`review_events` table). Over budget the review is
+  skipped silently; the SHA is not recorded so a later push still gets a review.
+- **Per-installation concurrency** (`max_concurrent_per_installation`) — a DB-backed
+  in-flight counter per installation (`inflight_reviews` table). The cap **value** comes from
+  the triggering repo's config, but the counter is genuinely per-installation (shared across
+  that installation's repos). A slot is atomically claimed at review start
+  (`try_acquire_inflight`, a single guarded upsert so concurrent acquirers never overshoot)
+  and released in a `finally` on **every** exit path (`release_inflight`); at the cap the run
+  defers (skips this delivery, no SHA recorded). All three counters are SQLite-backed, so the
+  caps survive worker restarts.
 
 ## Development
 
