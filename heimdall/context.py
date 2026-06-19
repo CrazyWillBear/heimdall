@@ -351,4 +351,10 @@ def _materialize(ctx: PRContext, directory: str) -> None:
         conventions_root = root / "conventions"
         conventions_root.mkdir(exist_ok=True)
         for name, content in ctx.convention_docs.items():
-            (conventions_root / name).write_text(content, encoding="utf-8")
+            # The names are a trusted hardcoded set today, but route through the same
+            # guard as files/ so a future dynamic source can't escape the workspace.
+            doc_path = _safe_file_path(conventions_root, name)
+            if doc_path is None:
+                continue
+            doc_path.parent.mkdir(parents=True, exist_ok=True)
+            doc_path.write_text(content, encoding="utf-8")

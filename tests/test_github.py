@@ -584,3 +584,56 @@ async def test_get_file_content_returns_none_on_404() -> None:
         )
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_decodes_base64() -> None:
+    """The standard base64 Contents API response is decoded to UTF-8 text."""
+    import base64
+
+    body = base64.b64encode(b"severity_threshold: low\n").decode("ascii")
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value={"content": body, "encoding": "base64"})
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=mock_response)
+
+    with patch("heimdall.github.make_jwt", return_value="fake.jwt"), patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        result = await client.get_file_content(
+            repo_full_name="owner/repo", path="x.yml", ref="abc123"
+        )
+
+    assert result == "severity_threshold: low\n"
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_rejects_non_base64_encoding() -> None:
+    """A non-base64 encoding (e.g. a file too large for the Contents API) raises.
+
+    Guards against silently base64-decoding non-base64 content into garbage.
+    """
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value={"content": "", "encoding": "none"})
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=mock_response)
+
+    with patch("heimdall.github.make_jwt", return_value="fake.jwt"), patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        with pytest.raises(ValueError):
+            await client.get_file_content(
+                repo_full_name="owner/repo", path="big.bin", ref="abc123"
+            )

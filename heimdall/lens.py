@@ -258,7 +258,7 @@ _SYNTHESIS_SYSTEM_PROMPT = (
     "what the lenses reported. Report the surviving findings as a single JSON object on "
     'its own line: {"findings": [{"severity": "critical|high|medium|low", "title": '
     '"...", "message": "...", "location": "path:line", "lens": '
-    '"security|design|cleanliness"}]}. Emit an empty findings list when nothing survives."'
+    '"security|design|cleanliness"}]}. Emit an empty findings list when nothing survives.'
 )
 
 SYNTHESIS_LENS = LensSpec(

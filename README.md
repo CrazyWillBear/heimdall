@@ -251,7 +251,7 @@ custom_lenses:                    # user-defined lenses that run alongside the b
 
 scope:                            # filters that skip the PR entirely
   base_branches: []               # allowlist of base branches; empty = any. Default: []
-  paths: []                       # glob allowlist of changed paths; empty = any. Default: []
+  paths: []                       # fnmatch allowlist of changed paths; empty = any. Default: []
   skip_drafts: true               # skip draft PRs. Default: true
   skip_bot_authors: true          # skip PRs authored by a bot account. Default: true
   opt_out_label: null             # skip a PR carrying this label. Default: null (unset)
@@ -310,7 +310,7 @@ the PR (silently).
 | Field              | Type          | Default | Meaning                                                       |
 | ------------------ | ------------- | ------- | ------------------------------------------------------------- |
 | `base_branches`    | list[string]  | `[]`    | Allowlist of base branches; empty = any base branch.          |
-| `paths`            | list[string]  | `[]`    | Glob allowlist of changed paths; empty = any path.            |
+| `paths`            | list[string]  | `[]`    | `fnmatch` allowlist of changed paths; empty = any. `*` matches `/`, so `src/*` ≡ `src/**`. |
 | `skip_drafts`      | bool          | `true`  | Skip draft PRs.                                                |
 | `skip_bot_authors` | bool          | `true`  | Skip PRs authored by a bot account.                           |
 | `opt_out_label`    | string        | unset   | When set and present on the PR, skip the PR.                  |

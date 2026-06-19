@@ -103,6 +103,20 @@ async def test_missing_config_returns_none() -> None:
 
 
 @pytest.mark.asyncio
+async def test_undecodable_config_maps_to_repo_config_error() -> None:
+    """A ValueError from reading the config (bad encoding/undecodable) -> RepoConfigError.
+
+    So the gate's existing `except RepoConfigError` skips cleanly instead of crashing
+    on an uncaught exception.
+    """
+    github = AsyncMock()
+    github.get_file_content = AsyncMock(side_effect=ValueError("unexpected encoding 'none'"))
+
+    with pytest.raises(RepoConfigError):
+        await load_repo_config(github, repo_full_name=_REPO, pr=_pr())
+
+
+@pytest.mark.asyncio
 async def test_present_config_loads() -> None:
     """A present heimdall.yml is parsed and returned (opt-in honored)."""
     github = AsyncMock()
@@ -245,6 +259,20 @@ def test_path_filter_proceeds_when_any_path_matches() -> None:
         config, pr=_pr(), changed_paths=["docs/readme.md", "src/app.py"]
     )
     assert reason is None
+
+
+def test_path_filter_uses_fnmatch_semantics_not_gitignore() -> None:
+    """Pin the documented behavior: paths are fnmatch patterns, so `*` matches `/`.
+
+    `src/*` therefore matches a deeply-nested `src/a/b.py` and is equivalent to
+    `src/**` — these are NOT gitignore-style globs.
+    """
+    single_star = parse_repo_config("scope:\n  paths: ['src/*']\n")
+    double_star = parse_repo_config("scope:\n  paths: ['src/**']\n")
+    nested = ["src/a/b/c.py"]
+    # Both patterns match the deeply-nested path because `*` spans `/`.
+    assert skip_reason(single_star, pr=_pr(), changed_paths=nested) is None
+    assert skip_reason(double_star, pr=_pr(), changed_paths=nested) is None
 
 
 # ---------------------------------------------------------------------------

@@ -108,8 +108,10 @@ class ScopeFilters(BaseModel):
     Attributes:
         base_branches: Allowlist of base branch names; when non-empty a PR whose
             base branch is not listed is skipped.  Empty means "any base branch".
-        paths: Glob allowlist of changed paths; when non-empty a PR whose changed
-            files are all outside these globs is skipped.  Empty means "any path".
+        paths: ``fnmatch`` allowlist of changed paths; when non-empty a PR whose changed
+            files are all outside these patterns is skipped.  Empty means "any path".
+            Note these are ``fnmatch`` patterns, not gitignore globs: ``*`` matches ``/``,
+            so ``src/*`` and ``src/**`` are equivalent (see :func:`_paths_out_of_scope`).
         skip_drafts: Skip draft PRs when True.
         skip_bot_authors: Skip PRs authored by a bot account when True.
         opt_out_label: When set and present on the PR, the PR is skipped.
@@ -338,12 +340,18 @@ async def load_repo_config(
         RepoConfigError: The file exists but is malformed/invalid.
     """
     ref = config_ref_for_pr(pr)
-    text = await github.get_file_content(
-        repo_full_name=repo_full_name,
-        path=CONFIG_PATH,
-        ref=ref,
-        tolerate_missing=True,
-    )
+    try:
+        text = await github.get_file_content(
+            repo_full_name=repo_full_name,
+            path=CONFIG_PATH,
+            ref=ref,
+            tolerate_missing=True,
+        )
+    except ValueError as exc:
+        # Bad content encoding or an undecodable body (binascii.Error and
+        # UnicodeDecodeError are both ValueError) — treat as a malformed config so the
+        # caller skips cleanly rather than crashing on an uncaught exception.
+        raise RepoConfigError(f"could not read {CONFIG_PATH}: {exc}") from exc
     if text is None:
         logger.info("No %s for %s; opt-in absent, skipping review", CONFIG_PATH, repo_full_name)
         return None
@@ -365,9 +373,12 @@ def _pr_labels(pr: dict[str, Any]) -> set[str]:
 
 
 def _paths_out_of_scope(paths: list[str], changed_paths: list[str]) -> bool:
-    """Return True when no changed path matches any allowlisted glob.
+    """Return True when no changed path matches any allowlisted pattern.
 
-    An empty ``paths`` allowlist means "any path", so it is never out of scope.
+    Patterns are matched with :func:`fnmatch.fnmatch`, NOT gitignore-style globbing:
+    ``*`` matches ``/`` too, so ``src/*`` and ``src/**`` behave identically (both match
+    ``src/a/b.py``). Use ``fnmatch`` semantics when writing ``paths`` entries. An empty
+    ``paths`` allowlist means "any path", so it is never out of scope.
     """
     if not paths:
         return False

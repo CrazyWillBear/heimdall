@@ -436,7 +436,15 @@ class GitHubClient:
             return None
         response.raise_for_status()
         data: dict[str, Any] = response.json()
-        # GitHub returns base64-encoded content with embedded newlines
+        # GitHub normally returns base64-encoded content with embedded newlines, but
+        # serves "none" for files too large for the Contents API. Guard the encoding
+        # so we never base64-decode something that isn't base64 (which would yield
+        # garbage or an opaque binascii error deep in the caller).
+        encoding = data.get("encoding")
+        if encoding != "base64":
+            raise ValueError(
+                f"unexpected content encoding {encoding!r} for {path}@{ref}"
+            )
         raw: str = data["content"]
         return base64.b64decode(raw.replace("\n", "")).decode("utf-8")
 

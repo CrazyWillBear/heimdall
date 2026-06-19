@@ -513,6 +513,45 @@ def test_materialize_rejects_traversal_filename(tmp_path: Path) -> None:
                 )
 
 
+def test_materialize_rejects_traversal_convention_name(tmp_path: Path) -> None:
+    """conventions/ materialization is guarded too: a ../ name cannot escape."""
+    from heimdall.context import _materialize
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    escape_target = tmp_path / "evil-conv.txt"
+
+    ctx = PRContext(
+        repo_full_name=_REPO,
+        pr_number=_PR_NUMBER,
+        title=_TITLE,
+        body=_BODY,
+        author=_AUTHOR,
+        base_sha=_BASE_SHA,
+        head_sha=_HEAD_SHA,
+        base_ref=_BASE_REF,
+        head_ref=_HEAD_REF,
+        linked_issues=[],
+        diff="",
+        changed_files=[],
+        file_contents={},
+        convention_docs={"../../evil-conv.txt": "evil content"},
+    )
+    _materialize(ctx, str(workspace))
+
+    assert not escape_target.exists(), (
+        "Traversal escaped the workspace via conventions/: file found outside workspace"
+    )
+    conventions_root = workspace / "conventions"
+    workspace_root = str(workspace.resolve())
+    if conventions_root.exists():
+        for p in conventions_root.rglob("*"):
+            if p.is_file():
+                assert str(p.resolve()).startswith(workspace_root), (
+                    f"Convention doc escaped workspace: {p}"
+                )
+
+
 def test_materialize_normal_nested_path(tmp_path: Path) -> None:
     """_materialize writes normal nested paths correctly under files/."""
     from heimdall.context import _materialize
