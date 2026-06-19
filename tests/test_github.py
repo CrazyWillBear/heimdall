@@ -73,6 +73,87 @@ async def test_post_review() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Across-push review lifecycle: dismiss (REQUEST_CHANGES) / minimize (COMMENT)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dismiss_review_puts_to_dismissals_endpoint() -> None:
+    """dismiss_review PUTs a message to the review dismissals REST endpoint."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+
+    mock_http = AsyncMock()
+    mock_http.put = AsyncMock(return_value=mock_response)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        await client.dismiss_review(
+            repo_full_name="owner/repo",
+            pr_number=5,
+            review_id=77,
+            message="Superseded by a newer push.",
+        )
+
+    call_args = mock_http.put.call_args
+    assert "pulls/5/reviews/77/dismissals" in call_args[0][0]
+    assert call_args[1]["json"]["message"] == "Superseded by a newer push."
+    mock_response.raise_for_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_minimize_review_calls_graphql_minimize_comment() -> None:
+    """minimize_review issues a GraphQL minimizeComment mutation on the node id."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(
+        return_value={"data": {"minimizeComment": {"minimizedComment": {"isMinimized": True}}}}
+    )
+
+    mock_http = AsyncMock()
+    mock_http.post = AsyncMock(return_value=mock_response)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        await client.minimize_review(node_id="REVIEW_NODE_ID")
+
+    call_args = mock_http.post.call_args
+    assert call_args[0][0].endswith("/graphql")
+    sent_json = call_args[1]["json"]
+    assert "minimizeComment" in sent_json["query"]
+    assert sent_json["variables"]["id"] == "REVIEW_NODE_ID"
+    mock_response.raise_for_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_minimize_review_raises_on_graphql_errors() -> None:
+    """minimize_review surfaces a GraphQL ``errors`` payload as a RuntimeError."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value={"errors": [{"message": "boom"}]})
+
+    mock_http = AsyncMock()
+    mock_http.post = AsyncMock(return_value=mock_response)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        with pytest.raises(RuntimeError, match="boom"):
+            await client.minimize_review(node_id="REVIEW_NODE_ID")
+
+
+# ---------------------------------------------------------------------------
 # GitHubClient lifecycle: aclose and async context-manager
 # ---------------------------------------------------------------------------
 

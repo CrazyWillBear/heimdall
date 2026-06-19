@@ -38,6 +38,16 @@ Each lens reports `Finding`s carrying a `Severity` (critical/high/medium/low).
 `verdict_for(findings)` maps any high/critical finding to **REQUEST_CHANGES**, otherwise
 **COMMENT**. `format_review_body(findings)` renders the posted review body.
 
+### Across-push review lifecycle
+
+When a PR receives a new push, `run_review` retires the prior Heimdall review before
+posting the fresh one so only the latest review stays active. The prior review's id,
+GraphQL node id, and verdict are persisted in SQLite (`posted_reviews` table), so the
+lifecycle survives a worker restart. Per the stored verdict, a prior **REQUEST_CHANGES**
+review is **dismissed** (REST `…/reviews/{id}/dismissals`) and a prior **COMMENT** review
+is **minimized** as outdated (GraphQL `minimizeComment`) — dismissal is invalid for
+COMMENT events. The freshly posted review then overwrites the stored record.
+
 ## Configuration
 
 Settings (`heimdall/config.py`) read from the environment / `.env`. Lens knobs:

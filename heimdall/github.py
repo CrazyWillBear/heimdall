@@ -159,6 +159,66 @@ class GitHubClient:
         result: dict[str, Any] = response.json()
         return result
 
+    async def dismiss_review(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+        review_id: int,
+        message: str,
+    ) -> None:
+        """Dismiss a prior PR review via the GitHub REST API.
+
+        Dismissal applies to REQUEST_CHANGES (and APPROVED) reviews: it clears
+        the blocking state while leaving the review visible with a dismissal
+        note.  GitHub requires a non-empty ``message`` explaining the dismissal.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+            review_id: The REST review id returned by ``post_review``.
+            message: Explanation recorded with the dismissal.
+        """
+        url = (
+            f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}"
+            f"/reviews/{review_id}/dismissals"
+        )
+        response = await self._http.put(
+            url,
+            headers=await self._gh_headers(),
+            json={"message": message, "event": "DISMISS"},
+        )
+        response.raise_for_status()
+
+    async def minimize_review(self, *, node_id: str) -> None:
+        """Minimize a prior review body via the GraphQL ``minimizeComment`` mutation.
+
+        COMMENT-event reviews cannot be dismissed (dismissal is only valid for
+        REQUEST_CHANGES/APPROVED), so their body is collapsed as outdated via
+        GraphQL using the review's global node id.
+
+        Args:
+            node_id: The GraphQL global node id of the review (its ``node_id``
+                in the REST ``post_review`` response).
+
+        Raises:
+            RuntimeError: If the GraphQL response carries an ``errors`` payload.
+        """
+        query = (
+            "mutation($id: ID!) {"
+            " minimizeComment(input: {subjectId: $id, classifier: OUTDATED})"
+            " { minimizedComment { isMinimized } } }"
+        )
+        response = await self._http.post(
+            f"{self._BASE}/graphql",
+            headers=await self._gh_headers(),
+            json={"query": query, "variables": {"id": node_id}},
+        )
+        response.raise_for_status()
+        payload: dict[str, Any] = response.json()
+        if payload.get("errors"):
+            raise RuntimeError(f"GraphQL minimizeComment failed: {payload['errors']}")
+
     async def _gh_headers(self) -> dict[str, str]:
         """Return GitHub API headers with a fresh installation token."""
         token = await self.get_installation_token()
