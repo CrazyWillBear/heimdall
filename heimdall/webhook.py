@@ -1,8 +1,9 @@
 """FastAPI webhook router: signature verification and PR event dispatch.
 
 Verifies the HMAC-SHA256 signature on every incoming webhook, ignores irrelevant
-events, and enqueues a review job for actionable pull_request events.  The handler
-returns 2xx immediately — the actual review happens asynchronously in the worker.
+events, and enqueues a review job for actionable pull_request events.  The enqueue is
+awaited inline before the 202 so a failed enqueue surfaces as 5xx (GitHub redelivers)
+rather than vanishing after the ack; the review itself runs asynchronously in the worker.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import hmac
 import logging
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Header, HTTPException, Request, Response
 
 from heimdall.queue import ReviewJob, enqueue_review
 
@@ -69,7 +70,6 @@ def make_webhook_router(*, webhook_secret: str) -> APIRouter:
     @router.post("/webhook", status_code=202)
     async def handle_webhook(
         request: Request,
-        background_tasks: BackgroundTasks,
         x_github_event: str | None = Header(default=None),
         x_hub_signature_256: str | None = Header(default=None),
     ) -> Response:
@@ -94,11 +94,13 @@ def make_webhook_router(*, webhook_secret: str) -> APIRouter:
         # Resolve the pool at request time from app.state so the lifespan-created
         # pool is always used, regardless of when the router was constructed.
         pool = request.app.state.arq_pool
-        # Enqueue in background so this handler acks immediately.
-        background_tasks.add_task(enqueue_review, pool, job)
+        # Enqueue inline before acking: if it raises, the handler returns 5xx and
+        # GitHub redelivers, rather than a background failure silently dropping the
+        # job after a 202 has already been sent.
+        await enqueue_review(pool, job)
 
         logger.info(
-            "Enqueuing review for %s#%d action=%s sha=%s",
+            "Enqueued review for %s#%d action=%s sha=%s",
             job.repo_full_name,
             job.pr_number,
             action,

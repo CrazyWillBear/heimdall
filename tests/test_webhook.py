@@ -89,6 +89,29 @@ def test_valid_webhook_returns_202(app_client: tuple[TestClient, MagicMock]) -> 
     mock_enqueue.assert_called_once()
 
 
+def test_enqueue_failure_returns_5xx() -> None:
+    """If enqueue raises, the handler returns 5xx (not 202) so GitHub redelivers.
+
+    The enqueue is awaited inline before the ack; a failure must not be swallowed by a
+    background task after a 202 has already been sent. Uses raise_server_exceptions=False
+    so the TestClient surfaces the 500 response instead of re-raising.
+    """
+    settings = _make_settings()
+    failing_enqueue = AsyncMock(side_effect=RuntimeError("redis down"))
+    payload = json.dumps(_pr_payload()).encode()
+    headers = {
+        "X-GitHub-Event": "pull_request",
+        "X-Hub-Signature-256": _sign(payload, _SECRET),
+        "Content-Type": "application/json",
+    }
+    with patch("heimdall.webhook.enqueue_review", failing_enqueue):
+        app = create_app(settings)
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post("/webhook", content=payload, headers=headers)
+    assert response.status_code >= 500
+    failing_enqueue.assert_called_once()
+
+
 def test_invalid_signature_rejected(app_client: tuple[TestClient, MagicMock]) -> None:
     """An invalid signature returns 401 and no job is enqueued."""
     client, mock_enqueue = app_client
