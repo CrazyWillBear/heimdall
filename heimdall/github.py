@@ -183,26 +183,54 @@ class GitHubClient:
         response.raise_for_status()
         return response.text
 
+    def _next_page_url(self, link_header: str) -> str | None:
+        """Parse the Link response header and return the ``rel="next"`` URL, or None.
+
+        GitHub paginates via RFC 5988 Link headers, e.g.:
+            <https://api.github.com/…?page=2>; rel="next", <…>; rel="last"
+        """
+        for part in link_header.split(","):
+            part = part.strip()
+            if 'rel="next"' in part:
+                # Extract the URL between < and >
+                url_part = part.split(";")[0].strip()
+                if url_part.startswith("<") and url_part.endswith(">"):
+                    return url_part[1:-1]
+        return None
+
     async def get_pr_files(
         self,
         *,
         repo_full_name: str,
         pr_number: int,
     ) -> list[dict[str, Any]]:
-        """List files changed in a pull request.
+        """List files changed in a pull request, following pagination to collect all files.
+
+        The GitHub API returns at most 100 files per page.  Large PRs require
+        following ``Link: rel="next"`` headers until no next page is returned.
 
         Args:
             repo_full_name: e.g. "owner/repo".
             pr_number: The PR number.
 
         Returns:
-            List of file objects (filename, status, patch, …) from the GitHub API.
+            List of all file objects (filename, status, patch, …) from the GitHub API.
         """
-        url = f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/files"
-        response = await self._http.get(url, headers=await self._gh_headers())
-        response.raise_for_status()
-        result: list[dict[str, Any]] = response.json()
-        return result
+        url: str | None = (
+            f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/files"
+        )
+        headers = await self._gh_headers()
+        all_files: list[dict[str, Any]] = []
+
+        while url is not None:
+            response = await self._http.get(
+                url, headers=headers, params={"per_page": 100}
+            )
+            response.raise_for_status()
+            all_files.extend(response.json())
+            url = self._next_page_url(response.headers.get("link", ""))
+
+        return all_files
 
     async def get_file_content(
         self,
