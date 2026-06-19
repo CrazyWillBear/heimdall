@@ -10,10 +10,14 @@ Context keys populated by WorkerSettings.on_startup:
 
 run_review builds a GitHubClient per-job using ctx["app_id"], ctx["private_key"],
 and the per-job installation_id argument.  It assembles the PR seed context into
-a temporary workspace, runs the Security lens (``claude -p``) over it, maps the
-findings to a verdict, and posts exactly one PR review.  A lens failure (timeout
-or token-cap abort) is logged and the job ends without posting — it never crashes
-the worker.
+a temporary workspace once, fans out three independent lenses (Security opus/max,
+Design-fit sonnet/high, Cleanliness sonnet/high) over that shared seed — each
+bounded by its own token cap and timeout — then runs a 4th synthesis ``claude -p``
+pass that dedups overlapping findings across lenses, ranks by severity, writes the
+verdict, and formats the review (findings grouped by severity, each tagged with the
+originating lens).  Exactly one PR review is posted.  A failure in any single lens
+is isolated (logged, that lens dropped); the pipeline only skips posting when every
+lens fails or the synthesis pass itself aborts.  Nothing here ever crashes the worker.
 
 Launch the worker with:
     arq heimdall.worker.WorkerSettings
@@ -21,6 +25,7 @@ Launch the worker with:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 import tempfile
@@ -32,16 +37,24 @@ from heimdall.context import assemble_pr_context
 from heimdall.db import Database, get_last_reviewed_sha, set_last_reviewed_sha
 from heimdall.github import GitHubClient
 from heimdall.lens import (
+    CLEANLINESS_LENS,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_TOKEN_CAP,
+    DESIGN_LENS,
     SECURITY_LENS,
     LensError,
-    format_review_body,
+    LensResult,
+    LensSpec,
+    SynthesisResult,
     run_lens,
-    verdict_for,
+    run_synthesis,
 )
 
 logger = logging.getLogger(__name__)
+
+# The three review lenses fanned out over the shared seed. Order is stable so the
+# synthesized review is deterministic; each runs independently bounded.
+_LENSES: tuple[LensSpec, ...] = (SECURITY_LENS, DESIGN_LENS, CLEANLINESS_LENS)
 
 
 def _db_path_from_url(database_url: str) -> str:
@@ -66,13 +79,16 @@ async def run_review(
     pr_number: int,
     head_sha: str,
 ) -> None:
-    """Arq task: run the Security lens over the PR and post one review.
+    """Arq task: fan out three lenses, synthesize, and post one review.
 
     Skips if the same head SHA was already reviewed (idempotency guard).  On a
-    fresh SHA it assembles the seed context, runs the Security lens, maps the
-    findings to a verdict (REQUEST_CHANGES for any high/critical finding, else
-    COMMENT), posts exactly one PR review, and records the SHA.  A lens failure
-    (timeout or token-cap abort) is logged and the job returns without posting.
+    fresh SHA it assembles the seed context once, runs the three lenses over it
+    (each independently bounded; a single lens failure is isolated), then runs the
+    synthesis pass that dedups overlapping findings, ranks by severity, writes the
+    verdict (REQUEST_CHANGES for a high/critical survivor, else COMMENT), and
+    formats the severity-grouped, lens-tagged review body.  Exactly one PR review
+    is posted and the SHA recorded.  When every lens fails, or the synthesis pass
+    aborts, the job returns without posting.
 
     A GitHubClient is constructed per-job from the app credentials in ctx so
     that each job can target a different GitHub App installation.
@@ -104,19 +120,18 @@ async def run_review(
             )
             return
 
-        review = await _run_security_lens(
+        synthesis = await _synthesize_review(
             ctx,
             installation_id=installation_id,
             repo_full_name=repo_full_name,
             pr_number=pr_number,
         )
-        if review is None:
-            return  # Lens failed; failure already logged. Do not post or record SHA.
+        if synthesis is None:
+            return  # Pipeline failed; failure already logged. Do not post or record SHA.
 
-        body, event = review
         logger.info(
             "Posting %s review for %s#%d @ %s",
-            event,
+            synthesis.verdict,
             repo_full_name,
             pr_number,
             head_sha,
@@ -125,8 +140,8 @@ async def run_review(
             repo_full_name=repo_full_name,
             pr_number=pr_number,
             commit_id=head_sha,
-            body=body,
-            event=event,
+            body=synthesis.body,
+            event=synthesis.verdict,
         )
         await set_last_reviewed_sha(
             db, repo_full_name=repo_full_name, pr_number=pr_number, sha=head_sha
@@ -138,21 +153,22 @@ async def run_review(
         await github_client.aclose()
 
 
-async def _run_security_lens(
+async def _synthesize_review(
     ctx: dict[str, Any],
     *,
     installation_id: int,
     repo_full_name: str,
     pr_number: int,
-) -> tuple[str, str] | None:
-    """Assemble seed context and run the Security lens, returning (body, event).
+) -> SynthesisResult | None:
+    """Assemble the seed, fan out the lenses, and synthesize the final review.
 
-    The seed context is materialized into a temporary workspace that the lens
-    reads via the heimdall-context wrapper; the workspace is removed afterwards.
+    The seed context is materialized into a temporary workspace once and shared by
+    every lens (read via the heimdall-context wrapper); the workspace is removed
+    afterwards.  Returns None when no lens produced a result (all failed) or when
+    the synthesis pass aborts — the caller then skips posting.
 
     Returns:
-        A ``(review_body, review_event)`` tuple, or None when the lens aborts
-        (timeout or token-cap breach) — the caller then skips posting.
+        The :class:`SynthesisResult` (tagged survivors, verdict, body), or None.
     """
     workspace = tempfile.mkdtemp(prefix="heimdall-lens-")
     try:
@@ -164,24 +180,82 @@ async def _run_security_lens(
             pr_number=pr_number,
             workspace_dir=workspace,
         )
-        result = await run_lens(
-            lens=SECURITY_LENS,
+
+        lens_results = await _run_lenses(
+            ctx,
             workspace_dir=workspace,
-            claude_binary=ctx.get("claude_binary", "claude"),
-            token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
-            timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
         )
-    except LensError:
-        logger.exception(
-            "Security lens aborted for %s#%d; skipping review",
-            repo_full_name,
-            pr_number,
-        )
-        return None
+        if not lens_results:
+            logger.warning(
+                "All lenses failed for %s#%d; skipping review", repo_full_name, pr_number
+            )
+            return None
+
+        try:
+            return await run_synthesis(
+                lens_results=lens_results,
+                workspace_dir=workspace,
+                claude_binary=ctx.get("claude_binary", "claude"),
+                token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
+                timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+            )
+        except LensError:
+            logger.exception(
+                "Synthesis aborted for %s#%d; skipping review",
+                repo_full_name,
+                pr_number,
+            )
+            return None
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
-    return format_review_body(result.findings), verdict_for(result.findings)
+
+async def _run_lenses(
+    ctx: dict[str, Any],
+    *,
+    workspace_dir: str,
+    repo_full_name: str,
+    pr_number: int,
+) -> list[LensResult]:
+    """Run every lens over the shared workspace, isolating per-lens failures.
+
+    Each lens is bounded independently (its own token cap + timeout via run_lens).
+    A lens that aborts (timeout or token-cap breach) is logged and dropped so the
+    remaining lenses still reach synthesis; an unexpected error in one lens is
+    likewise contained rather than crashing the whole run.
+
+    Returns:
+        The results of the lenses that succeeded (possibly empty if all failed).
+    """
+    outcomes = await asyncio.gather(
+        *(
+            run_lens(
+                lens=lens,
+                workspace_dir=workspace_dir,
+                claude_binary=ctx.get("claude_binary", "claude"),
+                token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
+                timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+            )
+            for lens in _LENSES
+        ),
+        return_exceptions=True,
+    )
+
+    results: list[LensResult] = []
+    for lens, outcome in zip(_LENSES, outcomes, strict=True):
+        if isinstance(outcome, LensResult):
+            results.append(outcome)
+        elif isinstance(outcome, BaseException):
+            logger.warning(
+                "Lens %s failed for %s#%d; dropping it from synthesis: %s",
+                lens.name,
+                repo_full_name,
+                pr_number,
+                outcome,
+            )
+    return results
 
 
 def _load_settings() -> Any:

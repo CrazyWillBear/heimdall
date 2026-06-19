@@ -53,6 +53,14 @@ class Severity(Enum):
 # Severities that escalate the PR verdict to REQUEST_CHANGES.
 _BLOCKING_SEVERITIES = frozenset({Severity.HIGH, Severity.CRITICAL})
 
+# Worst-first sort key shared by every review-body renderer.
+_SEVERITY_ORDER = {
+    Severity.CRITICAL: 0,
+    Severity.HIGH: 1,
+    Severity.MEDIUM: 2,
+    Severity.LOW: 3,
+}
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -86,18 +94,54 @@ class LensResult:
 
 @dataclass(frozen=True)
 class LensSpec:
-    """Static definition of a lens: its name and review instructions.
+    """Static definition of a lens: its name, instructions, and Claude model knobs.
 
-    #5 defines two more of these (Design-fit, Cleanliness) and passes them to
-    the same :func:`run_lens`.
+    The Security lens runs on opus/max; the Design-fit and Cleanliness lenses run
+    on sonnet/high; the synthesis pass runs on opus/max.  Model and effort live on
+    the spec so :func:`build_claude_argv` is the same code path for every lens.
 
     Attributes:
         name: Stable identifier (also used in the posted review body).
         system_prompt: Appended to Claude's system prompt to focus the pass.
+        model: Claude model to run the pass on (e.g. "opus", "sonnet").
+        effort: Reasoning-effort level for the pass (e.g. "max", "high").
     """
 
     name: str
     system_prompt: str
+    model: str = "opus"
+    effort: str = "max"
+
+
+@dataclass(frozen=True)
+class TaggedFinding:
+    """A finding tagged with the lens that originated it.
+
+    Synthesis survivors carry their source lens so the rendered review can show,
+    per finding, which lens raised it.
+
+    Attributes:
+        lens: Name of the originating lens (e.g. "security", "design").
+        finding: The underlying :class:`Finding`.
+    """
+
+    lens: str
+    finding: Finding
+
+
+@dataclass(frozen=True)
+class SynthesisResult:
+    """The outcome of the synthesis pass over all lenses' findings.
+
+    Attributes:
+        tagged_findings: Deduped, severity-ranked survivors, each lens-tagged.
+        verdict: "REQUEST_CHANGES" or "COMMENT" over the surviving set.
+        body: The rendered Markdown review body (severity-grouped, lens-tagged).
+    """
+
+    tagged_findings: list[TaggedFinding]
+    verdict: str
+    body: str
 
 
 @dataclass
@@ -144,7 +188,73 @@ _SECURITY_SYSTEM_PROMPT = (
     "Emit an empty findings list when the PR introduces no security concern."
 )
 
-SECURITY_LENS = LensSpec(name="security", system_prompt=_SECURITY_SYSTEM_PROMPT)
+SECURITY_LENS = LensSpec(
+    name="security",
+    system_prompt=_SECURITY_SYSTEM_PROMPT,
+    model="opus",
+    effort="max",
+)
+
+_FINDINGS_JSON_CONTRACT = (
+    'Report findings as a single JSON object on its own line: {"findings": '
+    '[{"severity": "critical|high|medium|low", "title": "...", "message": "...", '
+    '"location": "path:line"}]}. Emit an empty findings list when the PR is clean '
+    "through your lens."
+)
+
+_DESIGN_SYSTEM_PROMPT = (
+    "You are Heimdall's Design-fit / architecture review lens. Review ONLY whether "
+    "this pull request fits the existing design and architecture: module boundaries, "
+    "coupling and cohesion, abstraction level, layering, naming of public surfaces, "
+    "and consistency with established patterns and conventions. Use the heimdall-context "
+    "wrapper (diff|pr|file|conventions) and the read-only Read/Grep/Glob tools to inspect "
+    "changes. Do not modify anything. " + _FINDINGS_JSON_CONTRACT
+)
+
+DESIGN_LENS = LensSpec(
+    name="design",
+    system_prompt=_DESIGN_SYSTEM_PROMPT,
+    model="sonnet",
+    effort="high",
+)
+
+_CLEANLINESS_SYSTEM_PROMPT = (
+    "You are Heimdall's Cleanliness review lens. Review ONLY the cleanliness of this "
+    "pull request: readability, dead or duplicated code, unclear names, missing or "
+    "misleading docs, error-handling hygiene, and adherence to the repo style guide. "
+    "Use the heimdall-context wrapper (diff|pr|file|conventions) and the read-only "
+    "Read/Grep/Glob tools to inspect changes. Do not modify anything. "
+    + _FINDINGS_JSON_CONTRACT
+)
+
+CLEANLINESS_LENS = LensSpec(
+    name="cleanliness",
+    system_prompt=_CLEANLINESS_SYSTEM_PROMPT,
+    model="sonnet",
+    effort="high",
+)
+
+# Synthesis runs on opus/max because it must reason over every lens's output,
+# dedup overlaps, and decide the surviving severity that drives the verdict.
+_SYNTHESIS_SYSTEM_PROMPT = (
+    "You are Heimdall's review synthesizer. You receive the combined findings of "
+    "three independent review lenses (security, design, cleanliness) as JSON in the "
+    "prompt. Produce the final set of findings by: (1) DEDUPING overlapping findings "
+    "that describe the same underlying issue across lenses into a single finding; "
+    "(2) keeping the most accurate severity for each surviving finding; (3) attributing "
+    "each survivor to the lens that originated it. Do not invent new findings beyond "
+    "what the lenses reported. Report the surviving findings as a single JSON object on "
+    'its own line: {"findings": [{"severity": "critical|high|medium|low", "title": '
+    '"...", "message": "...", "location": "path:line", "lens": '
+    '"security|design|cleanliness"}]}. Emit an empty findings list when nothing survives."'
+)
+
+SYNTHESIS_LENS = LensSpec(
+    name="synthesis",
+    system_prompt=_SYNTHESIS_SYSTEM_PROMPT,
+    model="opus",
+    effort="max",
+)
 
 _DEFAULT_PROMPT = (
     "Review this pull request through your assigned lens and report findings as the "
@@ -170,8 +280,8 @@ def build_claude_argv(
 ) -> list[str]:
     """Build the ``claude -p`` argv for a read-only lens run over a workspace.
 
-    The invocation pins opus at max effort with JSON output, restricts tools to
-    read-only Read/Grep/Glob plus the allowlisted ``heimdall-context`` Bash
+    The invocation pins the lens's own model and effort with JSON output, restricts
+    tools to read-only Read/Grep/Glob plus the allowlisted ``heimdall-context`` Bash
     wrapper, and disallows Write/Edit.  Raw Bash carries no deny rule (an unscoped
     Bash deny would override the wrapper's allow rule); default-deny blocks it.
     argv is consumed by ``create_subprocess_exec`` (no shell), so none of these
@@ -180,7 +290,7 @@ def build_claude_argv(
     Args:
         claude_binary: Path or name of the claude executable.
         workspace_dir: Materialized seed-context directory to scope the session to.
-        lens: The lens whose system prompt focuses the review.
+        lens: The lens whose system prompt, model, and effort focus the review.
         prompt: The user prompt; defaults to a generic "review and report" prompt.
 
     Returns:
@@ -191,9 +301,9 @@ def build_claude_argv(
         "-p",
         prompt,
         "--model",
-        "opus",
+        lens.model,
         "--effort",
-        "max",
+        lens.effort,
         "--output-format",
         "json",
         "--add-dir",
@@ -295,13 +405,7 @@ def format_review_body(findings: list[Finding]) -> str:
     if not findings:
         return _NO_FINDINGS_BODY
 
-    order = {
-        Severity.CRITICAL: 0,
-        Severity.HIGH: 1,
-        Severity.MEDIUM: 2,
-        Severity.LOW: 3,
-    }
-    ranked = sorted(findings, key=lambda f: order[f.severity])
+    ranked = sorted(findings, key=lambda f: _SEVERITY_ORDER[f.severity])
 
     lines = ["## Heimdall security review", ""]
     for finding in ranked:
@@ -327,6 +431,132 @@ def verdict_for(findings: list[Finding]) -> str:
     if any(f.severity in _BLOCKING_SEVERITIES for f in findings):
         return "REQUEST_CHANGES"
     return "COMMENT"
+
+
+def verdict_for_tagged(tagged: list[TaggedFinding]) -> str:
+    """Map the surviving tagged findings to a PR review event.
+
+    Reuses :func:`verdict_for` over the underlying findings so the verdict reflects
+    the highest-severity finding that survived synthesis dedup.
+
+    Args:
+        tagged: The synthesis survivors.
+
+    Returns:
+        "REQUEST_CHANGES" if any survivor is high/critical, else "COMMENT".
+    """
+    return verdict_for([t.finding for t in tagged])
+
+
+_NO_SYNTHESIS_FINDINGS_BODY = "Heimdall review: no concerns found across any lens."
+
+_SEVERITY_HEADERS = (
+    (Severity.CRITICAL, "Critical"),
+    (Severity.HIGH, "High"),
+    (Severity.MEDIUM, "Medium"),
+    (Severity.LOW, "Low"),
+)
+
+
+def format_synthesis_body(tagged: list[TaggedFinding]) -> str:
+    """Render synthesis survivors grouped by severity, each tagged by its lens.
+
+    Findings are grouped under worst-first severity headers (Critical -> Low); each
+    bullet carries a ``[lens]`` tag naming the originating lens.  An empty list
+    yields a short all-clear message.
+
+    Args:
+        tagged: The deduped, lens-tagged survivors from synthesis.
+
+    Returns:
+        A Markdown string suitable as a GitHub review body.
+    """
+    if not tagged:
+        return _NO_SYNTHESIS_FINDINGS_BODY
+
+    by_severity: dict[Severity, list[TaggedFinding]] = {}
+    for item in tagged:
+        by_severity.setdefault(item.finding.severity, []).append(item)
+
+    lines = ["## Heimdall review", ""]
+    for severity, header in _SEVERITY_HEADERS:
+        group = by_severity.get(severity)
+        if not group:
+            continue
+        lines.append(f"### {severity.value.upper()} — {header}")
+        for item in group:
+            finding = item.finding
+            location = f" (`{finding.location}`)" if finding.location else ""
+            lines.append(f"- **[{item.lens}] {finding.title}**{location}")
+            if finding.message:
+                lines.append(f"  {finding.message}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def parse_tagged_findings(text: str) -> list[TaggedFinding]:
+    """Parse synthesis output into lens-tagged findings, ranked worst-first.
+
+    Reuses :func:`parse_findings` for the severity/title/message/location fields and
+    layers on the per-finding ``lens`` tag the synthesizer attaches.  The result is
+    sorted worst-first so the verdict and body see a stable ranking.
+
+    Args:
+        text: The synthesis lens output (claude's ``result`` text or bare JSON).
+
+    Returns:
+        The deduped survivors, lens-tagged and severity-ranked. Empty when none.
+    """
+    obj = _extract_findings_json(text)
+    raw_findings = obj.get("findings", []) if obj is not None else []
+    lens_by_index: list[str] = []
+    if isinstance(raw_findings, list):
+        for item in raw_findings:
+            lens_value = item.get("lens") if isinstance(item, dict) else None
+            lens_by_index.append(str(lens_value) if lens_value is not None else "")
+
+    findings = parse_findings(text)
+    tagged = [
+        TaggedFinding(lens=lens_by_index[i] if i < len(lens_by_index) else "", finding=finding)
+        for i, finding in enumerate(findings)
+    ]
+    return sorted(tagged, key=lambda t: _SEVERITY_ORDER[t.finding.severity])
+
+
+def _render_lens_findings_json(lens_results: list[LensResult]) -> str:
+    """Serialize every lens's findings into the JSON the synthesizer reads.
+
+    Each finding carries its originating lens name so the synthesizer can dedup
+    across lenses and attribute survivors.
+    """
+    payload = {
+        "lenses": [
+            {
+                "lens": result.lens_name,
+                "findings": [
+                    {
+                        "severity": f.severity.value,
+                        "title": f.title,
+                        "message": f.message,
+                        "location": f.location,
+                    }
+                    for f in result.findings
+                ],
+            }
+            for result in lens_results
+        ]
+    }
+    return json.dumps(payload, indent=2)
+
+
+def _build_synthesis_prompt(lens_results: list[LensResult]) -> str:
+    """Build the user prompt feeding all lens findings into the synthesis pass."""
+    return (
+        "Synthesize the final review from these per-lens findings. Dedup overlaps "
+        "across lenses, keep the most accurate severity, attribute each survivor to "
+        "its lens, and emit the findings JSON described in your instructions.\n\n"
+        + _render_lens_findings_json(lens_results)
+    )
 
 
 def _sum_tokens(envelope: dict[str, object]) -> int:
@@ -467,3 +697,62 @@ async def run_lens(
         result.total_tokens,
     )
     return LensResult(lens_name=lens.name, findings=findings)
+
+
+async def run_synthesis(
+    *,
+    lens_results: list[LensResult],
+    workspace_dir: str,
+    claude_binary: str = "claude",
+    token_cap: int = DEFAULT_TOKEN_CAP,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    invoker: ClaudeInvoker = run_claude_subprocess,
+) -> SynthesisResult:
+    """Run the 4th synthesis ``claude -p`` pass over all lenses' findings.
+
+    Feeds the combined per-lens findings into a bounded synthesis call that dedups
+    overlapping findings, ranks by severity, and tags each survivor with its lens.
+    The verdict reflects the highest-severity surviving finding and the body groups
+    survivors by severity with each tagged by its originating lens.
+
+    Args:
+        lens_results: Results of every lens that ran (Security, Design, Cleanliness).
+        workspace_dir: Materialized seed-context directory (the synthesis call is
+            scoped to it like the lenses, so it can re-check claims if needed).
+        claude_binary: Path or name of the claude executable.
+        token_cap: Per-agent cumulative-token ceiling (bounds the synthesis call).
+        timeout_seconds: Wall-clock limit for the synthesis run.
+        invoker: Coroutine that runs the subprocess; injected in tests.
+
+    Returns:
+        A :class:`SynthesisResult` with the tagged survivors, verdict, and body.
+
+    Raises:
+        LensTimeoutError / LensTokenCapError: Propagated from the invoker when the
+            synthesis run is aborted; the caller handles these as a failed pass.
+    """
+    argv = build_claude_argv(
+        claude_binary=claude_binary,
+        workspace_dir=workspace_dir,
+        lens=SYNTHESIS_LENS,
+        prompt=_build_synthesis_prompt(lens_results),
+    )
+    total_lens_findings = sum(len(r.findings) for r in lens_results)
+    logger.info(
+        "Running synthesis over %d lenses (%d findings)",
+        len(lens_results),
+        total_lens_findings,
+    )
+    result = await invoker(argv, timeout_seconds=timeout_seconds, token_cap=token_cap)
+    tagged = parse_tagged_findings(result.stdout)
+    logger.info(
+        "Synthesis kept %d of %d findings (%d tokens)",
+        len(tagged),
+        total_lens_findings,
+        result.total_tokens,
+    )
+    return SynthesisResult(
+        tagged_findings=tagged,
+        verdict=verdict_for_tagged(tagged),
+        body=format_synthesis_body(tagged),
+    )
