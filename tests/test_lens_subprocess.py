@@ -1,8 +1,11 @@
 """Tests for the default claude subprocess invoker: kills on timeout / token cap.
 
-The real claude binary is never spawned — asyncio.create_subprocess_exec is
-patched so we drive process behaviour (slow completion, oversized usage) and
-assert the subprocess is killed and the failure surfaces cleanly.
+The real claude binary is never spawned — bwrap resolution is patched to a fixed
+path and asyncio.create_subprocess_exec is patched so we drive process behaviour
+(slow completion, oversized usage) and assert the subprocess is killed and the
+failure surfaces cleanly.  These tests exercise the timeout/token-cap enforcement
+that runs after the sandbox wrap; the sandbox shape itself is covered in
+test_lens_sandbox.py.
 """
 
 from __future__ import annotations
@@ -66,11 +69,13 @@ async def test_subprocess_returns_parsed_result_on_success() -> None:
     proc = _fake_proc(stdout=stdout)
 
     with patch(
+        "heimdall.lens._resolve_bwrap", return_value="/usr/bin/bwrap"
+    ), patch(
         "heimdall.lens.asyncio.create_subprocess_exec",
         new=AsyncMock(return_value=proc),
     ):
         result = await run_claude_subprocess(
-            ["claude", "-p"], timeout_seconds=900, token_cap=400_000
+            ["claude", "-p"], timeout_seconds=900, token_cap=400_000, cwd="/srv/seed"
         )
 
     assert result.total_tokens == 1234
@@ -84,11 +89,13 @@ async def test_subprocess_killed_on_wall_clock_timeout() -> None:
     proc = _fake_proc(stdout=b"", exhausts_wait=True)
 
     with patch(
+        "heimdall.lens._resolve_bwrap", return_value="/usr/bin/bwrap"
+    ), patch(
         "heimdall.lens.asyncio.create_subprocess_exec",
         new=AsyncMock(return_value=proc),
     ), pytest.raises(LensTimeoutError):
         await run_claude_subprocess(
-            ["claude", "-p"], timeout_seconds=0.05, token_cap=400_000
+            ["claude", "-p"], timeout_seconds=0.05, token_cap=400_000, cwd="/srv/seed"
         )
 
     proc.kill.assert_called_once()
@@ -104,11 +111,13 @@ async def test_subprocess_killed_when_token_cap_exceeded() -> None:
     proc = _fake_proc(stdout=stdout)
 
     with patch(
+        "heimdall.lens._resolve_bwrap", return_value="/usr/bin/bwrap"
+    ), patch(
         "heimdall.lens.asyncio.create_subprocess_exec",
         new=AsyncMock(return_value=proc),
     ), pytest.raises(LensTokenCapError):
         await run_claude_subprocess(
-            ["claude", "-p"], timeout_seconds=900, token_cap=400_000
+            ["claude", "-p"], timeout_seconds=900, token_cap=400_000, cwd="/srv/seed"
         )
 
     proc.kill.assert_called_once()

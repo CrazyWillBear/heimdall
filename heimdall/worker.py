@@ -81,6 +81,7 @@ from heimdall.diff_anchor import (
 )
 from heimdall.github import GitHubClient
 from heimdall.lens import (
+    DEFAULT_BWRAP_BINARY,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_TOKEN_CAP,
     LensError,
@@ -668,6 +669,8 @@ async def _synthesize_review(
             token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
             timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
             env_passthrough=ctx.get("claude_env_passthrough", []),
+            bwrap_binary=ctx.get("bwrap_binary", DEFAULT_BWRAP_BINARY),
+            sandbox_extra_read_only_binds=ctx.get("sandbox_extra_read_only_binds", []),
             blocking=blocking_severities(config.severity_threshold),
         )
     finally:
@@ -713,6 +716,8 @@ async def _run_lenses(
                 token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
                 timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
                 env_passthrough=ctx.get("claude_env_passthrough", []),
+                bwrap_binary=ctx.get("bwrap_binary", DEFAULT_BWRAP_BINARY),
+                sandbox_extra_read_only_binds=ctx.get("sandbox_extra_read_only_binds", []),
             )
             for lens in lenses
         ),
@@ -828,6 +833,8 @@ class WorkerSettings:
             private_key:            PEM-encoded RSA private key
             claude_binary:          path/name of the claude CLI
             claude_env_passthrough: extra env keys forwarded to the claude child
+            bwrap_binary:           path/name of the bwrap executable for the sandbox
+            sandbox_extra_read_only_binds: extra read-only host binds for the sandbox
             lens_token_cap:         per-agent cumulative-token cap
             lens_timeout_seconds:   per-lens wall-clock timeout
             review_timeout_seconds: per-review wall-clock timeout (pipeline-wide)
@@ -848,6 +855,8 @@ class WorkerSettings:
         ctx["private_key"] = settings.github_app_private_key
         ctx["claude_binary"] = settings.claude_binary
         ctx["claude_env_passthrough"] = settings.claude_env_passthrough
+        ctx["bwrap_binary"] = settings.bwrap_binary
+        ctx["sandbox_extra_read_only_binds"] = settings.sandbox_extra_read_only_binds
         ctx["lens_token_cap"] = settings.lens_token_cap
         ctx["lens_timeout_seconds"] = settings.lens_timeout_seconds
         ctx["review_timeout_seconds"] = settings.review_timeout_seconds

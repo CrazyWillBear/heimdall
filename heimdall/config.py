@@ -28,6 +28,17 @@ class Settings(BaseSettings):
         description="Extra env-var names forwarded to the claude child beyond the "
         "PATH/HOME/ANTHROPIC_API_KEY allowlist (e.g. HTTPS_PROXY, NODE_EXTRA_CA_CERTS)",
     )
+    bwrap_binary: str = Field(
+        default="bwrap",
+        description="Path or name of the bubblewrap (bwrap) executable used to sandbox "
+        "each lens claude subprocess; resolved on PATH unless an absolute path is given",
+    )
+    sandbox_extra_read_only_binds: list[str] = Field(
+        default_factory=list,
+        description="Extra host paths bound read-only into the lens sandbox, for "
+        "nonstandard claude/node/CA installs (the seed, OS, CA, DNS, ~/.claude, and venv "
+        "are bound automatically; the worker project dir is never bound)",
+    )
     lens_token_cap: int = Field(
         default=400_000, description="Per-agent cumulative-token cap for a lens run"
     )

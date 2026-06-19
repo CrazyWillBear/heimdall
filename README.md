@@ -104,16 +104,21 @@ unscoped Bash deny would override and neuter the wrapper's allow rule — under 
 anything off the allowlist (including raw Bash) is already blocked. The subprocess is spawned
 via `create_subprocess_exec` (no shell). PR code is therefore **never executed**.
 
-> **Filesystem-read confinement is incomplete.** `--add-dir` *adds* the seed workspace to the
-> allowed set; it does **not** restrict Read/Grep/Glob to it, so a prompt-injected PR can still
-> read files elsewhere on the worker by absolute path. Two interim mitigations are in place: the
-> subprocess runs with a **strict env allowlist** (only `PATH`/`HOME`/`ANTHROPIC_API_KEY` plus
-> `CLAUDE_ENV_PASSTHROUGH`, so the App private key and webhook secret are not in its environment)
-> and its **`cwd` is the workspace** (keeping default-scope Grep/Glob inside it). Neither bounds
-> absolute-path reads — a real OS-level filesystem sandbox (Landlock/bwrap/container) is the
-> proper boundary and is **not yet implemented**. Run the worker as an unprivileged user and keep
-> host secrets out of readable on-disk files (inject env directly; don't leave a `.env` in the
-> worker's cwd) until it lands.
+**Filesystem-read confinement** is enforced at the OS level by a **bubblewrap (`bwrap`) sandbox**
+wrapped around every lens (and the synthesis) `claude` subprocess. The seed is bound **read-only**
+at the fixed in-sandbox path `/workspace` and nothing sensitive is reachable: the worker project
+dir (its `.env` / `heimdall.db`) is **never** bound in, `/tmp` is a private tmpfs, and `~/.claude`,
+the OS, CA, DNS, and `claude`/`node`/venv runtime paths are read-only. PID/IPC are unshared; the
+network is kept (`--share-net`). So even an absolute-path `Read`/`Grep`/`Glob` from a prompt-injected
+PR lands on a filesystem where no worker secret exists. The wrap is **fail-closed**: if `bwrap`
+can't be resolved or the sandbox can't be built, that lens errors and is dropped — it never runs
+unsandboxed. Configure nonstandard `claude`/`node`/CA locations via `SANDBOX_EXTRA_READ_ONLY_BINDS`
+and the `bwrap` path via `BWRAP_BINARY`. Defence in depth still holds beneath the sandbox: a
+**strict env allowlist** (only `PATH`/`HOME`/`ANTHROPIC_API_KEY` plus `CLAUDE_ENV_PASSTHROUGH`)
+keeps secrets out of the child's environment, and PR code is never *executed*.
+
+> **Requires `bwrap` on the worker host.** Install bubblewrap (it works in either setuid or
+> unprivileged-userns mode). Without it, every lens fails closed and no review is produced.
 
 Each run is bounded by a **per-agent cumulative-token cap** (default 400k) and a **per-lens
 wall-clock timeout** (default 1800s); exceeding either kills the subprocess and drops that
@@ -346,6 +351,8 @@ or a `.env` file. Secrets must come from env/`.env` — never commit them.
 | `DATABASE_URL`           | no       | `sqlite+aiosqlite:///./heimdall.db`    | SQLite database URL for persistence.                                    |
 | `CLAUDE_BINARY`          | no       | `claude`                               | Path or name of the `claude` CLI the lenses invoke.                     |
 | `CLAUDE_ENV_PASSTHROUGH` | no       | `[]`                                   | Extra env-var names forwarded to the `claude` child beyond the `PATH`/`HOME`/`ANTHROPIC_API_KEY` allowlist (e.g. `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`). |
+| `BWRAP_BINARY`           | no       | `bwrap`                                | Path or name of the bubblewrap (`bwrap`) executable used to sandbox each lens `claude` subprocess; resolved on `PATH` unless an absolute path is given. |
+| `SANDBOX_EXTRA_READ_ONLY_BINDS` | no | `[]`                                  | Extra host paths bound **read-only** into the lens sandbox, for nonstandard `claude`/`node`/CA installs. The seed, OS, CA, DNS, `~/.claude`, and venv are bound automatically; the worker project dir is **never** bound. |
 | `LENS_TOKEN_CAP`         | no       | `400000`                               | Per-agent cumulative-token cap for a single lens run.                   |
 | `LENS_TIMEOUT_SECONDS`   | no       | `1800`                                 | Per-lens wall-clock timeout (s) before a lens subprocess is killed.     |
 | `REVIEW_TIMEOUT_SECONDS` | no       | `2400`                                 | Per-review wall-clock timeout (s) across the whole pipeline.            |

@@ -22,16 +22,21 @@ Security posture of the invocation (see :func:`build_claude_argv`):
     default-deny already blocks anything off the allowlist, and an unscoped Bash
     deny would take precedence over (and neuter) the wrapper's allow rule.
 
-Filesystem-read confinement is **incomplete** and only partially mitigated here.
-``--add-dir`` *adds* the workspace to the allowed set; it does **not** restrict
-Read/Grep/Glob to it, so a prompt-injected PR can still read files elsewhere on the
-worker by absolute path.  The interim mitigations are: the child env is reduced to a
-strict allowlist (see :func:`run_claude_subprocess`), so the App private key and
-webhook secret are not visible to the model; and the subprocess ``cwd`` is set to the
-workspace, which keeps default-scope (no-path) Grep/Glob inside it.  Neither closes
-absolute-path reads — the real boundary is an OS-level filesystem sandbox
-(Landlock/bwrap/container restricting the read syscall to the workspace), which is NOT
-yet implemented.  PR code is still never *executed* (Bash off the allowlist is denied).
+Filesystem-read confinement is enforced at the OS level by a **bubblewrap (bwrap)
+sandbox** wrapped around the claude subprocess (see :func:`build_bwrap_prefix`).  The
+seed workspace is bound **read-only** at the fixed in-sandbox path ``/workspace`` and
+nothing else of the worker's filesystem is reachable: the worker project dir (its
+``.env`` / ``heimdall.db``) is never bound in, ``/tmp`` is a private tmpfs, ``~/.claude``
+and the OS/CA/DNS/runtime paths are read-only.  ``--add-dir`` then *adds* ``/workspace``
+to claude's allowed set; even an absolute-path Read/Grep/Glob from a prompt-injected PR
+hits a filesystem where nothing sensitive exists.  Defence in depth still holds beneath
+the sandbox: the child env is reduced to a strict allowlist (see
+:func:`run_claude_subprocess`) so secrets are not in its environment, and PR code is
+never *executed* (Bash off the allowlist is denied).
+
+The sandbox is **fail-closed**: if the bwrap wrap cannot be built or run the lens errors
+and is dropped (like a timeout) — it never falls back to an unsandboxed spawn.  The code
+is mode-agnostic (works with either setuid or unprivileged-userns bwrap).
 """
 
 from __future__ import annotations
@@ -41,9 +46,12 @@ import contextlib
 import json
 import logging
 import os
+import shutil
+import sys
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -652,6 +660,161 @@ def _build_subprocess_env(passthrough: Sequence[str] = ()) -> dict[str, str]:
     return {key: os.environ[key] for key in keep if key in os.environ}
 
 
+class SandboxError(LensError):
+    """Raised when the bwrap sandbox cannot be built (fail-closed at spawn).
+
+    A lens that hits this never runs unsandboxed; the caller drops it like a
+    timeout so a prompt-injected PR can never escape onto the host filesystem.
+    """
+
+
+# Fixed in-sandbox mount for the read-only seed.  The lens cwd, ``--add-dir``,
+# and every ``heimdall-context`` invocation reference this path (not the host
+# path), so the worker's real directory layout is never exposed to the model.
+SANDBOX_WORKSPACE_PATH = "/workspace"
+
+# Default bwrap executable name; resolved on PATH unless an explicit path is given.
+DEFAULT_BWRAP_BINARY = "bwrap"
+
+# Read-only OS / CA / DNS paths the claude+node runtime needs inside the sandbox.
+# Bound with --ro-bind-try so a path missing on this distro (e.g. /lib64 on merged-usr
+# systems, /etc/pki vs /etc/ssl) is skipped rather than aborting the build.  The worker
+# project dir is deliberately absent — that is what keeps .env / heimdall.db unreadable.
+_SANDBOX_BASE_READ_ONLY = (
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/etc/ssl",
+    "/etc/pki",
+    "/etc/ca-certificates",
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+)
+
+
+def _resolve_bwrap(bwrap_binary: str = DEFAULT_BWRAP_BINARY) -> str | None:
+    """Resolve the bwrap executable to an absolute path, or None when absent.
+
+    An explicit absolute path is returned only when it exists and is executable;
+    a bare name is looked up on ``PATH`` via :func:`shutil.which`.  Returning None
+    drives the fail-closed behaviour in :func:`build_bwrap_prefix`.
+    """
+    if os.path.isabs(bwrap_binary):
+        return bwrap_binary if os.access(bwrap_binary, os.X_OK) else None
+    return shutil.which(bwrap_binary)
+
+
+def _runtime_read_only_paths(argv_binary: str) -> list[str]:
+    """Resolve the real claude+node binaries and the venv to read-only bind paths.
+
+    The lens claude argv may reference ``claude`` by bare name; the sandbox needs the
+    *resolved* executable plus its directory (claude is typically a launcher that runs
+    ``node``) and the running Python prefix (so the ``heimdall-context`` console script
+    in the venv resolves).  Paths missing on this host are skipped by ``--ro-bind-try``.
+    """
+    paths: list[str] = []
+    resolved = shutil.which(argv_binary) if not os.path.isabs(argv_binary) else argv_binary
+    if resolved:
+        real = os.path.realpath(resolved)
+        paths.append(real)
+        paths.append(os.path.dirname(real))
+    node = shutil.which("node")
+    if node:
+        paths.append(os.path.realpath(node))
+    # The venv hosting heimdall-context (and its Python runtime).
+    paths.append(sys.prefix)
+    if sys.base_prefix != sys.prefix:
+        paths.append(sys.base_prefix)
+    return paths
+
+
+def _claude_home() -> str:
+    """Return the read-only ``~/.claude`` config dir path for the sandbox."""
+    return str(Path(os.environ.get("HOME", str(Path.home()))) / ".claude")
+
+
+def _dedup(*paths: str) -> list[str]:
+    """De-duplicate non-empty paths, preserving first-seen order."""
+    seen: set[str] = set()
+    kept: list[str] = []
+    for path in paths:
+        if path and path not in seen:
+            seen.add(path)
+            kept.append(path)
+    return kept
+
+
+def build_bwrap_prefix(
+    *,
+    workspace_dir: str,
+    claude_binary: str = "claude",
+    bwrap_binary: str = DEFAULT_BWRAP_BINARY,
+    extra_read_only_binds: Sequence[str] = (),
+) -> list[str]:
+    """Build the bwrap argv prefix that confines a lens claude subprocess.
+
+    The returned list is prepended to the claude argv; together they form the argv
+    handed to the no-shell subprocess spawn.  The sandbox binds the seed **read-only**
+    at the fixed :data:`SANDBOX_WORKSPACE_PATH`, gives a private ``/tmp`` tmpfs, mounts
+    ``~/.claude`` and the operator's extra binds read-only (hard ``--ro-bind``), binds the
+    optional OS/CA/DNS/runtime paths with ``--ro-bind-try`` (skipped when absent so the
+    wrap stays mode-agnostic across distros), unshares PID/IPC, and keeps the network
+    (``--share-net``).  The worker project dir is **never** bound, so its ``.env`` /
+    ``heimdall.db`` stay unreadable — this is what closes the absolute-path read hole.
+    Works with either setuid or unprivileged-userns bwrap.
+
+    Args:
+        workspace_dir: Host seed dir to bind read-only at ``/workspace``.
+        claude_binary: Path/name of the claude CLI, resolved to bind its real binary.
+        bwrap_binary: Path/name of the bwrap executable (default: found on PATH).
+        extra_read_only_binds: Extra host paths to bind read-only (for nonstandard
+            claude/node/CA installs); each surfaces as a ``--ro-bind`` flag.
+
+    Returns:
+        The bwrap argv prefix (``[bwrap, --ro-bind, …, --tmpfs, /tmp, …]``).
+
+    Raises:
+        SandboxError: bwrap could not be resolved — fail closed, never spawn unsandboxed.
+    """
+    bwrap = _resolve_bwrap(bwrap_binary)
+    if bwrap is None:
+        raise SandboxError(
+            f"bwrap executable {bwrap_binary!r} not found; refusing to run a lens "
+            "unsandboxed"
+        )
+
+    prefix = [bwrap, "--ro-bind", workspace_dir, SANDBOX_WORKSPACE_PATH]
+
+    # Optional OS / CA / DNS / runtime paths vary by distro and install layout, so
+    # they are bound with --ro-bind-try: bwrap silently skips a missing source rather
+    # than aborting the (fail-closed) build.  This keeps the wrap mode-agnostic.
+    for path in _dedup(*_SANDBOX_BASE_READ_ONLY, *_runtime_read_only_paths(claude_binary)):
+        prefix += ["--ro-bind-try", path, path]
+
+    # ~/.claude and the operator-chosen extra binds are bound hard (--ro-bind): they
+    # are required and surface as explicit flags; a wrong path fails closed at spawn.
+    for path in _dedup(_claude_home(), *extra_read_only_binds):
+        prefix += ["--ro-bind", path, path]
+
+    prefix += [
+        "--tmpfs",
+        "/tmp",  # noqa: S108 - in-sandbox tmpfs, not a host temp path
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--share-net",
+        "--chdir",
+        SANDBOX_WORKSPACE_PATH,
+    ]
+    return prefix
+
+
 async def run_claude_subprocess(
     argv: list[str],
     *,
@@ -659,36 +822,57 @@ async def run_claude_subprocess(
     token_cap: int,
     cwd: str | None = None,
     env_passthrough: Sequence[str] = (),
+    bwrap_binary: str = DEFAULT_BWRAP_BINARY,
+    sandbox_extra_read_only_binds: Sequence[str] = (),
 ) -> ClaudeResult:
-    """Default invoker: spawn claude, enforce the timeout and token cap, parse output.
+    """Default invoker: spawn claude in a bwrap sandbox, enforce timeout + token cap.
 
-    The subprocess is spawned with ``create_subprocess_exec`` (no shell) and is
-    killed (and the failure raised) when the wall-clock timeout elapses or when
-    claude's reported cumulative usage exceeds the cap.  It runs with a strict
-    allowlisted env (see :func:`_build_subprocess_env`) so secrets in the worker's
-    environment are not exposed to the model, and with ``cwd`` set to the workspace so
-    default-scope Grep/Glob stay inside it (absolute-path reads are not bounded here —
-    see the module docstring).
+    The claude argv is wrapped in a bubblewrap (bwrap) OS sandbox (see
+    :func:`build_bwrap_prefix`) so a prompt-injected PR cannot read host files by
+    absolute path: the host ``cwd`` (the seed workspace) is bound **read-only** at the
+    fixed :data:`SANDBOX_WORKSPACE_PATH`, the worker project dir is never bound, ``/tmp``
+    is a private tmpfs, and the spawn cwd inside the sandbox is ``/workspace``.  The wrap
+    is **fail-closed**: if it cannot be built the call raises :class:`SandboxError` and
+    no claude process is ever spawned unsandboxed.
+
+    The subprocess is spawned with no shell and is killed (and the failure raised) when
+    the wall-clock timeout elapses or when claude's reported cumulative usage exceeds the
+    cap.  Defence in depth holds beneath the sandbox: a strict allowlisted env (see
+    :func:`_build_subprocess_env`) keeps secrets out of the child.
 
     Args:
-        argv: The argument vector from :func:`build_claude_argv`.
+        argv: The argument vector from :func:`build_claude_argv` (claude binary first;
+            its ``--add-dir``/cwd already reference ``/workspace``).
         timeout_seconds: Wall-clock limit; the process is killed past it.
         token_cap: Cumulative-token ceiling; a run reporting more is rejected.
-        cwd: Working directory for the subprocess; should be the seed workspace.
+        cwd: Host seed workspace; bound read-only at ``/workspace`` in the sandbox.
         env_passthrough: Extra parent-env keys to forward beyond the base allowlist.
+        bwrap_binary: Path/name of the bwrap executable (default: found on PATH).
+        sandbox_extra_read_only_binds: Extra host paths to bind read-only (nonstandard
+            claude/node/CA installs); each surfaces as a ``--ro-bind`` flag.
 
     Returns:
         A :class:`ClaudeResult` with stdout (claude's ``result`` text) and tokens.
 
     Raises:
+        SandboxError: The bwrap wrap could not be built (fail-closed; never spawned).
         LensTimeoutError: The run exceeded ``timeout_seconds`` (subprocess killed).
         LensTokenCapError: The run exceeded ``token_cap`` (subprocess killed).
     """
+    if cwd is None:
+        raise SandboxError("a seed workspace cwd is required to build the bwrap sandbox")
+    prefix = build_bwrap_prefix(
+        workspace_dir=cwd,
+        claude_binary=argv[0],
+        bwrap_binary=bwrap_binary,
+        extra_read_only_binds=sandbox_extra_read_only_binds,
+    )
     proc = await asyncio.create_subprocess_exec(
+        *prefix,
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=cwd,
+        cwd=SANDBOX_WORKSPACE_PATH,
         env=_build_subprocess_env(env_passthrough),
     )
     try:
@@ -727,33 +911,40 @@ async def run_lens(
     token_cap: int = DEFAULT_TOKEN_CAP,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     env_passthrough: Sequence[str] = (),
+    bwrap_binary: str = DEFAULT_BWRAP_BINARY,
+    sandbox_extra_read_only_binds: Sequence[str] = (),
     invoker: ClaudeInvoker = run_claude_subprocess,
 ) -> LensResult:
     """Run one lens over a materialized seed workspace and parse its findings.
 
     This is the reusable seam #5 calls once per lens.  It builds the read-only
-    ``claude -p`` argv, delegates execution (and cap/timeout enforcement) to the
-    injected ``invoker``, then parses structured findings.
+    ``claude -p`` argv (scoped to the in-sandbox ``/workspace`` path), delegates
+    execution (sandbox wrap + cap/timeout enforcement) to the injected ``invoker``
+    — which binds the host ``workspace_dir`` read-only at ``/workspace`` — then parses
+    structured findings.
 
     Args:
         lens: The lens to run (name + system prompt).
-        workspace_dir: Materialized seed-context directory from assemble_pr_context.
+        workspace_dir: Materialized seed-context directory from assemble_pr_context;
+            bound read-only at ``/workspace`` inside the sandbox.
         claude_binary: Path or name of the claude executable.
         token_cap: Per-agent cumulative-token ceiling.
         timeout_seconds: Wall-clock limit for the run.
         env_passthrough: Extra parent-env keys forwarded to the claude child.
+        bwrap_binary: Path/name of the bwrap executable (default: found on PATH).
+        sandbox_extra_read_only_binds: Extra host paths bound read-only in the sandbox.
         invoker: Coroutine that runs the subprocess; injected in tests.
 
     Returns:
         A :class:`LensResult` with the lens name and parsed findings.
 
     Raises:
-        LensTimeoutError / LensTokenCapError: Propagated from the invoker when
-            the run is aborted; callers handle these as a failed lens.
+        SandboxError / LensTimeoutError / LensTokenCapError: Propagated from the
+            invoker when the run is aborted; callers handle these as a failed lens.
     """
     argv = build_claude_argv(
         claude_binary=claude_binary,
-        workspace_dir=workspace_dir,
+        workspace_dir=SANDBOX_WORKSPACE_PATH,
         lens=lens,
     )
     logger.info("Running lens %s over %s", lens.name, workspace_dir)
@@ -763,6 +954,8 @@ async def run_lens(
         token_cap=token_cap,
         cwd=workspace_dir,
         env_passthrough=env_passthrough,
+        bwrap_binary=bwrap_binary,
+        sandbox_extra_read_only_binds=sandbox_extra_read_only_binds,
     )
     findings = parse_findings(result.stdout)
     logger.info(
@@ -782,6 +975,8 @@ async def run_synthesis(
     token_cap: int = DEFAULT_TOKEN_CAP,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     env_passthrough: Sequence[str] = (),
+    bwrap_binary: str = DEFAULT_BWRAP_BINARY,
+    sandbox_extra_read_only_binds: Sequence[str] = (),
     invoker: ClaudeInvoker = run_claude_subprocess,
     blocking: frozenset[Severity] = _BLOCKING_SEVERITIES,
 ) -> SynthesisResult:
@@ -790,16 +985,19 @@ async def run_synthesis(
     Feeds the combined per-lens findings into a bounded synthesis call that dedups
     overlapping findings, ranks by severity, and tags each survivor with its lens.
     The verdict reflects the highest-severity surviving finding and the body groups
-    survivors by severity with each tagged by its originating lens.
+    survivors by severity with each tagged by its originating lens.  Like the lenses,
+    the call runs inside the bwrap sandbox with the seed bound read-only at ``/workspace``.
 
     Args:
         lens_results: Results of every lens that ran (Security, Design, Cleanliness).
-        workspace_dir: Materialized seed-context directory (the synthesis call is
-            scoped to it like the lenses, so it can re-check claims if needed).
+        workspace_dir: Materialized seed-context directory (bound read-only at
+            ``/workspace`` like the lenses, so it can re-check claims if needed).
         claude_binary: Path or name of the claude executable.
         token_cap: Per-agent cumulative-token ceiling (bounds the synthesis call).
         timeout_seconds: Wall-clock limit for the synthesis run.
         env_passthrough: Extra parent-env keys forwarded to the claude child.
+        bwrap_binary: Path/name of the bwrap executable (default: found on PATH).
+        sandbox_extra_read_only_binds: Extra host paths bound read-only in the sandbox.
         invoker: Coroutine that runs the subprocess; injected in tests.
         blocking: The severities that escalate the verdict to REQUEST_CHANGES;
             defaults to high/critical, overridden by the repo config threshold.
@@ -808,12 +1006,12 @@ async def run_synthesis(
         A :class:`SynthesisResult` with the tagged survivors, verdict, and body.
 
     Raises:
-        LensTimeoutError / LensTokenCapError: Propagated from the invoker when the
-            synthesis run is aborted; the caller handles these as a failed pass.
+        SandboxError / LensTimeoutError / LensTokenCapError: Propagated from the
+            invoker when the synthesis run is aborted; caller handles it as a failed pass.
     """
     argv = build_claude_argv(
         claude_binary=claude_binary,
-        workspace_dir=workspace_dir,
+        workspace_dir=SANDBOX_WORKSPACE_PATH,
         lens=SYNTHESIS_LENS,
         prompt=_build_synthesis_prompt(lens_results),
     )
@@ -829,6 +1027,8 @@ async def run_synthesis(
         token_cap=token_cap,
         cwd=workspace_dir,
         env_passthrough=env_passthrough,
+        bwrap_binary=bwrap_binary,
+        sandbox_extra_read_only_binds=sandbox_extra_read_only_binds,
     )
     tagged = parse_tagged_findings(result.stdout)
     logger.info(
