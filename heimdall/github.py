@@ -55,8 +55,27 @@ class GitHubClient:
         self._app_id = app_id
         self._private_key = private_key
         self._installation_id = installation_id
-        self._http = http_client or httpx.AsyncClient()
+        # Track ownership so aclose() only closes clients we created, not injected ones.
+        self._owns_http = http_client is None
+        self._http = http_client if http_client is not None else httpx.AsyncClient()
         self._cached_token: str | None = None
+
+    async def aclose(self) -> None:
+        """Close the underlying httpx client, but only if we created it.
+
+        Injected clients (passed via http_client) are owned by the caller and
+        must not be closed here.
+        """
+        if self._owns_http:
+            await self._http.aclose()
+
+    async def __aenter__(self) -> GitHubClient:
+        """Support ``async with GitHubClient(...)`` usage."""
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        """Close the owned httpx client when leaving the async context."""
+        await self.aclose()
 
     async def get_installation_token(self) -> str:
         """Exchange the App JWT for a short-lived installation access token."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from heimdall.github import GitHubClient, make_jwt
@@ -68,3 +69,57 @@ async def test_post_review() -> None:
     sent_json = call_args[1]["json"]
     assert sent_json["body"] == "Heimdall received this PR"
     assert sent_json["event"] == "COMMENT"
+
+
+# ---------------------------------------------------------------------------
+# GitHubClient lifecycle: aclose and async context-manager
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_aclose_closes_owned_http_client() -> None:
+    """aclose() closes self._http when GitHubClient created it (no injection)."""
+    mock_http = AsyncMock(spec=httpx.AsyncClient)
+
+    with patch("heimdall.github.httpx.AsyncClient", return_value=mock_http):
+        client = GitHubClient(app_id=1, private_key="key", installation_id=42)
+        await client.aclose()
+
+    mock_http.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_aclose_does_not_close_injected_http_client() -> None:
+    """aclose() must NOT close an http_client that was injected by the caller."""
+    mock_http = AsyncMock(spec=httpx.AsyncClient)
+    client = GitHubClient(
+        app_id=1, private_key="key", installation_id=42, http_client=mock_http
+    )
+    await client.aclose()
+
+    mock_http.aclose.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_async_context_manager_closes_owned_client() -> None:
+    """async with GitHubClient(...) closes the owned httpx client on exit."""
+    mock_http = AsyncMock(spec=httpx.AsyncClient)
+
+    with patch("heimdall.github.httpx.AsyncClient", return_value=mock_http):
+        async with GitHubClient(app_id=1, private_key="key", installation_id=42):
+            pass
+
+    mock_http.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_async_context_manager_does_not_close_injected_client() -> None:
+    """async with GitHubClient(..., http_client=x) does not close the injected client."""
+    mock_http = AsyncMock(spec=httpx.AsyncClient)
+
+    async with GitHubClient(
+        app_id=1, private_key="key", installation_id=42, http_client=mock_http
+    ):
+        pass
+
+    mock_http.aclose.assert_not_awaited()

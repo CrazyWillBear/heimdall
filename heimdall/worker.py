@@ -72,31 +72,37 @@ async def run_review(
         private_key=ctx["private_key"],
         installation_id=installation_id,
     )
-
-    last_sha = await get_last_reviewed_sha(
-        db, repo_full_name=repo_full_name, pr_number=pr_number
-    )
-    if last_sha == head_sha:
-        logger.info(
-            "Skipping already-reviewed SHA %s for %s#%d",
-            head_sha,
-            repo_full_name,
-            pr_number,
+    try:
+        last_sha = await get_last_reviewed_sha(
+            db, repo_full_name=repo_full_name, pr_number=pr_number
         )
-        return
+        if last_sha == head_sha:
+            logger.info(
+                "Skipping already-reviewed SHA %s for %s#%d",
+                head_sha,
+                repo_full_name,
+                pr_number,
+            )
+            return
 
-    logger.info("Posting review for %s#%d @ %s", repo_full_name, pr_number, head_sha)
-    await github_client.post_review(
-        repo_full_name=repo_full_name,
-        pr_number=pr_number,
-        commit_id=head_sha,
-        body=_REVIEW_BODY,
-        event="COMMENT",
-    )
-    await set_last_reviewed_sha(
-        db, repo_full_name=repo_full_name, pr_number=pr_number, sha=head_sha
-    )
-    logger.info("Review posted for %s#%d @ %s", repo_full_name, pr_number, head_sha)
+        logger.info(
+            "Posting review for %s#%d @ %s", repo_full_name, pr_number, head_sha
+        )
+        await github_client.post_review(
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            commit_id=head_sha,
+            body=_REVIEW_BODY,
+            event="COMMENT",
+        )
+        await set_last_reviewed_sha(
+            db, repo_full_name=repo_full_name, pr_number=pr_number, sha=head_sha
+        )
+        logger.info(
+            "Review posted for %s#%d @ %s", repo_full_name, pr_number, head_sha
+        )
+    finally:
+        await github_client.aclose()
 
 
 def _load_settings() -> Any:

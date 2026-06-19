@@ -91,6 +91,62 @@ async def test_run_review_skips_already_reviewed_sha() -> None:
     mock_gh_client.post_review.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_run_review_closes_github_client_after_posting() -> None:
+    """run_review closes the GitHubClient after posting a review (no FD leak)."""
+    mock_db = AsyncMock()
+    mock_gh_client = AsyncMock()
+    mock_gh_client.post_review = AsyncMock()
+
+    ctx: dict[str, object] = {
+        "db": mock_db,
+        "app_id": _APP_ID,
+        "private_key": _PRIVATE_KEY,
+    }
+
+    with (
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    mock_gh_client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_review_closes_github_client_on_skip_path() -> None:
+    """run_review closes the GitHubClient even when the review is skipped."""
+    mock_db = AsyncMock()
+    mock_gh_client = AsyncMock()
+
+    ctx: dict[str, object] = {
+        "db": mock_db,
+        "app_id": _APP_ID,
+        "private_key": _PRIVATE_KEY,
+    }
+
+    with (
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=_SHA)),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    mock_gh_client.aclose.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # WorkerSettings: registration and Redis wiring
 # ---------------------------------------------------------------------------
