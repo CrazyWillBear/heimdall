@@ -10,6 +10,7 @@ import pytest
 
 from heimdall.lens import (
     Finding,
+    LensError,
     LensResult,
     LensTimeoutError,
     Severity,
@@ -315,14 +316,16 @@ async def test_run_review_isolates_one_lens_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_run_review_handles_all_lenses_failing_without_crashing() -> None:
-    """If every lens fails, no review is posted, no SHA recorded, no crash."""
-    mock_gh_client = AsyncMock()
-    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+    """If every lens fails twice (after retry), a terse COMMENT note is posted, SHA recorded."""
+    mock_db = AsyncMock()
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": mock_db, "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
 
     stack, synth_mock = _patch_review_pipeline(lens_side_effect=LensTimeoutError("killed"))
     with (
         stack,
         patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()) as mock_set,
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()) as mock_persist,
         patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
     ):
         # Must not raise — the worker swallows lens failures gracefully.
@@ -334,16 +337,23 @@ async def test_run_review_handles_all_lenses_failing_without_crashing() -> None:
             head_sha=_SHA,
         )
 
+    # Every lens failed, so synthesis never ran; after retry-once also fails a
+    # single terse COMMENT note is posted, the SHA is recorded so the failed
+    # commit is not endlessly re-reviewed, and no posted-review record is kept.
     synth_mock.assert_not_called()
-    mock_gh_client.post_review.assert_not_called()
-    mock_set.assert_not_called()
+    mock_gh_client.post_review.assert_awaited_once()
+    assert mock_gh_client.post_review.await_args.kwargs["event"] == "COMMENT"
+    mock_set.assert_awaited_once_with(
+        mock_db, repo_full_name=_REPO, pr_number=_PR, sha=_SHA
+    )
+    mock_persist.assert_not_called()
     mock_gh_client.aclose.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_run_review_handles_synthesis_failure_without_crashing() -> None:
-    """A synthesis abort is handled: no crash, no review posted, SHA not recorded."""
-    mock_gh_client = AsyncMock()
+    """A persistent synthesis abort posts a terse COMMENT note and records the SHA."""
+    mock_gh_client = _gh_client()
     ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
 
     lens_results = [
@@ -351,12 +361,49 @@ async def test_run_review_handles_synthesis_failure_without_crashing() -> None:
         _lens_result([], name="design"),
         _lens_result([], name="cleanliness"),
     ]
+    # The retry re-runs the lenses, so feed enough results for two attempts.
     stack, _ = _patch_review_pipeline(
-        lens_results=lens_results,
+        lens_results=lens_results * 2,
         synthesis_side_effect=LensTimeoutError("synthesis killed"),
     )
     with (
         stack,
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()) as mock_set,
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()) as mock_persist,
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    mock_gh_client.post_review.assert_awaited_once()
+    assert mock_gh_client.post_review.await_args.kwargs["event"] == "COMMENT"
+    mock_set.assert_awaited_once()
+    mock_persist.assert_not_called()
+    mock_gh_client.aclose.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Retry-once + per-review timeout + terse failure note
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_review_retries_lens_exactly_once_then_posts_terse_note() -> None:
+    """A failing pipeline is retried exactly once, then posts a terse error COMMENT."""
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    # The whole lens-fanout + synthesis pipeline aborts on both attempts; the retry
+    # seam wraps _synthesize_review, so drive the failure there.
+    synthesize_mock = AsyncMock(side_effect=LensError("boom"))
+    with (
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
+        patch("heimdall.worker._synthesize_review", new=synthesize_mock),
         patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()) as mock_set,
         patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
     ):
@@ -368,9 +415,88 @@ async def test_run_review_handles_synthesis_failure_without_crashing() -> None:
             head_sha=_SHA,
         )
 
-    mock_gh_client.post_review.assert_not_called()
-    mock_set.assert_not_called()
-    mock_gh_client.aclose.assert_awaited_once()
+    # Exactly two attempts: the initial run plus a single retry.
+    assert synthesize_mock.await_count == 2
+    # Terse failure note posted exactly once as a COMMENT, never REQUEST_CHANGES.
+    mock_gh_client.post_review.assert_awaited_once()
+    posted = mock_gh_client.post_review.await_args.kwargs
+    assert posted["event"] == "COMMENT"
+    assert "failed" in posted["body"].lower()
+    # The failed SHA is recorded so it is not endlessly re-reviewed.
+    mock_set.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_review_retry_succeeds_posts_real_review() -> None:
+    """If the retry succeeds, the real review is posted (no failure note)."""
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    # First attempt aborts, second attempt synthesizes a clean review.
+    synthesis = _synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit", "style")])
+    synthesize_mock = AsyncMock(side_effect=[LensError("boom"), synthesis])
+    with (
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
+        patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None)),
+        patch("heimdall.worker._synthesize_review", new=synthesize_mock),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    assert synthesize_mock.await_count == 2
+    mock_gh_client.post_review.assert_awaited_once()
+    posted = mock_gh_client.post_review.await_args.kwargs
+    # A real verdict, not the terse failure note.
+    assert "failed" not in posted["body"].lower()
+
+
+@pytest.mark.asyncio
+async def test_run_review_pipeline_timeout_surfaced_as_failure() -> None:
+    """A run exceeding the per-review wall-clock timeout posts a terse failure note."""
+    mock_gh_client = AsyncMock()
+    # Tiny per-review timeout; the lens sleeps past it on every attempt.
+    ctx: dict[str, object] = {
+        "db": AsyncMock(),
+        "app_id": _APP_ID,
+        "private_key": _PRIVATE_KEY,
+        "review_timeout_seconds": 0.01,
+    }
+
+    async def _slow_lens(*_args: object, **_kwargs: object) -> object:
+        import asyncio
+
+        await asyncio.sleep(1.0)
+        return _lens_result([])
+
+    run_lens_mock = AsyncMock(side_effect=_slow_lens)
+    with (
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
+        patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock())),
+        patch("heimdall.worker.run_lens", new=run_lens_mock),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    # The timeout is surfaced as a failure: terse COMMENT note after retry.
+    mock_gh_client.post_review.assert_awaited_once()
+    posted = mock_gh_client.post_review.await_args.kwargs
+    assert posted["event"] == "COMMENT"
+    assert "failed" in posted["body"].lower()
 
 
 @pytest.mark.asyncio
@@ -551,6 +677,116 @@ async def test_run_review_first_review_does_not_refresh() -> None:
     mock_gh_client.dismiss_review.assert_not_called()
     mock_gh_client.minimize_review.assert_not_called()
     mock_gh_client.post_review.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Metadata-only logging: no token/secret/findings by default; findings under DEBUG
+# ---------------------------------------------------------------------------
+
+_TOKEN = "ghs_supersecretinstallationtoken"
+_SECRET_KEY = "-----BEGIN RSA PRIVATE KEY-----\nMIIsecret\n-----END RSA PRIVATE KEY-----"
+_API_KEY = "sk-ant-supersecretanthropickey"
+_FINDING_TITLE = "SQL injection via unsanitized id"
+_FINDING_MESSAGE = "User input concatenated into a raw query string"
+
+
+async def _drive_review_capturing_logs(
+    *,
+    debug_logging: bool,
+) -> str:
+    """Run a successful review under the given debug flag; return the full log text."""
+    import logging
+
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {
+        "db": AsyncMock(),
+        # Secrets the worker handles but must never log.
+        "app_id": _APP_ID,
+        "private_key": _SECRET_KEY,
+        "installation_token": _TOKEN,
+        "anthropic_api_key": _API_KEY,
+        "debug_logging": debug_logging,
+    }
+    # A synthesized survivor whose title/message must only surface under DEBUG.
+    synthesis = _synthesis_from(
+        [
+            TaggedFinding(
+                lens="security",
+                finding=Finding(
+                    severity=Severity.HIGH,
+                    title=_FINDING_TITLE,
+                    message=_FINDING_MESSAGE,
+                    location="app/db.py:12",
+                ),
+            )
+        ]
+    )
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture()
+    worker_logger = logging.getLogger("heimdall.worker")
+    prev_level = worker_logger.level
+    worker_logger.addHandler(handler)
+    worker_logger.setLevel(logging.DEBUG)
+    try:
+        with (
+            _patch_review_pipeline(synthesis_result=synthesis)[0],
+            patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+            patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+            patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+        ):
+            await run_review(
+                ctx,
+                installation_id=_INSTALL_ID,
+                repo_full_name=_REPO,
+                pr_number=_PR,
+                head_sha=_SHA,
+            )
+    finally:
+        worker_logger.removeHandler(handler)
+        worker_logger.setLevel(prev_level)
+
+    return "\n".join(record.getMessage() for record in records)
+
+
+@pytest.mark.asyncio
+async def test_default_logs_contain_only_metadata_no_secrets_or_findings() -> None:
+    """Default logs carry metadata only — no token, secret, or findings text."""
+    log_text = await _drive_review_capturing_logs(debug_logging=False)
+
+    # Metadata is present (repo, PR, SHA, verdict).
+    assert _REPO in log_text
+    assert _SHA in log_text
+
+    # No secret material ever appears.
+    assert _TOKEN not in log_text
+    assert _SECRET_KEY not in log_text
+    assert _API_KEY not in log_text
+    assert "BEGIN RSA PRIVATE KEY" not in log_text
+
+    # No findings/code text in default (metadata-only) logs.
+    assert _FINDING_TITLE not in log_text
+    assert _FINDING_MESSAGE not in log_text
+
+
+@pytest.mark.asyncio
+async def test_debug_logs_include_findings_and_code() -> None:
+    """Under the DEBUG flag, findings/code text appears in the logs."""
+    log_text = await _drive_review_capturing_logs(debug_logging=True)
+
+    # Findings/code text appears only because DEBUG logging is enabled.
+    assert _FINDING_TITLE in log_text
+    assert _FINDING_MESSAGE in log_text
+
+    # Even under DEBUG, secrets are never logged.
+    assert _TOKEN not in log_text
+    assert _SECRET_KEY not in log_text
+    assert _API_KEY not in log_text
 
 
 # ---------------------------------------------------------------------------

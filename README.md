@@ -36,9 +36,10 @@ neuter the wrapper's allow rule — under default-deny, anything off the allowli
 raw Bash) is already blocked. The subprocess is spawned via `create_subprocess_exec` (no
 shell).
 
-Each run is bounded by a **per-agent cumulative-token cap** (default 400k) and a
-**wall-clock timeout** (default 1800s). Exceeding either kills the subprocess and raises
-`LensTokenCapError` / `LensTimeoutError`; the worker logs the abort and drops that lens.
+Each lens run is bounded by a **per-agent cumulative-token cap** (default 400k) and a
+**per-lens wall-clock timeout** (default 1800s). Exceeding either kills the subprocess and
+raises `LensTokenCapError` / `LensTimeoutError`; the worker logs the abort and drops that
+lens.
 
 ## Synthesis
 
@@ -46,7 +47,24 @@ A 4th `claude -p` pass (`run_synthesis`, using `SYNTHESIS_LENS` on **opus/max**)
 the combined findings of all three lenses and: **dedups** overlapping findings across
 lenses, **ranks** by severity, attributes each survivor to its originating lens, writes the
 **verdict**, and formats the review. The synthesis call is bounded by the same token cap
-and timeout. When every lens fails, or synthesis itself aborts, the worker posts nothing.
+and timeout. When every lens fails, or synthesis itself aborts, that run produces no
+review (the per-review retry/failure handling below then takes over).
+
+### Failure, retry, and the per-review timeout
+
+The whole review pipeline (`run_review`) is additionally bounded by a **per-review
+wall-clock timeout** (default 2400s) that wraps the entire lens-fanout + synthesis pipeline
+— distinct from, and looser than, the per-lens timeout. On any pipeline failure or timeout
+(including every lens failing or synthesis aborting) the worker **retries exactly once**;
+if the retry also fails it posts a terse **"Heimdall review failed" COMMENT** note (never
+REQUEST_CHANGES, since a pipeline failure is not a verdict) and records the SHA so the
+failed commit is not re-reviewed in a loop.
+
+### Logging discipline
+
+Default logs are **metadata-only** — repo / PR / SHA / timing / verdict. **Tokens and
+secrets are never logged** (installation token, private key, `ANTHROPIC_API_KEY`). Findings
+and code-snippet text are logged **only** when the `DEBUG_LOGGING` flag is set.
 
 ### Findings and verdict
 
@@ -69,7 +87,8 @@ COMMENT events. The freshly posted review then overwrites the stored record.
 ## Configuration
 
 Settings (`heimdall/config.py`) read from the environment / `.env`. Lens knobs:
-`CLAUDE_BINARY`, `LENS_TOKEN_CAP`, `LENS_TIMEOUT_SECONDS`.
+`CLAUDE_BINARY`, `LENS_TOKEN_CAP`, `LENS_TIMEOUT_SECONDS`. Review knobs:
+`REVIEW_TIMEOUT_SECONDS`, `DEBUG_LOGGING`.
 
 ## Development
 

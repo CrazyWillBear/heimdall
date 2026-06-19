@@ -29,5 +29,13 @@ class Settings(BaseSettings):
     lens_timeout_seconds: float = Field(
         default=1_800.0, description="Wall-clock timeout (s) before a lens subprocess is killed"
     )
+    review_timeout_seconds: float = Field(
+        default=2_400.0,
+        description="Per-review wall-clock timeout (s) across the whole pipeline",
+    )
+    debug_logging: bool = Field(
+        default=False,
+        description="When True, log findings and code text; default logs are metadata-only",
+    )
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
