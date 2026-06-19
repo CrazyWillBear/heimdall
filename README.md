@@ -1,196 +1,357 @@
 # Heimdall
 
-A GitHub App that auto-reviews pull requests with a Claude-driven review engine.
+Heimdall is a self-hosted GitHub App that automatically reviews pull requests with a
+Claude-driven, multi-lens review engine. When a PR is opened or updated it fans out three
+independent review lenses — **Security**, **Design-fit**, and **Cleanliness** — over a
+read-only seed of the PR, runs a synthesis pass that dedups and ranks their findings, and
+posts exactly one PR review (inline comments plus a body) with a verdict.
 
-## Review pipeline
+Heimdall is **opt-in per repo**: a repository is only reviewed when it checks in a
+`.github/heimdall.yml` file. PR code is **never executed** — every lens reads from a
+materialized seed assembled purely from GitHub API data.
 
-1. **Webhook** (`heimdall/webhook.py`) verifies the signature and enqueues a job.
-2. **Worker** (`heimdall/worker.py`) runs `run_review`: it first **gates** the PR
-   (opt-in + scope filters + lens tuning — see [Per-repo config](#per-repo-config-githubheimdallyml)),
-   then assembles the PR seed context once, fans out the configured lenses over it,
-   runs a synthesis pass over their combined findings, and posts exactly one PR
-   review (idempotent per head SHA).
-3. **Seed context** (`heimdall/context.py`) materializes a workspace on disk
-   (`diff.patch`, `pr_metadata.json`, `files/<path>`, `conventions/`) from GitHub API
-   data only — no PR code is executed.
-4. **Lens runner** (`heimdall/lens.py`) drives `claude -p` over that workspace.
+## How it works
 
-## Lenses
+```
+GitHub  ──pull_request webhook──▶  Service (FastAPI)  ──enqueue──▶  Redis / Arq queue
+                                        │ verify signature                   │
+                                        │ ack 202 immediately                ▼
+                                        └─ cancel stale job on new push   Worker (run_review)
+                                                                             │
+   gate (opt-in + scope + caps) ─▶ assemble seed ─▶ 3 lenses ─▶ synthesis ─▶ verdict
+                                                                             │
+                              dismiss/minimize prior review ─▶ post one review (inline + body)
+```
 
-A *lens* is one read-only `claude -p` pass over the seed workspace. The reusable seam
-is `run_lens(lens=..., workspace_dir=..., ...) -> LensResult`. Three lenses run over the
-same shared seed, each bounded independently:
+### 1. The service (`heimdall/app.py`, `heimdall/webhook.py`)
 
-- **`SECURITY_LENS`** — security posture (model **opus**, effort **max**).
-- **`DESIGN_LENS`** — design-fit / architecture (model **sonnet**, effort **high**).
-- **`CLEANLINESS_LENS`** — readability, dead/duplicated code, doc hygiene
-  (model **sonnet**, effort **high**).
+A FastAPI app receives GitHub `pull_request` webhooks. For every request it:
 
-Model and effort live on each `LensSpec`, so `build_claude_argv` threads them through a
-single code path. A failure in one lens is isolated (logged, that lens dropped); the rest
-still reach synthesis.
+1. **Verifies the HMAC-SHA256 signature** (`X-Hub-Signature-256`) against the configured
+   webhook secret — an unsigned or mismatched request gets a 401.
+2. Acts only on the relevant actions — `opened`, `reopened`, `synchronize`,
+   `ready_for_review` — and ignores everything else (and skips draft PRs) with a 204.
+3. **Enqueues** a `ReviewJob` onto the Redis/Arq queue and **acks 202 immediately**, so the
+   review runs asynchronously in the worker. On a new push to a PR, any earlier *queued*
+   (not-yet-running) job for the same PR is cancelled first (`cancel_stale_jobs`), so only
+   the latest commit is reviewed.
 
-The invocation (`build_claude_argv`) is headless with JSON output and restricts tools to
-read-only **Read/Grep/Glob** plus the single allowlisted **`heimdall-context`** Bash
-wrapper (`heimdall/context_cli.py`). **Write** and **Edit** are explicitly disallowed; raw
-Bash carries no deny rule because an unscoped `Bash` deny would take precedence over and
-neuter the wrapper's allow rule — under default-deny, anything off the allowlist (including
-raw Bash) is already blocked. The subprocess is spawned via `create_subprocess_exec` (no
-shell).
+The worker authenticates as the **GitHub App installation** (per-job, from the App id +
+private key) to read the PR and post the review.
 
-Each lens run is bounded by a **per-agent cumulative-token cap** (default 400k) and a
-**per-lens wall-clock timeout** (default 1800s). Exceeding either kills the subprocess and
-raises `LensTokenCapError` / `LensTimeoutError`; the worker logs the abort and drops that
-lens.
+### 2. The worker pipeline (`heimdall/worker.py`)
 
-## Synthesis
+`run_review` is the Arq task. For each job it runs, in order:
 
-A 4th `claude -p` pass (`run_synthesis`, using `SYNTHESIS_LENS` on **opus/max**) receives
-the combined findings of all three lenses and: **dedups** overlapping findings across
-lenses, **ranks** by severity, attributes each survivor to its originating lens, writes the
-**verdict**, and formats the review. The synthesis call is bounded by the same token cap
-and timeout. When every lens fails, or synthesis itself aborts, that run produces no
-review (the per-review retry/failure handling below then takes over).
+1. **Idempotency guard** — if this exact head SHA was already reviewed, skip.
+2. **Gate** (`_gate_review`):
+   - **Opt-in** — load `.github/heimdall.yml` from the trust-resolved ref. No file → the
+     repo has not opted in → nothing is posted. A malformed file is skipped (never crashes
+     the worker).
+   - **Scope filters** (`skip_reason`) — base-branch allowlist, path globs, draft skip,
+     bot-author skip, opt-out label. A filtered PR is skipped silently.
+   - **Size caps** (`diff_cap_skip_note`) — a PR over `max_files` / `max_diff_lines` is
+     skipped **with a posted COMMENT note** so the author learns why.
+3. **Rate / concurrency caps** — a per-repo rolling-window budget (`max_reviews_per_window`
+   over `rate_window_seconds`) and a per-installation concurrency cap
+   (`max_concurrent_per_installation`), both DB-backed so they survive restarts.
+4. **Assemble seed** (once) — materialize the PR seed into a temp workspace.
+5. **Three lenses + synthesis** — fan out the config-tuned lenses over the shared seed, then
+   a 4th synthesis pass dedups/ranks/tags their findings and writes the verdict.
+6. **Retry-once / per-review timeout** — the whole pipeline is bounded by a per-review
+   wall-clock timeout and retried exactly once on any failure/timeout. If the retry also
+   fails, a terse **"review failed" COMMENT** is posted (never REQUEST_CHANGES) and the SHA
+   recorded so the failed commit is not re-reviewed in a loop.
+7. **Across-push lifecycle** — retire the prior Heimdall review (a REQUEST_CHANGES review is
+   **dismissed**, a COMMENT review is **minimized** as outdated) and delete its stale inline
+   comments, then **post exactly one review**: findings on a changed diff line ride as
+   **inline comments** in the same submission, off-diff (or unparseable-location) findings
+   render in the **body**.
+8. **Metadata-only logging** — default logs carry only repo / PR / SHA / timing / verdict.
+   Tokens and secrets are never logged; findings and code text are logged only when
+   `DEBUG_LOGGING` is set.
 
-### Failure, retry, and the per-review timeout
+### 3. The seed context (`heimdall/context.py`, `heimdall/context_cli.py`)
 
-The whole review pipeline (`run_review`) is additionally bounded by a **per-review
-wall-clock timeout** (default 2400s) that wraps the entire lens-fanout + synthesis pipeline
-— distinct from, and looser than, the per-lens timeout. On any pipeline failure or timeout
-(including every lens failing or synthesis aborting) the worker **retries exactly once**;
-if the retry also fails it posts a terse **"Heimdall review failed" COMMENT** note (never
-REQUEST_CHANGES, since a pipeline failure is not a verdict) and records the SHA so the
-failed commit is not re-reviewed in a loop.
+`assemble_pr_context` materializes a read-only workspace on disk from GitHub API data only —
+**no PR code is executed**:
 
-### Logging discipline
+- `diff.patch` — the unified diff
+- `pr_metadata.json` — title, body, author, base/head refs + SHAs, linked issues
+- `files/<path>` — full content of each changed file at the head SHA (binary/oversize files
+  skipped; path traversal rejected)
+- `conventions/<name>` — repo convention docs (`STYLEGUIDE.md`, `CLAUDE.md`, `README.md`)
+  when present
 
-Default logs are **metadata-only** — repo / PR / SHA / timing / verdict. **Tokens and
-secrets are never logged** (installation token, private key, `ANTHROPIC_API_KEY`). Findings
-and code-snippet text are logged **only** when the `DEBUG_LOGGING` flag is set.
+Each lens reads this workspace through the **`heimdall-context`** CLI wrapper — the single
+allowlisted Bash command — with subcommands `diff`, `pr`, `file <path>`, and `conventions`.
 
-### Findings and verdict
+### 4. The lenses and synthesis (`heimdall/lens.py`)
 
-Each lens reports `Finding`s carrying a `Severity` (critical/high/medium/low). Synthesis
-returns `TaggedFinding`s (a finding plus its lens). `verdict_for_tagged(...)` maps any
-**surviving** finding whose severity meets the repo's **blocking threshold** to
-**REQUEST_CHANGES**, otherwise **COMMENT** (the default threshold is `high`, so high/critical
-block — see [Per-repo config](#per-repo-config-githubheimdallyml)).
-`format_synthesis_body(...)` renders the posted body: findings grouped by severity
-(worst-first), each tagged with the lens that raised it.
+A *lens* is one read-only `claude -p` pass over the seed. Three built-ins run over the same
+shared seed, each bounded independently:
 
-### Across-push review lifecycle
+| Lens          | Focus                                                | Model  | Effort |
+| ------------- | ---------------------------------------------------- | ------ | ------ |
+| `security`    | Security posture                                     | opus   | max    |
+| `design`      | Design-fit / architecture                            | sonnet | high   |
+| `cleanliness` | Readability, dead/duplicated code, doc hygiene       | sonnet | high   |
 
-When a PR receives a new push, `run_review` retires the prior Heimdall review before
-posting the fresh one so only the latest review stays active. The prior review's id,
-GraphQL node id, and verdict are persisted in SQLite (`posted_reviews` table), so the
-lifecycle survives a worker restart. Per the stored verdict, a prior **REQUEST_CHANGES**
-review is **dismissed** (REST `…/reviews/{id}/dismissals`) and a prior **COMMENT** review
-is **minimized** as outdated (GraphQL `minimizeComment`) — dismissal is invalid for
-COMMENT events. The freshly posted review then overwrites the stored record.
+The `claude -p` invocation is headless with JSON output and restricts tools to the read-only
+**Read / Grep / Glob** plus the single allowlisted **`heimdall-context`** Bash wrapper.
+**Write** and **Edit** are explicitly disallowed; raw Bash carries no deny rule because an
+unscoped Bash deny would override and neuter the wrapper's allow rule — under default-deny,
+anything off the allowlist (including raw Bash) is already blocked. The subprocess is spawned
+via `create_subprocess_exec` (no shell).
 
-## Configuration
+Each run is bounded by a **per-agent cumulative-token cap** (default 400k) and a **per-lens
+wall-clock timeout** (default 1800s); exceeding either kills the subprocess and drops that
+lens. A failure in one lens is isolated — the rest still reach synthesis.
 
-Two layers: **service config** (env-based, machine-wide) and **per-repo config**
-(`.github/heimdall.yml`, checked into each reviewed repo).
+A **4th synthesis pass** (`run_synthesis`, opus/max) receives the combined findings of every
+lens and: **dedups** overlapping findings across lenses, **ranks** by severity, **attributes**
+each survivor to its originating lens, writes the **verdict**, and formats the
+severity-grouped, lens-tagged body. When every lens fails or synthesis itself aborts, that run
+produces no review (the retry/failure handling above takes over).
 
-### Service config
+**Verdict.** Each finding carries a `Severity` (critical / high / medium / low). Any surviving
+finding whose severity meets the repo's **blocking threshold** maps the review to
+**REQUEST_CHANGES**; otherwise the review is a **COMMENT**. The default threshold is `high`,
+so high/critical block.
 
-Settings (`heimdall/config.py`) read from the environment / `.env`. Lens knobs:
-`CLAUDE_BINARY`, `LENS_TOKEN_CAP`, `LENS_TIMEOUT_SECONDS`. Review knobs:
-`REVIEW_TIMEOUT_SECONDS`, `DEBUG_LOGGING`.
+### Persistence (`heimdall/db.py`)
 
-### Per-repo config (`.github/heimdall.yml`)
+State lives in SQLite so the service survives restarts: in-flight jobs, the last-reviewed SHA
+per PR (idempotency), posted reviews (id + GraphQL node id + verdict, for the across-push
+dismiss/minimize lifecycle), per-repo review timestamps (`review_events`, the rate/budget
+cap), and a per-installation in-flight counter (`inflight_reviews`, the concurrency cap). All
+of it is DB-backed, so the caps and lifecycle hold across worker restarts.
 
-Per-repo behavior lives in `heimdall/repo_config.py` (`RepoConfig`) and is **opt-in**:
-a repo with **no `.github/heimdall.yml` is never reviewed**. The file's mere presence
-opts the repo in; a bare/empty file uses all defaults.
+## Self-host setup
 
-**Trust / fork safety.** Config is read from the **base** branch ref by default. Only a
-same-repo PR from a trusted author association (`OWNER`/`MEMBER`/`COLLABORATOR`) may have
-its **head** config honored; a **fork PR is always forced to the base ref**, so a malicious
-fork cannot ship a config that disables the security lens or widens scope
-(`config_ref_for_pr` / `is_trusted_pr`).
+### Prerequisites
+
+- **Python ≥ 3.12** and [`uv`](https://docs.astral.sh/uv/).
+- A running **Redis** instance (the Arq queue).
+- The **`claude` CLI** on the worker host (the lenses shell out to it), plus an
+  **`ANTHROPIC_API_KEY`** in the worker's environment for the CLI to authenticate.
+- A **GitHub App** (see below).
+
+Install dependencies:
+
+```
+uv sync
+```
+
+### Create the GitHub App
+
+Create a GitHub App and configure it to:
+
+- subscribe to **Pull request** webhook events,
+- point its webhook URL at your service's `/webhook` endpoint,
+- set a **webhook secret** (matches `WEBHOOK_SECRET`),
+- grant read access to PR contents/metadata and **read/write to Pull requests** (to post
+  reviews, dismiss, and minimize),
+- generate a **private key** (PEM) and note the **App ID** and **installation**.
+
+Install the App on the repositories you want reviewed. A repo is only reviewed once it also
+checks in a `.github/heimdall.yml` (see the config reference below).
+
+### Configure the environment
+
+Set the service env settings (`heimdall/config.py`) — secrets via a `.env` file or injected
+by the deployment. See the [Service env reference](#service-env-reference) for the full list.
+
+### Run the service and the worker
+
+The service and the worker are two processes that share Redis and the SQLite database.
+
+Run the **web service** (the FastAPI app is built by the `create_app` factory):
+
+```
+uv run uvicorn --factory heimdall.app:create_app --host 0.0.0.0 --port 8000
+```
+
+Run the **worker** (the Arq worker that processes the queue) with either the console script
+or Arq directly:
+
+```
+uv run heimdall-worker
+# equivalently:
+uv run arq heimdall.worker.WorkerSettings
+```
+
+The `heimdall-context` console script is invoked internally by the lenses; you do not run it
+by hand.
+
+## Operation
+
+Once installed and configured:
+
+1. A contributor opens or pushes to a PR in an opted-in repo.
+2. GitHub delivers a `pull_request` webhook; the service verifies it and enqueues a job,
+   cancelling any stale queued job for the same PR.
+3. The worker gates the PR (opt-in + scope + caps), assembles the seed, runs the three lenses
+   + synthesis, and posts one review with a verdict — REQUEST_CHANGES when a finding meets the
+   repo's blocking threshold, otherwise COMMENT.
+4. On a new push, the prior review is dismissed (REQUEST_CHANGES) or minimized (COMMENT) and a
+   fresh review replaces it.
+
+**Tuning a repo.** Edit `.github/heimdall.yml` to enable/disable or re-tune lenses, add custom
+lenses, change the blocking threshold, narrow scope, or adjust the guardrail caps.
+
+**Fork safety.** Config is read from the **base** branch ref by default. Only a same-repo PR
+from a trusted author association (`OWNER` / `MEMBER` / `COLLABORATOR`) may have its **head**
+config honored; a **fork PR is always forced to the base ref**, so a malicious fork can never
+ship a config that disables the security lens, injects a lens prompt, or widens scope.
+
+## `.github/heimdall.yml` config reference
+
+Per-repo behavior lives in `RepoConfig` (`heimdall/repo_config.py`) and is **opt-in**: a repo
+with **no `.github/heimdall.yml` is never reviewed**. The file's mere presence opts the repo
+in; a bare/empty file uses all defaults. Unknown keys are rejected (`extra: forbid`).
+
+Every field below is optional and shown with its **real default**.
 
 ```yaml
 # .github/heimdall.yml — every field optional; shown with its default.
-severity_threshold: high        # lowest severity that blocks (REQUEST_CHANGES)
-lenses:                         # per-lens model/effort/enable overrides
-  security:
-    model: opus
-    effort: max
-  design:
-    enabled: false              # a disabled lens never runs and never reaches synthesis
-  cleanliness:
-    instructions: |             # APPENDED to (not a replacement for) the built-in prompt
-      Flag TODO/FIXME comments left in the diff.
-custom_lenses:                  # user-defined lenses that run alongside the built-ins
-  - name: accessibility         # must be unique and not collide with a built-in name
-    system_prompt: |            # required; the lens's review instructions
+
+severity_threshold: high          # lowest severity that blocks (REQUEST_CHANGES);
+                                  # below it findings only comment. Default: high.
+
+lenses:                           # per-lens overrides, keyed by built-in lens name.
+  security:                       # built-in: opus / max
+    enabled: true                 # a disabled lens never runs and never reaches synthesis
+    model: opus                   # override the lens's default model (else built-in default)
+    effort: max                   # override the lens's default effort (else built-in default)
+    instructions: |               # APPENDED to (not a replacement for) the built-in prompt
+      Pay extra attention to auth and input validation.
+  design:                         # built-in: sonnet / high
+    enabled: true
+  cleanliness:                    # built-in: sonnet / high
+    enabled: true
+
+custom_lenses:                    # user-defined lenses that run alongside the built-ins
+  - name: accessibility           # required; unique, must not collide with a built-in name
+    system_prompt: |              # required; the lens's review instructions
       Review the diff for web accessibility (WCAG) regressions.
-    model: sonnet               # optional, default sonnet
-    effort: high                # optional, default high
-scope:                          # filters that skip the PR entirely
-  base_branches: [main]         # allowlist; empty = any base branch
-  paths: ['src/**']             # glob allowlist of changed paths; empty = any path
-  skip_drafts: true             # skip draft PRs
-  skip_bot_authors: true        # skip PRs authored by a bot account
-  opt_out_label: heimdall-skip  # skip a PR carrying this label
-caps:                           # guardrail caps; every field has a SAFE default
-  max_files: 75                 # skip (with a posted note) a PR over this many files
-  max_diff_lines: 20000         # skip (with a posted note) a PR over this many changed lines
-  max_reviews_per_window: 20    # per-repo budget: max reviews started per window
-  rate_window_seconds: 3600     # rolling window the per-repo budget is measured over
-  max_concurrent_per_installation: 4  # max reviews running at once per installation
+    model: sonnet                 # optional. Default: sonnet
+    effort: high                  # optional. Default: high
+
+scope:                            # filters that skip the PR entirely
+  base_branches: []               # allowlist of base branches; empty = any. Default: []
+  paths: []                       # glob allowlist of changed paths; empty = any. Default: []
+  skip_drafts: true               # skip draft PRs. Default: true
+  skip_bot_authors: true          # skip PRs authored by a bot account. Default: true
+  opt_out_label: null             # skip a PR carrying this label. Default: null (unset)
+
+caps:                             # guardrail caps; every field has a SAFE, non-unbounded default
+  max_files: 75                   # skip (with a posted note) a PR over this many files. Default: 75
+  max_diff_lines: 20000           # skip (with a posted note) a PR over this many changed
+                                  # lines (additions + deletions). Default: 20000
+  max_reviews_per_window: 20      # per-repo budget: max reviews started per window. Default: 20
+  rate_window_seconds: 3600       # rolling window the per-repo budget is measured over (s).
+                                  # Default: 3600
+  max_concurrent_per_installation: 4  # max reviews running at once per installation. Default: 4
 ```
 
-The worker gate (`_gate_review` in `heimdall/worker.py`) loads this config, applies the
-scope filters (`skip_reason`), then threads lens tuning (`tuned_lenses`) and the blocking
-threshold (`blocking_severities`) into the pipeline.
+### Field-by-field
 
-**Per-lens `instructions`** (`LensConfig.instructions` in `heimdall/repo_config.py`) — an
-optional field on each entry under `lenses:`. Its text is **appended to** (not a replacement
-for) that built-in lens's system prompt, so the lens keeps its built-in identity and runs with
-the extra guidance (`tuned_lenses` / `_tuned_builtin`). Like all config it is read from the
-trust-resolved ref (**base for forks**), so a fork PR can never inject prompt text.
+**Top level (`RepoConfig`)**
 
-**Custom lenses** (`custom_lenses` / `CustomLensConfig` in `heimdall/repo_config.py`) — a list
-of user-defined lenses that run **alongside** the built-ins over the same shared seed, each
-turned into a `LensSpec` by `tuned_lenses` and run via the same `run_lens` path (same token cap
-and timeout); their findings reach synthesis **tagged by `name`**. Each entry takes:
+| Field                | Type                       | Default | Meaning                                                              |
+| -------------------- | -------------------------- | ------- | ------------------------------------------------------------------- |
+| `lenses`             | map of name → lens config  | `{}`    | Per-built-in-lens overrides; absent lenses keep their defaults.     |
+| `custom_lenses`      | list of custom lenses      | `[]`    | User-defined lenses that run alongside the built-ins.               |
+| `severity_threshold` | `critical`/`high`/`medium`/`low` | `high` | Lowest severity that blocks (REQUEST_CHANGES); below it comments. |
+| `scope`              | scope filters              | all defaults | Whether the PR is reviewed at all.                             |
+| `caps`               | guardrail caps             | all defaults | Resource ceilings on review work.                             |
 
-- `name` — required; **must not collide** with a built-in lens name (`security`/`design`/
-  `cleanliness`) and **must be unique** across custom lenses (the names tag findings, so a
-  collision is rejected at load time by `RepoConfig`'s validator).
-- `system_prompt` — **required**; the lens's review instructions.
-- `model` — optional, default **`sonnet`**.
-- `effort` — optional, default **`high`**.
+**Per-lens override (`lenses.<security|design|cleanliness>`, `LensConfig`)** — overrides a
+built-in lens. `instructions` is **appended** to the built-in system prompt (the lens keeps its
+built-in identity). Read only from the trusted config ref, so a fork cannot inject prompt text.
 
-Like the built-in prompts, a custom lens's `system_prompt` is read from the trust-resolved ref
-(**base for forks**), so a fork PR can never inject a custom-lens prompt.
+| Field          | Type      | Default | Meaning                                                  |
+| -------------- | --------- | ------- | -------------------------------------------------------- |
+| `enabled`      | bool      | `true`  | When false the lens never runs and never reaches synthesis. |
+| `model`        | string    | unset   | Overrides the lens's default Claude model.               |
+| `effort`       | string    | unset   | Overrides the lens's default reasoning effort.           |
+| `instructions` | string    | unset   | Extra guidance **appended** to the built-in system prompt. |
 
-**Guardrail caps** (`GuardrailCaps` in `heimdall/repo_config.py`) bound review cost; every
-cap has a safe, non-unbounded default so an absent `caps` block still has ceilings. They are
-enforced in three places, all in `run_review`:
+**Custom lens entry (`custom_lenses[]`, `CustomLensConfig`)** — a user-defined lens run over the
+same shared seed via the same bounded `run_lens` path; its findings reach synthesis tagged by
+`name`. Its `system_prompt` is read from the trusted ref (base for forks), so a fork cannot
+inject a custom-lens prompt.
 
-- **Diff size / file count** (`max_files`, `max_diff_lines`) — checked in `_gate_review` from
-  the PR-files payload. Over the cap the PR is **skipped with a posted COMMENT note**
-  (`diff_cap_skip_note`) — unlike the silent scope skips — so the author learns why.
-- **Per-repo rate / budget** (`max_reviews_per_window`, `rate_window_seconds`) — a DB-backed
-  rolling-window count of review starts (`review_events` table). Over budget the review is
-  skipped silently; the SHA is not recorded so a later push still gets a review.
-- **Per-installation concurrency** (`max_concurrent_per_installation`) — a DB-backed
-  in-flight counter per installation (`inflight_reviews` table). The cap **value** comes from
-  the triggering repo's config, but the counter is genuinely per-installation (shared across
-  that installation's repos). A slot is atomically claimed at review start
-  (`try_acquire_inflight`, a single guarded upsert so concurrent acquirers never overshoot)
-  and released in a `finally` on **every** exit path (`release_inflight`); at the cap the run
-  defers (skips this delivery, no SHA recorded). All three counters are SQLite-backed, so the
-  caps survive worker restarts.
+| Field           | Type   | Default  | Meaning                                                       |
+| --------------- | ------ | -------- | ------------------------------------------------------------- |
+| `name`          | string | required | Unique lens id; **must not** collide with a built-in name.    |
+| `system_prompt` | string | required | The lens's review instructions.                               |
+| `model`         | string | `sonnet` | Claude model for the pass.                                    |
+| `effort`        | string | `high`   | Reasoning effort for the pass.                                |
+
+A custom-lens `name` that shadows a built-in (`security` / `design` / `cleanliness`) or
+duplicates another custom lens is **rejected at load time**.
+
+**Scope filters (`scope`, `ScopeFilters`)** — applied in order; the first failing filter skips
+the PR (silently).
+
+| Field              | Type          | Default | Meaning                                                       |
+| ------------------ | ------------- | ------- | ------------------------------------------------------------- |
+| `base_branches`    | list[string]  | `[]`    | Allowlist of base branches; empty = any base branch.          |
+| `paths`            | list[string]  | `[]`    | Glob allowlist of changed paths; empty = any path.            |
+| `skip_drafts`      | bool          | `true`  | Skip draft PRs.                                                |
+| `skip_bot_authors` | bool          | `true`  | Skip PRs authored by a bot account.                           |
+| `opt_out_label`    | string        | unset   | When set and present on the PR, skip the PR.                  |
+
+**Guardrail caps (`caps`, `GuardrailCaps`)** — every cap has a safe default, so an absent `caps`
+block still has ceilings (a missing cap never means "unlimited"). All counters are SQLite-backed
+and survive restarts.
+
+| Field                             | Type  | Default | Meaning                                                                 |
+| --------------------------------- | ----- | ------- | ----------------------------------------------------------------------- |
+| `max_files`                       | int   | `75`    | Skip (with a posted COMMENT note) a PR changing more files than this.   |
+| `max_diff_lines`                  | int   | `20000` | Skip (with a posted note) a PR whose changed lines exceed this.         |
+| `max_reviews_per_window`          | int   | `20`    | Per-repo budget: max reviews **started** per rolling window.            |
+| `rate_window_seconds`             | float | `3600`  | The rolling window the per-repo budget is measured over (seconds).      |
+| `max_concurrent_per_installation` | int   | `4`     | Max reviews running concurrently per GitHub App installation.           |
+
+Over the size caps the PR is skipped **with a posted note** (`diff_cap_skip_note`) — unlike the
+silent scope skips — so the author learns why. Over the rate budget the review is skipped
+silently and the SHA is **not** recorded, so a later push still gets reviewed. At the concurrency
+cap the run defers (the slot is atomically claimed at start and released on every exit path).
+
+## Service env reference
+
+Service-level configuration (`Settings` in `heimdall/config.py`) is read from the environment
+or a `.env` file. Secrets must come from env/`.env` — never commit them.
+
+| Env var                  | Required | Default                                | Meaning                                                                 |
+| ------------------------ | -------- | -------------------------------------- | ----------------------------------------------------------------------- |
+| `WEBHOOK_SECRET`         | yes      | —                                      | GitHub webhook HMAC secret used to verify `X-Hub-Signature-256`.        |
+| `GITHUB_APP_ID`          | yes      | —                                      | GitHub App numeric ID.                                                  |
+| `GITHUB_APP_PRIVATE_KEY` | yes      | —                                      | PEM-encoded RSA private key for the App (installation auth).            |
+| `REDIS_URL`              | no       | `redis://localhost:6379`               | Redis connection URL for the Arq queue.                                 |
+| `DATABASE_URL`           | no       | `sqlite+aiosqlite:///./heimdall.db`    | SQLite database URL for persistence.                                    |
+| `CLAUDE_BINARY`          | no       | `claude`                               | Path or name of the `claude` CLI the lenses invoke.                     |
+| `LENS_TOKEN_CAP`         | no       | `400000`                               | Per-agent cumulative-token cap for a single lens run.                   |
+| `LENS_TIMEOUT_SECONDS`   | no       | `1800`                                 | Per-lens wall-clock timeout (s) before a lens subprocess is killed.     |
+| `REVIEW_TIMEOUT_SECONDS` | no       | `2400`                                 | Per-review wall-clock timeout (s) across the whole pipeline.            |
+| `DEBUG_LOGGING`          | no       | `false`                                | When true, log findings and code text; default logs are metadata-only. |
+
+The `claude` CLI on the worker host also needs `ANTHROPIC_API_KEY` in its environment to
+authenticate the lens calls.
 
 ## Development
+
+The full done-check — all three must pass:
 
 ```
 uv run pytest
 uv run ruff check .
 uv run mypy .
 ```
+
+## License
+
+[Apache License 2.0](./LICENSE).
