@@ -428,24 +428,35 @@ def format_review_body(findings: list[Finding]) -> str:
     return "\n".join(lines)
 
 
-def verdict_for(findings: list[Finding]) -> str:
+def verdict_for(
+    findings: list[Finding],
+    *,
+    blocking: frozenset[Severity] = _BLOCKING_SEVERITIES,
+) -> str:
     """Map findings to a PR review event.
 
-    Any high or critical finding requests changes; otherwise the review is a
-    plain comment.
+    Any finding whose severity is in ``blocking`` requests changes; otherwise the
+    review is a plain comment.  The default blocking set (high/critical) is
+    overridden by the repo config's severity threshold.
 
     Args:
         findings: All findings across the run.
+        blocking: The severities that escalate to REQUEST_CHANGES; defaults to
+            high/critical.
 
     Returns:
         "REQUEST_CHANGES" if any blocking finding exists, else "COMMENT".
     """
-    if any(f.severity in _BLOCKING_SEVERITIES for f in findings):
+    if any(f.severity in blocking for f in findings):
         return "REQUEST_CHANGES"
     return "COMMENT"
 
 
-def verdict_for_tagged(tagged: list[TaggedFinding]) -> str:
+def verdict_for_tagged(
+    tagged: list[TaggedFinding],
+    *,
+    blocking: frozenset[Severity] = _BLOCKING_SEVERITIES,
+) -> str:
     """Map the surviving tagged findings to a PR review event.
 
     Reuses :func:`verdict_for` over the underlying findings so the verdict reflects
@@ -453,11 +464,13 @@ def verdict_for_tagged(tagged: list[TaggedFinding]) -> str:
 
     Args:
         tagged: The synthesis survivors.
+        blocking: The severities that escalate to REQUEST_CHANGES; defaults to
+            high/critical.
 
     Returns:
-        "REQUEST_CHANGES" if any survivor is high/critical, else "COMMENT".
+        "REQUEST_CHANGES" if any survivor is blocking, else "COMMENT".
     """
-    return verdict_for([t.finding for t in tagged])
+    return verdict_for([t.finding for t in tagged], blocking=blocking)
 
 
 _NO_SYNTHESIS_FINDINGS_BODY = "Heimdall review: no concerns found across any lens."
@@ -719,6 +732,7 @@ async def run_synthesis(
     token_cap: int = DEFAULT_TOKEN_CAP,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     invoker: ClaudeInvoker = run_claude_subprocess,
+    blocking: frozenset[Severity] = _BLOCKING_SEVERITIES,
 ) -> SynthesisResult:
     """Run the 4th synthesis ``claude -p`` pass over all lenses' findings.
 
@@ -735,6 +749,8 @@ async def run_synthesis(
         token_cap: Per-agent cumulative-token ceiling (bounds the synthesis call).
         timeout_seconds: Wall-clock limit for the synthesis run.
         invoker: Coroutine that runs the subprocess; injected in tests.
+        blocking: The severities that escalate the verdict to REQUEST_CHANGES;
+            defaults to high/critical, overridden by the repo config threshold.
 
     Returns:
         A :class:`SynthesisResult` with the tagged survivors, verdict, and body.
@@ -765,6 +781,6 @@ async def run_synthesis(
     )
     return SynthesisResult(
         tagged_findings=tagged,
-        verdict=verdict_for_tagged(tagged),
+        verdict=verdict_for_tagged(tagged, blocking=blocking),
         body=format_synthesis_body(tagged),
     )

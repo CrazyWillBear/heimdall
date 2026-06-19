@@ -11,10 +11,15 @@ Context keys populated by WorkerSettings.on_startup:
     debug_logging:          when True, log findings/code text (else metadata-only) (bool)
 
 run_review builds a GitHubClient per-job using ctx["app_id"], ctx["private_key"],
-and the per-job installation_id argument.  It assembles the PR seed context into
-a temporary workspace once, fans out three independent lenses (Security opus/max,
-Design-fit sonnet/high, Cleanliness sonnet/high) over that shared seed — each
-bounded by its own token cap and timeout — then runs a 4th synthesis ``claude -p``
+and the per-job installation_id argument.  Before any review work it gates the PR
+(see heimdall.repo_config): it loads ``.github/heimdall.yml`` from the trust-resolved
+ref (base for forks, head for trusted same-repo PRs) — a missing file means the repo
+has not opted in, so nothing is reviewed — then applies scope filters (base-branch
+allowlist, path globs, skip drafts/bot authors, opt-out label).  If it proceeds, it
+assembles the PR seed context into a temporary workspace once, fans out the
+config-tuned lenses (built-ins Security opus/max, Design-fit sonnet/high, Cleanliness
+sonnet/high, each with per-lens model/effort/enable overrides) over that shared seed —
+each bounded by its own token cap and timeout — then runs a 4th synthesis ``claude -p``
 pass that dedups overlapping findings across lenses, ranks by severity, writes the
 verdict, and formats the review (findings grouped by severity, each tagged with the
 originating lens).  Exactly one PR review is posted.  A failure in any single lens
@@ -54,24 +59,24 @@ from heimdall.db import (
 )
 from heimdall.github import GitHubClient
 from heimdall.lens import (
-    CLEANLINESS_LENS,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_TOKEN_CAP,
-    DESIGN_LENS,
-    SECURITY_LENS,
     LensError,
     LensResult,
-    LensSpec,
     SynthesisResult,
     run_lens,
     run_synthesis,
 )
+from heimdall.repo_config import (
+    RepoConfig,
+    RepoConfigError,
+    blocking_severities,
+    load_repo_config,
+    skip_reason,
+    tuned_lenses,
+)
 
 logger = logging.getLogger(__name__)
-
-# The three review lenses fanned out over the shared seed. Order is stable so the
-# synthesized review is deterministic; each runs independently bounded.
-_LENSES: tuple[LensSpec, ...] = (SECURITY_LENS, DESIGN_LENS, CLEANLINESS_LENS)
 
 # Per-review wall-clock timeout across the whole pipeline (assembly + lens fanout +
 # synthesis), distinct from and looser than the per-lens timeout: it bounds the total
@@ -153,8 +158,17 @@ async def run_review(
             )
             return
 
+        config = await _gate_review(
+            github_client, repo_full_name=repo_full_name, pr_number=pr_number
+        )
+        if config is None:
+            # Opt-in absent or scope filters excluded the PR — skip cleanly, posting
+            # nothing and recording no SHA (a later in-scope push still gets reviewed).
+            return
+
         synthesis = await _run_pipeline_with_retry(
             ctx,
+            config=config,
             installation_id=installation_id,
             repo_full_name=repo_full_name,
             pr_number=pr_number,
@@ -216,6 +230,49 @@ async def run_review(
         await github_client.aclose()
 
 
+async def _gate_review(
+    github_client: GitHubClient,
+    *,
+    repo_full_name: str,
+    pr_number: int,
+) -> RepoConfig | None:
+    """Early gate: enforce opt-in and scope filters before any review work.
+
+    Fetches the PR object, loads ``.github/heimdall.yml`` from the trust-resolved
+    ref (base for forks, head for trusted same-repo PRs), and applies the scope
+    filters.  Returns the loaded config when the PR is in scope, or None to skip
+    the review entirely.  A missing config file (no opt-in) or a malformed file
+    both skip cleanly — Heimdall never reviews a repo that has not opted in, and a
+    broken config must not crash the worker.
+
+    Returns:
+        The :class:`RepoConfig` to drive the pipeline, or None to skip the review.
+    """
+    pr = await github_client.get_pr(repo_full_name=repo_full_name, pr_number=pr_number)
+    try:
+        config = await load_repo_config(github_client, repo_full_name=repo_full_name, pr=pr)
+    except RepoConfigError as exc:
+        logger.warning(
+            "Skipping review for %s#%d: invalid heimdall.yml: %s",
+            repo_full_name,
+            pr_number,
+            exc,
+        )
+        return None
+    if config is None:
+        return None
+
+    files = await github_client.get_pr_files(
+        repo_full_name=repo_full_name, pr_number=pr_number
+    )
+    changed_paths = [str(f.get("filename")) for f in files if f.get("filename")]
+    reason = skip_reason(config, pr=pr, changed_paths=changed_paths)
+    if reason is not None:
+        logger.info("Skipping review for %s#%d: %s", repo_full_name, pr_number, reason)
+        return None
+    return config
+
+
 async def _refresh_prior_review(
     github_client: GitHubClient,
     db: Database,
@@ -250,6 +307,7 @@ async def _refresh_prior_review(
 async def _run_pipeline_with_retry(
     ctx: dict[str, Any],
     *,
+    config: RepoConfig,
     installation_id: int,
     repo_full_name: str,
     pr_number: int,
@@ -283,6 +341,7 @@ async def _run_pipeline_with_retry(
             synthesis = await asyncio.wait_for(
                 _synthesize_review(
                     ctx,
+                    config=config,
                     installation_id=installation_id,
                     repo_full_name=repo_full_name,
                     pr_number=pr_number,
@@ -326,6 +385,7 @@ async def _run_pipeline_with_retry(
 async def _synthesize_review(
     ctx: dict[str, Any],
     *,
+    config: RepoConfig,
     installation_id: int,
     repo_full_name: str,
     pr_number: int,
@@ -355,6 +415,7 @@ async def _synthesize_review(
 
         lens_results = await _run_lenses(
             ctx,
+            config=config,
             workspace_dir=workspace,
             repo_full_name=repo_full_name,
             pr_number=pr_number,
@@ -371,6 +432,7 @@ async def _synthesize_review(
             claude_binary=ctx.get("claude_binary", "claude"),
             token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
             timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+            blocking=blocking_severities(config.severity_threshold),
         )
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
@@ -386,20 +448,24 @@ async def _synthesize_review(
 async def _run_lenses(
     ctx: dict[str, Any],
     *,
+    config: RepoConfig,
     workspace_dir: str,
     repo_full_name: str,
     pr_number: int,
 ) -> list[LensResult]:
-    """Run every lens over the shared workspace, isolating per-lens failures.
+    """Run the config-tuned lenses over the shared workspace, isolating failures.
 
-    Each lens is bounded independently (its own token cap + timeout via run_lens).
-    A lens that aborts (timeout or token-cap breach) is logged and dropped so the
-    remaining lenses still reach synthesis; an unexpected error in one lens is
-    likewise contained rather than crashing the whole run.
+    The repo config decides which lenses run and with what model/effort (a disabled
+    lens never runs and never reaches synthesis).  Each surviving lens is bounded
+    independently (its own token cap + timeout via run_lens).  A lens that aborts
+    (timeout or token-cap breach) is logged and dropped so the remaining lenses
+    still reach synthesis; an unexpected error in one lens is likewise contained
+    rather than crashing the whole run.
 
     Returns:
         The results of the lenses that succeeded (possibly empty if all failed).
     """
+    lenses = tuned_lenses(config)
     outcomes = await asyncio.gather(
         *(
             run_lens(
@@ -409,13 +475,13 @@ async def _run_lenses(
                 token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
                 timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
             )
-            for lens in _LENSES
+            for lens in lenses
         ),
         return_exceptions=True,
     )
 
     results: list[LensResult] = []
-    for lens, outcome in zip(_LENSES, outcomes, strict=True):
+    for lens, outcome in zip(lenses, outcomes, strict=True):
         if isinstance(outcome, LensResult):
             results.append(outcome)
         elif isinstance(outcome, BaseException):

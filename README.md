@@ -5,9 +5,11 @@ A GitHub App that auto-reviews pull requests with a Claude-driven review engine.
 ## Review pipeline
 
 1. **Webhook** (`heimdall/webhook.py`) verifies the signature and enqueues a job.
-2. **Worker** (`heimdall/worker.py`) runs `run_review`: it assembles the PR seed
-   context once, fans out three lenses over it, runs a synthesis pass over their
-   combined findings, and posts exactly one PR review (idempotent per head SHA).
+2. **Worker** (`heimdall/worker.py`) runs `run_review`: it first **gates** the PR
+   (opt-in + scope filters + lens tuning — see [Per-repo config](#per-repo-config-githubheimdallyml)),
+   then assembles the PR seed context once, fans out the configured lenses over it,
+   runs a synthesis pass over their combined findings, and posts exactly one PR
+   review (idempotent per head SHA).
 3. **Seed context** (`heimdall/context.py`) materializes a workspace on disk
    (`diff.patch`, `pr_metadata.json`, `files/<path>`, `conventions/`) from GitHub API
    data only — no PR code is executed.
@@ -70,7 +72,9 @@ and code-snippet text are logged **only** when the `DEBUG_LOGGING` flag is set.
 
 Each lens reports `Finding`s carrying a `Severity` (critical/high/medium/low). Synthesis
 returns `TaggedFinding`s (a finding plus its lens). `verdict_for_tagged(...)` maps any
-high/critical **surviving** finding to **REQUEST_CHANGES**, otherwise **COMMENT**.
+**surviving** finding whose severity meets the repo's **blocking threshold** to
+**REQUEST_CHANGES**, otherwise **COMMENT** (the default threshold is `high`, so high/critical
+block — see [Per-repo config](#per-repo-config-githubheimdallyml)).
 `format_synthesis_body(...)` renders the posted body: findings grouped by severity
 (worst-first), each tagged with the lens that raised it.
 
@@ -86,9 +90,47 @@ COMMENT events. The freshly posted review then overwrites the stored record.
 
 ## Configuration
 
+Two layers: **service config** (env-based, machine-wide) and **per-repo config**
+(`.github/heimdall.yml`, checked into each reviewed repo).
+
+### Service config
+
 Settings (`heimdall/config.py`) read from the environment / `.env`. Lens knobs:
 `CLAUDE_BINARY`, `LENS_TOKEN_CAP`, `LENS_TIMEOUT_SECONDS`. Review knobs:
 `REVIEW_TIMEOUT_SECONDS`, `DEBUG_LOGGING`.
+
+### Per-repo config (`.github/heimdall.yml`)
+
+Per-repo behavior lives in `heimdall/repo_config.py` (`RepoConfig`) and is **opt-in**:
+a repo with **no `.github/heimdall.yml` is never reviewed**. The file's mere presence
+opts the repo in; a bare/empty file uses all defaults.
+
+**Trust / fork safety.** Config is read from the **base** branch ref by default. Only a
+same-repo PR from a trusted author association (`OWNER`/`MEMBER`/`COLLABORATOR`) may have
+its **head** config honored; a **fork PR is always forced to the base ref**, so a malicious
+fork cannot ship a config that disables the security lens or widens scope
+(`config_ref_for_pr` / `is_trusted_pr`).
+
+```yaml
+# .github/heimdall.yml — every field optional; shown with its default.
+severity_threshold: high        # lowest severity that blocks (REQUEST_CHANGES)
+lenses:                         # per-lens model/effort/enable overrides
+  security:
+    model: opus
+    effort: max
+  design:
+    enabled: false              # a disabled lens never runs and never reaches synthesis
+scope:                          # filters that skip the PR entirely
+  base_branches: [main]         # allowlist; empty = any base branch
+  paths: ['src/**']             # glob allowlist of changed paths; empty = any path
+  skip_drafts: true             # skip draft PRs
+  skip_bot_authors: true        # skip PRs authored by a bot account
+  opt_out_label: heimdall-skip  # skip a PR carrying this label
+```
+
+The worker gate (`_gate_review` in `heimdall/worker.py`) loads this config, applies the
+scope filters (`skip_reason`), then threads lens tuning (`tuned_lenses`) and the blocking
+threshold (`blocking_severities`) into the pipeline.
 
 ## Development
 

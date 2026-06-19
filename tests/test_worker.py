@@ -17,6 +17,7 @@ from heimdall.lens import (
     SynthesisResult,
     TaggedFinding,
 )
+from heimdall.repo_config import LensConfig, RepoConfig, ScopeFilters
 from heimdall.worker import WorkerSettings, run_review
 
 _REPO = "owner/repo"
@@ -25,6 +26,10 @@ _SHA = "sha1234"
 _INSTALL_ID = 42
 _APP_ID = 1
 _PRIVATE_KEY = "key"
+
+# Distinguishes "caller did not pass config" (default permissive gate) from an
+# explicit config=None (simulate an opt-out / no-config skip).
+_SENTINEL = object()
 
 
 def _lens_result(findings: list[Finding], *, name: str = "security") -> LensResult:
@@ -50,16 +55,24 @@ def _patch_review_pipeline(
     synthesis_side_effect: BaseException | None = None,
     last_sha: str | None = None,
     prior_review: dict[str, object] | None = None,
+    config: object | None = _SENTINEL,
 ) -> tuple[ExitStack, AsyncMock]:
-    """Patch the worker's seed-assembly, lens run, synthesis, and SHA helpers.
+    """Patch the worker's gate, seed-assembly, lens run, synthesis, and SHA helpers.
 
-    Also patches the across-push persistence helpers (``get_posted_review`` so a
-    prior-review record can be injected via ``prior_review``).
+    By default the early gate is stubbed to return a permissive RepoConfig so the
+    pipeline proceeds; pass ``config=None`` to simulate an opt-out/no-config skip,
+    or a specific RepoConfig to exercise tuning.  Also patches the across-push
+    persistence helpers (``get_posted_review`` so a prior-review record can be
+    injected via ``prior_review``).
 
     Returns the ExitStack (used under ``with``) plus the run_synthesis mock so a
     test can assert what reached synthesis.
     """
     stack = ExitStack()
+    gate_config = RepoConfig() if config is _SENTINEL else config
+    stack.enter_context(
+        patch("heimdall.worker._gate_review", new=AsyncMock(return_value=gate_config))
+    )
     stack.enter_context(
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=last_sha))
     )
@@ -277,6 +290,9 @@ async def test_run_review_isolates_one_lens_failure() -> None:
     ]
     stack = ExitStack()
     stack.enter_context(
+        patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig()))
+    )
+    stack.enter_context(
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
     )
     stack.enter_context(
@@ -402,6 +418,7 @@ async def test_run_review_retries_lens_exactly_once_then_posts_terse_note() -> N
     # seam wraps _synthesize_review, so drive the failure there.
     synthesize_mock = AsyncMock(side_effect=LensError("boom"))
     with (
+        patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig())),
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
         patch("heimdall.worker._synthesize_review", new=synthesize_mock),
         patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()) as mock_set,
@@ -436,6 +453,7 @@ async def test_run_review_retry_succeeds_posts_real_review() -> None:
     synthesis = _synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit", "style")])
     synthesize_mock = AsyncMock(side_effect=[LensError("boom"), synthesis])
     with (
+        patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig())),
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
         patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None)),
         patch("heimdall.worker._synthesize_review", new=synthesize_mock),
@@ -478,6 +496,7 @@ async def test_run_review_pipeline_timeout_surfaced_as_failure() -> None:
 
     run_lens_mock = AsyncMock(side_effect=_slow_lens)
     with (
+        patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig())),
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
         patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock())),
         patch("heimdall.worker.run_lens", new=run_lens_mock),
@@ -869,3 +888,232 @@ async def test_on_startup_strips_sqlalchemy_prefix() -> None:
     assert not db_path.startswith("sqlite+aiosqlite"), (
         f"Database received raw SQLAlchemy DSN: {db_path!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #8 — config gating (opt-in + scope) and lens tuning through run_review
+# ---------------------------------------------------------------------------
+
+
+def _gating_gh_client(
+    *,
+    config_yaml: str | None,
+    draft: bool = False,
+    user_type: str = "User",
+    association: str = "OWNER",
+    head_repo: str = "owner/repo",
+    base_ref: str = "main",
+    labels: list[str] | None = None,
+    changed_paths: list[str] | None = None,
+) -> AsyncMock:
+    """Mock GitHubClient for the real _gate_review path (get_pr/file/files)."""
+    client = _gh_client()
+    client.get_pr = AsyncMock(
+        return_value={
+            "draft": draft,
+            "author_association": association,
+            "user": {"login": "alice", "type": user_type},
+            "labels": [{"name": name} for name in (labels or [])],
+            "base": {"ref": base_ref, "sha": "BASE_SHA", "repo": {"full_name": "owner/repo"}},
+            "head": {"ref": "feat", "sha": "HEAD_SHA", "repo": {"full_name": head_repo}},
+        }
+    )
+    client.get_file_content = AsyncMock(return_value=config_yaml)
+    client.get_pr_files = AsyncMock(
+        return_value=[{"filename": p} for p in (changed_paths or ["src/app.py"])]
+    )
+    return client
+
+
+def _run_with_real_gate(client: AsyncMock, synth_mock: AsyncMock) -> ExitStack:
+    """ExitStack patching everything except the real _gate_review under test."""
+    stack = ExitStack()
+    stack.enter_context(
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock()))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.run_lens", new=AsyncMock(return_value=_lens_result([])))
+    )
+    stack.enter_context(patch("heimdall.worker.run_synthesis", new=synth_mock))
+    stack.enter_context(patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.set_posted_review", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.GitHubClient", return_value=client))
+    return stack
+
+
+async def _drive(client: AsyncMock) -> None:
+    await run_review(
+        {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY},
+        installation_id=_INSTALL_ID,
+        repo_full_name=_REPO,
+        pr_number=_PR,
+        head_sha=_SHA,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_review_no_config_posts_nothing() -> None:
+    """Acceptance #1: a repo with no heimdall.yml is not reviewed (no post)."""
+    client = _gating_gh_client(config_yaml=None)
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    with _run_with_real_gate(client, synth_mock):
+        await _drive(client)
+
+    synth_mock.assert_not_called()
+    client.post_review.assert_not_called()
+    client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_review_fork_reads_config_from_base_ref() -> None:
+    """Acceptance #2: a fork PR loads config from the BASE sha, ignoring head."""
+    client = _gating_gh_client(config_yaml="", head_repo="attacker/repo")
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    with _run_with_real_gate(client, synth_mock):
+        await _drive(client)
+
+    client.get_file_content.assert_awaited_once_with(
+        repo_full_name=_REPO,
+        path=".github/heimdall.yml",
+        ref="BASE_SHA",
+        tolerate_missing=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_review_disabled_lens_does_not_run() -> None:
+    """Acceptance #3: a lens disabled in config never runs (not in fanout)."""
+    client = _gating_gh_client(config_yaml="lenses:\n  design:\n    enabled: false\n")
+    run_lens_mock = AsyncMock(return_value=_lens_result([]))
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    stack = ExitStack()
+    stack.enter_context(
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock()))
+    )
+    stack.enter_context(patch("heimdall.worker.run_lens", new=run_lens_mock))
+    stack.enter_context(patch("heimdall.worker.run_synthesis", new=synth_mock))
+    stack.enter_context(patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.set_posted_review", new=AsyncMock()))
+    stack.enter_context(patch("heimdall.worker.GitHubClient", return_value=client))
+    with stack:
+        await _drive(client)
+
+    ran = {call.kwargs["lens"].name for call in run_lens_mock.await_args_list}
+    assert "design" not in ran
+    assert ran == {"security", "cleanliness"}
+
+
+@pytest.mark.asyncio
+async def test_run_review_threshold_changes_verdict() -> None:
+    """Acceptance #3: a CRITICAL threshold makes a HIGH finding COMMENT, not block."""
+    client = _gating_gh_client(config_yaml="severity_threshold: critical")
+    captured: dict[str, object] = {}
+
+    async def _synth(**kwargs: object) -> SynthesisResult:
+        captured["blocking"] = kwargs["blocking"]
+        from heimdall.lens import format_synthesis_body, verdict_for_tagged
+
+        tagged = [_tagged(Severity.HIGH, "security", "x")]
+        blocking = kwargs["blocking"]
+        assert isinstance(blocking, frozenset)
+        return SynthesisResult(
+            tagged_findings=tagged,
+            verdict=verdict_for_tagged(tagged, blocking=blocking),
+            body=format_synthesis_body(tagged),
+        )
+
+    synth_mock = AsyncMock(side_effect=_synth)
+    with _run_with_real_gate(client, synth_mock):
+        await _drive(client)
+
+    # HIGH does not block under a CRITICAL threshold -> COMMENT.
+    assert captured["blocking"] == frozenset({Severity.CRITICAL})
+    assert client.post_review.await_args.kwargs["event"] == "COMMENT"
+
+
+@pytest.mark.asyncio
+async def test_run_review_base_branch_filter_skips() -> None:
+    """Acceptance #3: a base branch outside the allowlist is skipped (no post)."""
+    client = _gating_gh_client(
+        config_yaml="scope:\n  base_branches: [release]\n", base_ref="main"
+    )
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    with _run_with_real_gate(client, synth_mock):
+        await _drive(client)
+
+    synth_mock.assert_not_called()
+    client.post_review.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_review_path_filter_skips() -> None:
+    """Acceptance #3: a PR touching only out-of-scope paths is skipped (no post)."""
+    client = _gating_gh_client(
+        config_yaml="scope:\n  paths: ['src/**']\n", changed_paths=["docs/x.md"]
+    )
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    with _run_with_real_gate(client, synth_mock):
+        await _drive(client)
+
+    synth_mock.assert_not_called()
+    client.post_review.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_review_draft_skipped() -> None:
+    """Acceptance #4: a draft PR is skipped per config (no post)."""
+    client = _gating_gh_client(config_yaml="", draft=True)
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    with _run_with_real_gate(client, synth_mock):
+        await _drive(client)
+
+    synth_mock.assert_not_called()
+    client.post_review.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_review_bot_author_skipped() -> None:
+    """Acceptance #4: a bot-authored PR is skipped per config (no post)."""
+    client = _gating_gh_client(config_yaml="", user_type="Bot")
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    with _run_with_real_gate(client, synth_mock):
+        await _drive(client)
+
+    synth_mock.assert_not_called()
+    client.post_review.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_review_opt_out_label_skipped() -> None:
+    """Acceptance #4: a PR carrying the opt-out label is skipped (no post)."""
+    client = _gating_gh_client(
+        config_yaml="scope:\n  opt_out_label: heimdall-skip\n", labels=["heimdall-skip"]
+    )
+    synth_mock = AsyncMock(return_value=_synthesis_from([]))
+    with _run_with_real_gate(client, synth_mock):
+        await _drive(client)
+
+    synth_mock.assert_not_called()
+    client.post_review.assert_not_called()
+
+
+def test_lens_config_and_scope_filters_constructible() -> None:
+    """The repo-config models are importable and constructible (contract smoke)."""
+    cfg = RepoConfig(
+        lenses={"security": LensConfig(model="sonnet")},
+        scope=ScopeFilters(base_branches=["main"]),
+    )
+    assert cfg.lenses["security"].model == "sonnet"
+    assert cfg.scope.base_branches == ["main"]
