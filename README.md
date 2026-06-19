@@ -105,7 +105,10 @@ anything off the allowlist (including raw Bash) is already blocked. The subproce
 via `create_subprocess_exec` (no shell). PR code is therefore **never executed**.
 
 **Filesystem-read confinement** is enforced at the OS level by a **bubblewrap (`bwrap`) sandbox**
-wrapped around every lens (and the synthesis) `claude` subprocess. The seed is bound **read-only**
+wrapped around each **lens** `claude` subprocess. (The 4th **synthesis** pass runs *unsandboxed*: it
+is a no-tools, no-workspace reasoning pass over the findings JSON — no `--add-dir`, no Read/Grep/Glob,
+no `cwd` — so it can read nothing and there is nothing to confine. This is what makes it correct to
+sandbox only the three lenses.) The seed is bound **read-only**
 at the fixed in-sandbox path `/workspace` and nothing sensitive is reachable: the worker project
 dir (its `.env` / `heimdall.db`) is **never** bound in, `/tmp` is a private tmpfs, and `~/.claude`,
 the OS, CA, DNS, and `claude`/`node`/venv runtime paths are read-only. PID/IPC are unshared; the
