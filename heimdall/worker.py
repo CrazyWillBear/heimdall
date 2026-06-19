@@ -663,7 +663,6 @@ async def _synthesize_review(
 
         synthesis = await run_synthesis(
             lens_results=lens_results,
-            workspace_dir=workspace,
             claude_binary=ctx.get("claude_binary", "claude"),
             token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
             timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
