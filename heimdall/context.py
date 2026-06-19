@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 
 from heimdall.github import GitHubClient
+from heimdall.repo_config import _DEFAULT_DOCS
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ async def assemble_pr_context(
     repo_full_name: str,
     pr_number: int,
     workspace_dir: str | None = None,
+    docs: list[str] | None = None,
 ) -> PRContext:
     """Assemble the seed context for a pull request.
 
@@ -90,10 +92,15 @@ async def assemble_pr_context(
         repo_full_name: e.g. "owner/repo".
         pr_number: The pull-request number.
         workspace_dir: Optional caller-managed directory to materialize into.
+        docs: Repo-relative doc paths to fetch from the PR head (tolerate-missing).
+            ``None`` uses the four built-in defaults; ``[]`` fetches no docs.  The
+            worker passes the loaded ``config.docs`` (validated, from the trusted
+            ref) so the list is trusted even though contents come from the head.
 
     Returns:
         The assembled PRContext with all seed fields populated.
     """
+    doc_names = list(_DEFAULT_DOCS) if docs is None else docs
     github = GitHubClient(
         app_id=app_id,
         private_key=private_key,
@@ -104,11 +111,12 @@ async def assemble_pr_context(
             github, repo_full_name=repo_full_name, pr_number=pr_number
         )
         head_sha = pr_meta["head"]["sha"]
-        file_contents, docs = await _fetch_file_contents_and_docs(
+        file_contents, fetched_docs = await _fetch_file_contents_and_docs(
             github,
             repo_full_name=repo_full_name,
             files=files,
             ref=head_sha,
+            doc_names=doc_names,
         )
     finally:
         await github.aclose()
@@ -127,7 +135,7 @@ async def assemble_pr_context(
         diff=diff,
         changed_files=files,
         file_contents=file_contents,
-        docs=docs,
+        docs=fetched_docs,
     )
 
     if workspace_dir is not None:
@@ -174,15 +182,13 @@ async def _fetch_pr_data(
     return pr_meta, diff, files, linked
 
 
-_DEFAULT_DOC_NAMES = ("STYLEGUIDE.md", "CLAUDE.md", "README.md")
-
-
 async def _fetch_file_contents_and_docs(
     github: GitHubClient,
     *,
     repo_full_name: str,
     files: list[dict[str, Any]],
     ref: str,
+    doc_names: list[str],
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Fetch changed-file contents and repo docs in parallel.
 
@@ -197,6 +203,7 @@ async def _fetch_file_contents_and_docs(
         repo_full_name: e.g. "owner/repo".
         files: Changed-file objects from the PR files API.
         ref: Git ref (commit SHA) to read from.
+        doc_names: Repo-relative doc paths to fetch (the validated config list).
 
     Returns:
         A ``(file_contents, docs)`` tuple where each value maps a path/name to
@@ -225,7 +232,7 @@ async def _fetch_file_contents_and_docs(
 
     n_changed = len(fetchable)
     changed_tasks = [_fetch_changed(f["filename"]) for f in fetchable]
-    doc_tasks = [_fetch_doc(name) for name in _DEFAULT_DOC_NAMES]
+    doc_tasks = [_fetch_doc(name) for name in doc_names]
 
     # Gather all tasks in one shot. return_exceptions=True isolates per-file
     # errors in the changed-file slice so one bad file cannot abort the whole
@@ -351,8 +358,9 @@ def _materialize(ctx: PRContext, directory: str) -> None:
         docs_root = root / "docs"
         docs_root.mkdir(exist_ok=True)
         for name, content in ctx.docs.items():
-            # The names are a trusted hardcoded set today, but route through the same
-            # guard as files/ so a future dynamic source can't escape the workspace.
+            # Doc names come from the trusted config list (already rejected at load for
+            # absolute/.. entries), but route through the same guard as files/ as
+            # defense in depth so nothing can escape the workspace.
             doc_path = _safe_file_path(docs_root, name)
             if doc_path is None:
                 continue

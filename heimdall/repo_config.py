@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+from pathlib import PurePosixPath
 from typing import Any
 
 import yaml
@@ -52,6 +53,11 @@ _BUILTIN_LENSES: dict[str, LensSpec] = {
     DESIGN_LENS.name: DESIGN_LENS,
     CLEANLINESS_LENS.name: CLEANLINESS_LENS,
 }
+
+# Repo docs fetched into every PR seed by default when ``docs`` is absent.  This is
+# the single source of truth for the default list (the materializer threads it through
+# assemble_pr_context); setting ``docs`` in heimdall.yml fully replaces these.
+_DEFAULT_DOCS = ("CLAUDE.md", "README.md", "AGENTS.md", "STYLEGUIDE.md")
 
 
 class LensConfig(BaseModel):
@@ -211,6 +217,10 @@ class RepoConfig(BaseModel):
         scope: Scope filters deciding whether the PR is reviewed at all.
         caps: Guardrail caps (diff size, per-repo rate/budget, per-installation
             concurrency) with safe defaults when the block is absent.
+        docs: Repo-relative paths fetched into every PR seed (no globbing); their
+            contents come from the PR head, the list from this trusted config.
+            Setting ``docs`` FULLY REPLACES the defaults; ``[]`` means no docs; an
+            absent field uses the four defaults (:data:`_DEFAULT_DOCS`).
     """
 
     model_config = {"extra": "forbid"}
@@ -220,6 +230,23 @@ class RepoConfig(BaseModel):
     severity_threshold: Severity = Severity.HIGH
     scope: ScopeFilters = Field(default_factory=ScopeFilters)
     caps: GuardrailCaps = Field(default_factory=GuardrailCaps)
+    docs: list[str] = Field(default_factory=lambda: list(_DEFAULT_DOCS))
+
+    @model_validator(mode="after")
+    def _validate_docs_paths(self) -> RepoConfig:
+        """Reject docs entries that aren't safe repo-relative paths.
+
+        Defense in depth on top of the materializer's path-escape guard: an
+        absolute path or a ``..`` traversal entry is rejected at config load so a
+        bad list never reaches the Contents API or the workspace.
+        """
+        for entry in self.docs:
+            path = PurePosixPath(entry)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError(
+                    f"docs entry {entry!r} must be a repo-relative path without '..'"
+                )
+        return self
 
     @model_validator(mode="after")
     def _validate_custom_lens_names(self) -> RepoConfig:

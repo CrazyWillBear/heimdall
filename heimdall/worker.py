@@ -653,6 +653,7 @@ async def _synthesize_review(
             repo_full_name=repo_full_name,
             pr_number=pr_number,
             workspace_dir=workspace,
+            docs=config.docs,
         )
 
         lens_results = await _run_lenses(

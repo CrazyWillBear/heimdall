@@ -80,8 +80,8 @@ private key) to read the PR and post the review.
 - `pr_metadata.json` — title, body, author, base/head refs + SHAs, linked issues
 - `files/<path>` — full content of each changed file at the head SHA (binary/oversize files
   skipped; path traversal rejected)
-- `docs/<name>` — repo docs (`STYLEGUIDE.md`, `CLAUDE.md`, `README.md`)
-  when present
+- `docs/<name>` — repo docs from the configurable `docs` list (defaults:
+  `CLAUDE.md`, `README.md`, `AGENTS.md`, `STYLEGUIDE.md`) when present
 
 Each lens reads this workspace through the **`heimdall-context`** CLI wrapper — the single
 allowlisted Bash command — with subcommands `diff`, `pr`, `file <path>`, and `docs`.
@@ -241,6 +241,12 @@ Every field below is optional and shown with its **real default**.
 severity_threshold: high          # lowest severity that blocks (REQUEST_CHANGES);
                                   # below it findings only comment. Default: high.
 
+docs:                             # repo-relative doc paths fed into every PR seed.
+  - CLAUDE.md                     # setting `docs` FULLY REPLACES this default list;
+  - README.md                     # `docs: []` means no docs; an absent field uses
+  - AGENTS.md                     # these four. No globbing; absolute/`..` paths are
+  - STYLEGUIDE.md                 # rejected at load. Default: the four shown here.
+
 lenses:                           # per-lens overrides, keyed by built-in lens name.
   security:                       # built-in: opus / max
     enabled: true                 # a disabled lens never runs and never reaches synthesis
@@ -288,6 +294,7 @@ caps:                             # guardrail caps; every field has a SAFE, non-
 | `severity_threshold` | `critical`/`high`/`medium`/`low` | `high` | Lowest severity that blocks (REQUEST_CHANGES); below it comments. |
 | `scope`              | scope filters              | all defaults | Whether the PR is reviewed at all.                             |
 | `caps`               | guardrail caps             | all defaults | Resource ceilings on review work.                             |
+| `docs`               | list of repo-relative paths | `[CLAUDE.md, README.md, AGENTS.md, STYLEGUIDE.md]` | Docs fed into every PR seed; setting it **fully replaces** the defaults, `[]` means none. Contents come from the PR head; the list from the trusted config. No globbing; absolute/`..` entries rejected at load. |
 
 **Per-lens override (`lenses.<security|design|cleanliness>`, `LensConfig`)** — overrides a
 built-in lens. `instructions` is **appended** to the built-in system prompt (the lens keeps its

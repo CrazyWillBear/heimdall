@@ -87,6 +87,41 @@ def test_non_mapping_top_level_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue #30 — configurable docs list with safe defaults + path guards
+# ---------------------------------------------------------------------------
+
+
+def test_docs_default_when_absent() -> None:
+    """An absent docs field uses the four built-in defaults."""
+    config = parse_repo_config("")
+    assert config.docs == ["CLAUDE.md", "README.md", "AGENTS.md", "STYLEGUIDE.md"]
+
+
+def test_docs_fully_replaces_defaults() -> None:
+    """Setting docs replaces (not extends) the defaults."""
+    config = parse_repo_config("docs: [FOO.md]\n")
+    assert config.docs == ["FOO.md"]
+
+
+def test_docs_empty_list_means_no_docs() -> None:
+    """An explicit empty list means no docs are fetched."""
+    config = parse_repo_config("docs: []\n")
+    assert config.docs == []
+
+
+def test_docs_rejects_absolute_path() -> None:
+    """An absolute path entry is rejected at config load (RepoConfigError)."""
+    with pytest.raises(RepoConfigError):
+        parse_repo_config("docs: ['/etc/passwd']\n")
+
+
+def test_docs_rejects_traversal_entry() -> None:
+    """A ../-traversal entry is rejected at config load (RepoConfigError)."""
+    with pytest.raises(RepoConfigError):
+        parse_repo_config("docs: ['../../etc/passwd']\n")
+
+
+# ---------------------------------------------------------------------------
 # Acceptance #1 — no heimdall.yml -> no review (opt-in)
 # ---------------------------------------------------------------------------
 

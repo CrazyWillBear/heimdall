@@ -788,6 +788,77 @@ async def test_assemble_pr_context_materializes_docs() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue #30 — the docs list is configurable through assemble_pr_context
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_custom_docs_list_materializes_only_those() -> None:
+    """A docs=[FOO.md] argument materializes only docs/FOO.md, ignoring defaults."""
+    repo_docs = {"FOO.md": "# Foo\n", "CLAUDE.md": "# Claude\n"}
+    mock_client = _make_mock_github_client_with_docs(repo_docs)
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+            docs=["FOO.md"],
+        )
+        assert set(ctx.docs) == {"FOO.md"}
+        docs_dir = Path(tmp_dir) / "docs"
+        assert (docs_dir / "FOO.md").exists()
+        assert not (docs_dir / "CLAUDE.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_default_docs_list_uses_four_defaults() -> None:
+    """An absent docs argument fetches the four default docs present in the repo."""
+    repo_docs = {
+        "CLAUDE.md": "c",
+        "README.md": "r",
+        "AGENTS.md": "a",
+        "STYLEGUIDE.md": "s",
+    }
+    mock_client = _make_mock_github_client_with_docs(repo_docs)
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    assert set(ctx.docs) == {"CLAUDE.md", "README.md", "AGENTS.md", "STYLEGUIDE.md"}
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_empty_docs_list_materializes_none() -> None:
+    """A docs=[] argument fetches and materializes no docs at all."""
+    mock_client = _make_mock_github_client_with_docs()
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+            docs=[],
+        )
+        assert ctx.docs == {}
+        assert not (Path(tmp_dir) / "docs").exists()
+
+
+# ---------------------------------------------------------------------------
 # heimdall-context CLI: file subcommand (with path sanitization)
 # ---------------------------------------------------------------------------
 
