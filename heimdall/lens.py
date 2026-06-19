@@ -291,6 +291,30 @@ _ALLOWED_TOOLS = "Read Grep Glob Bash(heimdall-context *)"
 _DISALLOWED_TOOLS = "Write Edit"
 
 
+def _base_claude_argv(*, claude_binary: str, lens: LensSpec, prompt: str) -> list[str]:
+    """Shared head of every ``claude -p`` argv: binary, prompt, model/effort, JSON.
+
+    Holds the parts common to a read-only lens run and the no-tools synthesis pass —
+    headless ``-p`` on the lens's own model+effort with JSON output and the lens's
+    appended system prompt.  Callers append (or omit) workspace/tool flags.  argv is
+    consumed by ``create_subprocess_exec`` (no shell), so none of these strings are
+    shell-interpreted.
+    """
+    return [
+        claude_binary,
+        "-p",
+        prompt,
+        "--model",
+        lens.model,
+        "--effort",
+        lens.effort,
+        "--output-format",
+        "json",
+        "--append-system-prompt",
+        lens.system_prompt,
+    ]
+
+
 def build_claude_argv(
     *,
     claude_binary: str,
@@ -317,24 +341,36 @@ def build_claude_argv(
         The argument vector to pass to the subprocess invoker.
     """
     return [
-        claude_binary,
-        "-p",
-        prompt,
-        "--model",
-        lens.model,
-        "--effort",
-        lens.effort,
-        "--output-format",
-        "json",
+        *_base_claude_argv(claude_binary=claude_binary, lens=lens, prompt=prompt),
         "--add-dir",
         workspace_dir,
         "--allowedTools",
         _ALLOWED_TOOLS,
         "--disallowedTools",
         _DISALLOWED_TOOLS,
-        "--append-system-prompt",
-        lens.system_prompt,
     ]
+
+
+def build_synthesis_argv(*, claude_binary: str, prompt: str) -> list[str]:
+    """Build the ``claude -p`` argv for the no-tools, no-workspace synthesis pass.
+
+    Synthesis only dedups/ranks/tags the three lenses' findings JSON it is handed in
+    the prompt, so it gets neither a workspace (no ``--add-dir``, and the caller does
+    not set ``cwd``) nor any tools (no Read/Grep/Glob and no ``heimdall-context`` Bash
+    wrapper).  Because it cannot read files at all, it has nothing to confine and is
+    not sandboxed — which is what makes it correct to sandbox only the three lenses.
+    It still runs headless on the synthesis lens's model+effort with JSON output.
+
+    Args:
+        claude_binary: Path or name of the claude executable.
+        prompt: The synthesis user prompt carrying the per-lens findings JSON.
+
+    Returns:
+        The argument vector to pass to the subprocess invoker.
+    """
+    return _base_claude_argv(
+        claude_binary=claude_binary, lens=SYNTHESIS_LENS, prompt=prompt
+    )
 
 
 def _coerce_severity(value: object) -> Severity:
@@ -970,13 +1006,10 @@ async def run_lens(
 async def run_synthesis(
     *,
     lens_results: list[LensResult],
-    workspace_dir: str,
     claude_binary: str = "claude",
     token_cap: int = DEFAULT_TOKEN_CAP,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     env_passthrough: Sequence[str] = (),
-    bwrap_binary: str = DEFAULT_BWRAP_BINARY,
-    sandbox_extra_read_only_binds: Sequence[str] = (),
     invoker: ClaudeInvoker = run_claude_subprocess,
     blocking: frozenset[Severity] = _BLOCKING_SEVERITIES,
 ) -> SynthesisResult:
@@ -985,19 +1018,19 @@ async def run_synthesis(
     Feeds the combined per-lens findings into a bounded synthesis call that dedups
     overlapping findings, ranks by severity, and tags each survivor with its lens.
     The verdict reflects the highest-severity surviving finding and the body groups
-    survivors by severity with each tagged by its originating lens.  Like the lenses,
-    the call runs inside the bwrap sandbox with the seed bound read-only at ``/workspace``.
+    survivors by severity with each tagged by its originating lens.
+
+    This is a pure reasoning pass over the findings JSON in the prompt: it is given
+    no workspace and no tools (see :func:`build_synthesis_argv`), so it cannot read
+    the seed and ``cwd`` is left unset.  Having nothing to confine, it is not
+    sandboxed — only the three lenses are.
 
     Args:
         lens_results: Results of every lens that ran (Security, Design, Cleanliness).
-        workspace_dir: Materialized seed-context directory (bound read-only at
-            ``/workspace`` like the lenses, so it can re-check claims if needed).
         claude_binary: Path or name of the claude executable.
         token_cap: Per-agent cumulative-token ceiling (bounds the synthesis call).
         timeout_seconds: Wall-clock limit for the synthesis run.
         env_passthrough: Extra parent-env keys forwarded to the claude child.
-        bwrap_binary: Path/name of the bwrap executable (default: found on PATH).
-        sandbox_extra_read_only_binds: Extra host paths bound read-only in the sandbox.
         invoker: Coroutine that runs the subprocess; injected in tests.
         blocking: The severities that escalate the verdict to REQUEST_CHANGES;
             defaults to high/critical, overridden by the repo config threshold.
@@ -1006,13 +1039,11 @@ async def run_synthesis(
         A :class:`SynthesisResult` with the tagged survivors, verdict, and body.
 
     Raises:
-        SandboxError / LensTimeoutError / LensTokenCapError: Propagated from the
-            invoker when the synthesis run is aborted; caller handles it as a failed pass.
+        LensTimeoutError / LensTokenCapError: Propagated from the invoker when the
+            synthesis run is aborted; the caller handles these as a failed pass.
     """
-    argv = build_claude_argv(
+    argv = build_synthesis_argv(
         claude_binary=claude_binary,
-        workspace_dir=SANDBOX_WORKSPACE_PATH,
-        lens=SYNTHESIS_LENS,
         prompt=_build_synthesis_prompt(lens_results),
     )
     total_lens_findings = sum(len(r.findings) for r in lens_results)
@@ -1025,10 +1056,8 @@ async def run_synthesis(
         argv,
         timeout_seconds=timeout_seconds,
         token_cap=token_cap,
-        cwd=workspace_dir,
+        cwd=None,
         env_passthrough=env_passthrough,
-        bwrap_binary=bwrap_binary,
-        sandbox_extra_read_only_binds=sandbox_extra_read_only_binds,
     )
     tagged = parse_tagged_findings(result.stdout)
     logger.info(

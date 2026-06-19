@@ -26,6 +26,7 @@ from heimdall.lens import (
     SynthesisResult,
     TaggedFinding,
     build_claude_argv,
+    build_synthesis_argv,
     format_synthesis_body,
     run_synthesis,
     verdict_for_tagged,
@@ -74,6 +75,37 @@ def test_argv_security_lens_still_opus_max() -> None:
     )
     assert argv[argv.index("--model") + 1] == "opus"
     assert argv[argv.index("--effort") + 1] == "max"
+
+
+# ---------------------------------------------------------------------------
+# Synthesis argv: no workspace, no tools (it only reasons over the prompt JSON)
+# ---------------------------------------------------------------------------
+
+
+def test_synthesis_argv_pins_synthesis_lens_model_effort_and_prompt() -> None:
+    """The synthesis argv runs headless on the synthesis lens with JSON output."""
+    argv = build_synthesis_argv(claude_binary="claude", prompt="synthesize")
+    assert argv[0] == "claude"
+    assert "-p" in argv
+    assert argv[argv.index("-p") + 1] == "synthesize"
+    assert argv[argv.index("--model") + 1] == SYNTHESIS_LENS.model
+    assert argv[argv.index("--effort") + 1] == SYNTHESIS_LENS.effort
+    assert argv[argv.index("--output-format") + 1] == "json"
+    assert argv[argv.index("--append-system-prompt") + 1] == SYNTHESIS_LENS.system_prompt
+
+
+def test_synthesis_argv_has_no_workspace() -> None:
+    """Synthesis is handed the findings JSON; it gets no --add-dir workspace."""
+    argv = build_synthesis_argv(claude_binary="claude", prompt="synthesize")
+    assert "--add-dir" not in argv
+
+
+def test_synthesis_argv_grants_no_tools() -> None:
+    """Synthesis gets no Read/Grep/Glob/Bash tools — it cannot explore the seed."""
+    argv = build_synthesis_argv(claude_binary="claude", prompt="synthesize")
+    allowed = argv[argv.index("--allowedTools") + 1] if "--allowedTools" in argv else ""
+    for tool in ("Read", "Grep", "Glob", "Bash"):
+        assert tool not in allowed
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +205,6 @@ async def test_run_synthesis_passes_all_lens_findings_to_claude() -> None:
 
     await run_synthesis(
         lens_results=lens_results,
-        workspace_dir=_WORKSPACE,
         claude_binary="claude",
         token_cap=400_000,
         timeout_seconds=900,
@@ -211,7 +242,6 @@ async def test_run_synthesis_returns_deduped_ranked_tagged_findings() -> None:
             _lens_result("security", [_finding(Severity.CRITICAL, "RCE")]),
             _lens_result("cleanliness", [_finding(Severity.LOW, "Nit")]),
         ],
-        workspace_dir=_WORKSPACE,
         claude_binary="claude",
         token_cap=400_000,
         timeout_seconds=900,
@@ -257,7 +287,6 @@ async def test_run_synthesis_lens_tags_survive_malformed_entry() -> None:
 
     result = await run_synthesis(
         lens_results=[_lens_result("security", [_finding(Severity.HIGH, "RealBug")])],
-        workspace_dir=_WORKSPACE,
         claude_binary="claude",
         token_cap=400_000,
         timeout_seconds=900,
@@ -289,7 +318,6 @@ async def test_run_synthesis_verdict_reflects_dedup_survivors_only() -> None:
             _lens_result("security", [_finding(Severity.HIGH, "Dup")]),
             _lens_result("design", [_finding(Severity.HIGH, "Dup")]),
         ],
-        workspace_dir=_WORKSPACE,
         claude_binary="claude",
         token_cap=400_000,
         timeout_seconds=900,
@@ -313,7 +341,6 @@ async def test_run_synthesis_uses_synthesis_lens_spec() -> None:
 
     await run_synthesis(
         lens_results=[_lens_result("security", [])],
-        workspace_dir=_WORKSPACE,
         claude_binary="claude",
         token_cap=400_000,
         timeout_seconds=900,
@@ -323,6 +350,35 @@ async def test_run_synthesis_uses_synthesis_lens_spec() -> None:
     argv = captured["argv"]
     system_prompt = argv[argv.index("--append-system-prompt") + 1]
     assert system_prompt == SYNTHESIS_LENS.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_run_synthesis_does_not_scope_to_a_workspace() -> None:
+    """The synthesis call gets no workspace: no --add-dir and no seed cwd."""
+    captured: dict[str, Any] = {}
+
+    async def fake_invoker(
+        argv: list[str],
+        *,
+        timeout_seconds: float,
+        token_cap: int,
+        cwd: str | None = None,
+        **_kwargs: object,
+    ) -> ClaudeResult:
+        captured["argv"] = argv
+        captured["cwd"] = cwd
+        return ClaudeResult(stdout=json.dumps({"findings": []}), total_tokens=0)
+
+    await run_synthesis(
+        lens_results=[_lens_result("security", [])],
+        claude_binary="claude",
+        token_cap=400_000,
+        timeout_seconds=900,
+        invoker=fake_invoker,
+    )
+
+    assert "--add-dir" not in captured["argv"]
+    assert captured["cwd"] is None
 
 
 def test_synthesis_lens_is_opus_max() -> None:
