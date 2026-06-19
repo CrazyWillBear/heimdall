@@ -201,7 +201,7 @@ ClaudeInvoker = Callable[..., Awaitable[ClaudeResult]]
 _SECURITY_SYSTEM_PROMPT = (
     "You are Heimdall's Security review lens. Review ONLY the security posture of "
     "this pull request using the materialized seed context in the workspace. Use the "
-    "heimdall-context wrapper (diff|pr|file|conventions) and the read-only Read/Grep/"
+    "heimdall-context wrapper (diff|pr|file|docs) and the read-only Read/Grep/"
     "Glob tools to inspect changes. Do not modify anything. Report findings as a single "
     'JSON object on its own line: {"findings": [{"severity": "critical|high|medium|low", '
     '"title": "...", "message": "...", "location": "path:line"}]}. '
@@ -227,7 +227,7 @@ _DESIGN_SYSTEM_PROMPT = (
     "this pull request fits the existing design and architecture: module boundaries, "
     "coupling and cohesion, abstraction level, layering, naming of public surfaces, "
     "and consistency with established patterns and conventions. Use the heimdall-context "
-    "wrapper (diff|pr|file|conventions) and the read-only Read/Grep/Glob tools to inspect "
+    "wrapper (diff|pr|file|docs) and the read-only Read/Grep/Glob tools to inspect "
     "changes. Do not modify anything. " + _FINDINGS_JSON_CONTRACT
 )
 
@@ -242,7 +242,7 @@ _CLEANLINESS_SYSTEM_PROMPT = (
     "You are Heimdall's Cleanliness review lens. Review ONLY the cleanliness of this "
     "pull request: readability, dead or duplicated code, unclear names, missing or "
     "misleading docs, error-handling hygiene, and adherence to the repo style guide. "
-    "Use the heimdall-context wrapper (diff|pr|file|conventions) and the read-only "
+    "Use the heimdall-context wrapper (diff|pr|file|docs) and the read-only "
     "Read/Grep/Glob tools to inspect changes. Do not modify anything. "
     + _FINDINGS_JSON_CONTRACT
 )

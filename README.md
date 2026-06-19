@@ -80,11 +80,11 @@ private key) to read the PR and post the review.
 - `pr_metadata.json` — title, body, author, base/head refs + SHAs, linked issues
 - `files/<path>` — full content of each changed file at the head SHA (binary/oversize files
   skipped; path traversal rejected)
-- `conventions/<name>` — repo convention docs (`STYLEGUIDE.md`, `CLAUDE.md`, `README.md`)
+- `docs/<name>` — repo docs (`STYLEGUIDE.md`, `CLAUDE.md`, `README.md`)
   when present
 
 Each lens reads this workspace through the **`heimdall-context`** CLI wrapper — the single
-allowlisted Bash command — with subcommands `diff`, `pr`, `file <path>`, and `conventions`.
+allowlisted Bash command — with subcommands `diff`, `pr`, `file <path>`, and `docs`.
 
 ### 4. The lenses and synthesis (`heimdall/lens.py`)
 
