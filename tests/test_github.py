@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -171,22 +172,49 @@ async def test_get_pr_files_single_page() -> None:
 
 @pytest.mark.asyncio
 async def test_get_pr_files_multi_page_collects_all_files() -> None:
-    """get_pr_files follows Link headers until exhausted and returns all files."""
-    page1 = [_make_file(f"file{i}.py") for i in range(3)]
-    page2 = [_make_file(f"file{i}.py") for i in range(3, 6)]
-    page3 = [_make_file(f"file{i}.py") for i in range(6, 8)]
+    """get_pr_files follows Link headers until exhausted and returns all files.
 
-    page2_url = "https://api.github.com/repos/owner/repo/pulls/7/files?page=2"
-    page3_url = "https://api.github.com/repos/owner/repo/pulls/7/files?page=3"
+    The mock simulates httpx's param-merging: it builds the effective URL by
+    merging the ``params`` kwarg into the base URL (exactly as httpx does),
+    then keys its response on the resulting ``page`` query param.  This means a
+    stripped-page regression — where ``params={'per_page': 100}`` overwrites the
+    existing ``page=N`` query string — causes the mock to see ``page=1`` on every
+    call and the hard cap assertion fires instead of the test silently passing.
+    """
+    page1_files = [_make_file(f"file{i}.py") for i in range(3)]
+    page2_files = [_make_file(f"file{i}.py") for i in range(3, 6)]
+    page3_files = [_make_file(f"file{i}.py") for i in range(6, 8)]
+
+    base_url = "https://api.github.com/repos/owner/repo/pulls/7/files"
+    page2_url = f"{base_url}?page=2&per_page=100"
+    page3_url = f"{base_url}?page=3&per_page=100"
+
+    pages: dict[int, MagicMock] = {
+        1: _page_response(page1_files, next_url=page2_url),
+        2: _page_response(page2_files, next_url=page3_url),
+        3: _page_response(page3_files, next_url=None),
+    }
+
+    _call_count = 0
+
+    async def _url_keyed_get(url: str, **kwargs: object) -> MagicMock:
+        nonlocal _call_count
+        _call_count += 1
+        # Hard cap: more than 5 calls means pagination is not advancing.
+        assert _call_count <= 5, (
+            f"get_pr_files made {_call_count} requests — likely stuck in an "
+            "infinite loop due to a stripped page= parameter"
+        )
+        # Simulate httpx's behaviour: params= replaces the query string, so
+        # build the effective URL the same way httpx would.
+        effective_url = httpx.Request("GET", url, params=kwargs.get("params")).url  # type: ignore[arg-type]
+        qs = parse_qs(str(effective_url).split("?", 1)[-1])
+        page = int(qs.get("page", ["1"])[0])
+        assert page in pages, f"Unexpected page={page} requested (effective URL: {effective_url})"
+        return pages[page]
 
     mock_http = AsyncMock()
-    mock_http.get = AsyncMock(
-        side_effect=[
-            _page_response(page1, next_url=page2_url),
-            _page_response(page2, next_url=page3_url),
-            _page_response(page3, next_url=None),
-        ]
-    )
+    mock_http.get = _url_keyed_get
 
     with patch.object(
         GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
@@ -196,8 +224,8 @@ async def test_get_pr_files_multi_page_collects_all_files() -> None:
         )
         result = await client.get_pr_files(repo_full_name="owner/repo", pr_number=7)
 
-    assert result == page1 + page2 + page3
-    assert mock_http.get.await_count == 3
+    assert result == page1_files + page2_files + page3_files
+    assert _call_count == 3
 
 
 @pytest.mark.asyncio

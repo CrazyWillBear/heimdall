@@ -250,11 +250,18 @@ class GitHubClient:
         )
         headers = await self._gh_headers()
         all_files: list[dict[str, Any]] = []
+        first_page = True
 
         while url is not None:
-            response = await self._http.get(
-                url, headers=headers, params={"per_page": 100}
-            )
+            # Only attach params on the first request. GitHub's next-page URLs
+            # already carry page= and per_page= in their query string; passing
+            # params= again would replace the entire query string (httpx
+            # behaviour), stripping page= and causing an infinite loop.
+            kwargs: dict[str, Any] = {"headers": headers}
+            if first_page:
+                kwargs["params"] = {"per_page": 100}
+                first_page = False
+            response = await self._http.get(url, **kwargs)
             response.raise_for_status()
             all_files.extend(response.json())
             url = self._next_page_url(response.headers.get("link", ""))
