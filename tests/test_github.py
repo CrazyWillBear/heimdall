@@ -123,3 +123,97 @@ async def test_async_context_manager_does_not_close_injected_client() -> None:
         pass
 
     mock_http.aclose.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# get_pr_files pagination
+# ---------------------------------------------------------------------------
+
+
+def _make_file(name: str) -> dict[str, str]:
+    return {"filename": name, "status": "modified"}
+
+
+def _page_response(
+    files: list[dict[str, str]], next_url: str | None = None
+) -> MagicMock:
+    """Return a mock httpx response for one page of PR files."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json = MagicMock(return_value=files)
+    link_header = (
+        f'<{next_url}>; rel="next", <https://api.github.com/last>; rel="last"'
+        if next_url
+        else ""
+    )
+    resp.headers = {"link": link_header}
+    return resp
+
+
+@pytest.mark.asyncio
+async def test_get_pr_files_single_page() -> None:
+    """get_pr_files returns all files when the response fits in one page."""
+    files = [_make_file("a.py"), _make_file("b.py")]
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=_page_response(files))
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        result = await client.get_pr_files(repo_full_name="owner/repo", pr_number=1)
+
+    assert result == files
+    mock_http.get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_pr_files_multi_page_collects_all_files() -> None:
+    """get_pr_files follows Link headers until exhausted and returns all files."""
+    page1 = [_make_file(f"file{i}.py") for i in range(3)]
+    page2 = [_make_file(f"file{i}.py") for i in range(3, 6)]
+    page3 = [_make_file(f"file{i}.py") for i in range(6, 8)]
+
+    page2_url = "https://api.github.com/repos/owner/repo/pulls/7/files?page=2"
+    page3_url = "https://api.github.com/repos/owner/repo/pulls/7/files?page=3"
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(
+        side_effect=[
+            _page_response(page1, next_url=page2_url),
+            _page_response(page2, next_url=page3_url),
+            _page_response(page3, next_url=None),
+        ]
+    )
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        result = await client.get_pr_files(repo_full_name="owner/repo", pr_number=7)
+
+    assert result == page1 + page2 + page3
+    assert mock_http.get.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_get_pr_files_uses_per_page_100() -> None:
+    """get_pr_files requests 100 files per page to minimize round-trips."""
+    files = [_make_file("x.py")]
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=_page_response(files))
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        await client.get_pr_files(repo_full_name="owner/repo", pr_number=1)
+
+    call_kwargs = mock_http.get.call_args[1]
+    assert call_kwargs.get("params", {}).get("per_page") == 100
