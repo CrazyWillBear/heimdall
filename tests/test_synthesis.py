@@ -235,6 +235,40 @@ async def test_run_synthesis_returns_deduped_ranked_tagged_findings() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_synthesis_lens_tags_survive_malformed_entry() -> None:
+    """A non-dict entry in findings must not misalign surviving findings' lens tags.
+
+    The synthesizer can emit a malformed (non-dict) entry anywhere in the array.
+    Each surviving finding must still carry the lens named on its own raw object,
+    not a tag shifted in from a neighbour (the pre-fix positional-zip bug).
+    """
+    synthesized = {
+        "findings": [
+            "garbage-non-dict-entry",
+            {"severity": "high", "title": "RealBug", "message": "m", "lens": "security"},
+            {"severity": "low", "title": "Nit", "message": "x", "lens": "cleanliness"},
+        ]
+    }
+
+    async def fake_invoker(
+        argv: list[str], *, timeout_seconds: float, token_cap: int
+    ) -> ClaudeResult:
+        return ClaudeResult(stdout=json.dumps(synthesized), total_tokens=10)
+
+    result = await run_synthesis(
+        lens_results=[_lens_result("security", [_finding(Severity.HIGH, "RealBug")])],
+        workspace_dir=_WORKSPACE,
+        claude_binary="claude",
+        token_cap=400_000,
+        timeout_seconds=900,
+        invoker=fake_invoker,
+    )
+
+    lens_by_title = {t.finding.title: t.lens for t in result.tagged_findings}
+    assert lens_by_title == {"RealBug": "security", "Nit": "cleanliness"}
+
+
+@pytest.mark.asyncio
 async def test_run_synthesis_verdict_reflects_dedup_survivors_only() -> None:
     """When synthesis drops the only high finding, the verdict downgrades to COMMENT."""
     # Two lenses each report a HIGH duplicate; synthesis collapses them into one

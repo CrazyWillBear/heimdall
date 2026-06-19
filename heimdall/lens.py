@@ -351,6 +351,39 @@ def _extract_findings_json(text: str) -> dict[str, object] | None:
     return None
 
 
+def _finding_from_raw(item: dict[str, object]) -> Finding:
+    """Coerce one raw findings dict into a :class:`Finding`.
+
+    Shared by :func:`parse_findings` and :func:`parse_tagged_findings` so the
+    severity/title/message/location coercion lives in exactly one place.  Severity
+    is coerced via :func:`_coerce_severity`; missing title/message degrade to empty
+    strings, and a missing location stays None.
+    """
+    location = item.get("location")
+    return Finding(
+        severity=_coerce_severity(item.get("severity")),
+        title=str(item.get("title", "")),
+        message=str(item.get("message", "")),
+        location=str(location) if location is not None else None,
+    )
+
+
+def _raw_findings(text: str) -> list[object]:
+    """Return the raw ``findings`` list from a lens's output, empty when absent.
+
+    Tolerates prose around the JSON block and a missing or non-list ``findings``
+    field.  Callers filter the list for dict entries themselves.
+    """
+    obj = _extract_findings_json(text)
+    if obj is None:
+        logger.warning("No findings JSON in lens output; treating as no findings")
+        return []
+    raw_findings = obj.get("findings", [])
+    if not isinstance(raw_findings, list):
+        return []
+    return raw_findings
+
+
 def parse_findings(text: str) -> list[Finding]:
     """Parse a lens's textual output into a list of :class:`Finding`.
 
@@ -363,28 +396,7 @@ def parse_findings(text: str) -> list[Finding]:
     Returns:
         The parsed findings, empty when none are present.
     """
-    obj = _extract_findings_json(text)
-    if obj is None:
-        logger.warning("No findings JSON in lens output; treating as no findings")
-        return []
-    raw_findings = obj.get("findings", [])
-    if not isinstance(raw_findings, list):
-        return []
-
-    findings: list[Finding] = []
-    for item in raw_findings:
-        if not isinstance(item, dict):
-            continue
-        location = item.get("location")
-        findings.append(
-            Finding(
-                severity=_coerce_severity(item.get("severity")),
-                title=str(item.get("title", "")),
-                message=str(item.get("message", "")),
-                location=str(location) if location is not None else None,
-            )
-        )
-    return findings
+    return [_finding_from_raw(item) for item in _raw_findings(text) if isinstance(item, dict)]
 
 
 _NO_FINDINGS_BODY = "Heimdall security review: no security concerns found."
@@ -497,9 +509,11 @@ def format_synthesis_body(tagged: list[TaggedFinding]) -> str:
 def parse_tagged_findings(text: str) -> list[TaggedFinding]:
     """Parse synthesis output into lens-tagged findings, ranked worst-first.
 
-    Reuses :func:`parse_findings` for the severity/title/message/location fields and
-    layers on the per-finding ``lens`` tag the synthesizer attaches.  The result is
-    sorted worst-first so the verdict and body see a stable ranking.
+    Derives each survivor's finding fields and its ``lens`` tag from the SAME raw
+    dict in one filtered pass, so a malformed (non-dict) entry anywhere in the array
+    cannot misalign a finding with a neighbour's lens tag.  Reuses
+    :func:`_finding_from_raw` for the severity/title/message/location coercion.  The
+    result is sorted worst-first so the verdict and body see a stable ranking.
 
     Args:
         text: The synthesis lens output (claude's ``result`` text or bare JSON).
@@ -507,20 +521,18 @@ def parse_tagged_findings(text: str) -> list[TaggedFinding]:
     Returns:
         The deduped survivors, lens-tagged and severity-ranked. Empty when none.
     """
-    obj = _extract_findings_json(text)
-    raw_findings = obj.get("findings", []) if obj is not None else []
-    lens_by_index: list[str] = []
-    if isinstance(raw_findings, list):
-        for item in raw_findings:
-            lens_value = item.get("lens") if isinstance(item, dict) else None
-            lens_by_index.append(str(lens_value) if lens_value is not None else "")
-
-    findings = parse_findings(text)
     tagged = [
-        TaggedFinding(lens=lens_by_index[i] if i < len(lens_by_index) else "", finding=finding)
-        for i, finding in enumerate(findings)
+        TaggedFinding(lens=_lens_tag(item), finding=_finding_from_raw(item))
+        for item in _raw_findings(text)
+        if isinstance(item, dict)
     ]
     return sorted(tagged, key=lambda t: _SEVERITY_ORDER[t.finding.severity])
+
+
+def _lens_tag(item: dict[str, object]) -> str:
+    """Read the ``lens`` tag off a raw findings dict, defaulting to ""."""
+    lens_value = item.get("lens")
+    return str(lens_value) if lens_value is not None else ""
 
 
 def _render_lens_findings_json(lens_results: list[LensResult]) -> str:
