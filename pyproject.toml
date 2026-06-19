@@ -29,6 +29,7 @@ dev = [
 
 [project.scripts]
 heimdall-worker = "heimdall.worker:main"
+heimdall-context = "heimdall.context_cli:main"
 
 [tool.ruff]
 line-length = 100

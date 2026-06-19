@@ -1,7 +1,8 @@
 """GitHub App authentication and API client.
 
 Implements JWT generation (for App-level auth) and installation token exchange,
-then wraps the GitHub REST calls needed by Heimdall: posting PR reviews.
+then wraps the GitHub REST calls needed by Heimdall: posting PR reviews and
+fetching PR metadata, diffs, file lists, and file contents for seed-context assembly.
 """
 
 from __future__ import annotations
@@ -128,3 +129,133 @@ class GitHubClient:
         response.raise_for_status()
         result: dict[str, Any] = response.json()
         return result
+
+    async def _gh_headers(self) -> dict[str, str]:
+        """Return GitHub API headers with a fresh installation token."""
+        token = await self.get_installation_token()
+        return {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+    async def get_pr(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> dict[str, Any]:
+        """Fetch pull-request metadata.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            Parsed JSON of the PR object from the GitHub REST API.
+        """
+        url = f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}"
+        response = await self._http.get(url, headers=await self._gh_headers())
+        response.raise_for_status()
+        result: dict[str, Any] = response.json()
+        return result
+
+    async def get_pr_diff(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> str:
+        """Fetch the unified diff for a pull request.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            The raw unified diff string.
+        """
+        url = f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}"
+        headers = await self._gh_headers()
+        # Request diff media type to get the raw unified diff
+        headers["Accept"] = "application/vnd.github.diff"
+        response = await self._http.get(url, headers=headers)
+        response.raise_for_status()
+        return response.text
+
+    async def get_pr_files(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> list[dict[str, Any]]:
+        """List files changed in a pull request.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            List of file objects (filename, status, patch, …) from the GitHub API.
+        """
+        url = f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/files"
+        response = await self._http.get(url, headers=await self._gh_headers())
+        response.raise_for_status()
+        result: list[dict[str, Any]] = response.json()
+        return result
+
+    async def get_file_content(
+        self,
+        *,
+        repo_full_name: str,
+        path: str,
+        ref: str,
+    ) -> str:
+        """Fetch the decoded text content of a file at a specific ref.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            path: File path within the repository.
+            ref: Git ref (branch, tag, or commit SHA) to read from.
+
+        Returns:
+            The decoded UTF-8 content of the file.
+        """
+        import base64
+
+        url = f"{self._BASE}/repos/{repo_full_name}/contents/{path}"
+        response = await self._http.get(
+            url,
+            headers=await self._gh_headers(),
+            params={"ref": ref},
+        )
+        response.raise_for_status()
+        data: dict[str, Any] = response.json()
+        # GitHub returns base64-encoded content with embedded newlines
+        raw: str = data["content"]
+        return base64.b64decode(raw.replace("\n", "")).decode("utf-8")
+
+    async def get_linked_issues(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> list[dict[str, Any]]:
+        """Return issues mentioned in the PR body via closing keywords.
+
+        GitHub does not expose a direct "linked issues" API endpoint, so we use
+        the GraphQL timeline API to surface cross-references.  For now we return
+        an empty list and leave the GraphQL implementation as a future extension;
+        the seed-context caller can fill this via the PR body parser if needed.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            List of linked issue dicts (may be empty if none found).
+        """
+        # The REST API has no direct "linked issues" endpoint.
+        # Return empty list; a future issue can wire GraphQL here.
+        _ = repo_full_name, pr_number  # acknowledged unused for now
+        return []
