@@ -230,7 +230,7 @@ async def _fetch_file_contents_and_conventions(
     # Gather all tasks in one shot. return_exceptions=True isolates per-file
     # errors in the changed-file slice so one bad file cannot abort the whole
     # gather; convention tasks handle missing-file 404s via tolerate_missing.
-    all_results: list[object] = await asyncio.gather(
+    all_results: list[tuple[str, str | None] | BaseException] = await asyncio.gather(
         *changed_tasks,
         *convention_tasks,
         return_exceptions=True,
@@ -257,7 +257,7 @@ async def _fetch_file_contents_and_conventions(
             # Unexpected error — re-raise so it isn't silently swallowed.
             raise item
         else:
-            filename, content = item  # type: ignore[misc]
+            filename, content = item
             if content is not None:
                 file_contents[filename] = content
 
@@ -265,7 +265,7 @@ async def _fetch_file_contents_and_conventions(
     for item in convention_raw:
         if isinstance(item, BaseException):
             raise item
-        name, content = item  # type: ignore[misc]
+        name, content = item
         if content is not None:
             convention_docs[name] = content
 
