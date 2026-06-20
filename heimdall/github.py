@@ -43,6 +43,25 @@ def parse_linked_issues_from_body(body: str) -> list[dict[str, Any]]:
     return results
 
 
+def _raise_with_body(response: httpx.Response) -> None:
+    """Like ``response.raise_for_status()`` but include the response body in the error.
+
+    httpx omits the body from :class:`httpx.HTTPStatusError`, yet GitHub's 4xx body
+    carries the actual reason — e.g. a 422 on create-review whose body says an inline
+    comment's "line must be part of the diff" — so an opaque status code alone is
+    undebuggable.  Re-raise the same error class (callers/tests still see
+    HTTPStatusError) with the truncated body appended.
+    """
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise httpx.HTTPStatusError(
+            f"{exc}: {response.text[:1000]}",
+            request=exc.request,
+            response=exc.response,
+        ) from exc
+
+
 def make_jwt(*, app_id: int, private_key: str) -> str:
     """Return a short-lived GitHub App JWT signed with the App's private key.
 
@@ -170,7 +189,7 @@ class GitHubClient:
             },
             json=payload,
         )
-        response.raise_for_status()
+        _raise_with_body(response)
         result: dict[str, Any] = response.json()
         return result
 

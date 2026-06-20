@@ -73,6 +73,47 @@ async def test_post_review() -> None:
 
 
 @pytest.mark.asyncio
+async def test_post_review_error_includes_github_response_body() -> None:
+    """A 4xx from create-review surfaces GitHub's body (the actual reason).
+
+    httpx's raise_for_status() reports only the status + URL; GitHub's 422 body holds
+    the real cause (e.g. an inline comment's line not part of the diff), so post_review
+    must include it in the raised error or failures are undebuggable.
+    """
+    request = httpx.Request("POST", "https://api.github.com/repos/o/r/pulls/5/reviews")
+    error_response = httpx.Response(422, request=request)
+
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "422 Unprocessable Entity", request=request, response=error_response
+        )
+    )
+    mock_response.text = '{"message":"line must be part of the diff"}'
+
+    mock_http = AsyncMock()
+    mock_http.post = AsyncMock(return_value=mock_response)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        with pytest.raises(httpx.HTTPStatusError) as excinfo:
+            await client.post_review(
+                repo_full_name="o/r",
+                pr_number=5,
+                commit_id="sha",
+                body="b",
+                event="COMMENT",
+                comments=[{"path": "x.py", "line": 9, "side": "RIGHT", "body": "c"}],
+            )
+
+    assert "line must be part of the diff" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
 async def test_post_review_attaches_inline_comments_in_same_submission() -> None:
     """post_review attaches the comments array to the single create-review call."""
     mock_response = MagicMock()
