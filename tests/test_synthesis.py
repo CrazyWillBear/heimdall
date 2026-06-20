@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -28,6 +29,7 @@ from heimdall.lens import (
     build_claude_argv,
     build_synthesis_argv,
     format_synthesis_body,
+    run_claude_subprocess,
     run_synthesis,
     verdict_for_tagged,
 )
@@ -353,8 +355,14 @@ async def test_run_synthesis_uses_synthesis_lens_spec() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_synthesis_does_not_scope_to_a_workspace() -> None:
-    """The synthesis call gets no workspace: no --add-dir and no seed cwd."""
+async def test_run_synthesis_grants_no_seed_workspace_but_supplies_a_sandbox_cwd() -> None:
+    """Synthesis reads no seed (no --add-dir) yet still runs sandboxed.
+
+    The pass has no tools and no seed to confine, but the production invoker
+    (run_claude_subprocess) is fail-closed and refuses a cwd-less spawn, so synthesis
+    must hand it a throwaway directory to bind — not None.  Guards the regression where
+    synthesis passed cwd=None and crashed every real review with SandboxError.
+    """
     captured: dict[str, Any] = {}
 
     async def fake_invoker(
@@ -377,8 +385,49 @@ async def test_run_synthesis_does_not_scope_to_a_workspace() -> None:
         invoker=fake_invoker,
     )
 
+    # No seed scoping (synthesis only reasons over the findings JSON in its prompt)...
     assert "--add-dir" not in captured["argv"]
-    assert captured["cwd"] is None
+    # ...but a real throwaway cwd so the fail-closed sandbox can be built.
+    assert captured["cwd"] is not None
+
+
+@pytest.mark.asyncio
+async def test_run_synthesis_with_real_invoker_runs_sandboxed_not_crashes() -> None:
+    """run_synthesis through the real invoker spawns a bwrap-sandboxed claude.
+
+    Reproduces the production crash: the default invoker raised SandboxError on the
+    cwd=None synthesis call, so every dogfood review failed.  With a throwaway cwd the
+    spawn is wrapped in bwrap and completes.
+    """
+    proc = MagicMock()
+    proc.returncode = 0
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
+    envelope = {
+        "type": "result",
+        "result": json.dumps({"findings": []}),
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    proc.communicate = AsyncMock(return_value=(json.dumps(envelope).encode(), b""))
+    spawn = AsyncMock(return_value=proc)
+
+    with patch(
+        "heimdall.lens._resolve_bwrap", return_value="/usr/bin/bwrap"
+    ), patch(
+        "heimdall.lens.asyncio.create_subprocess_exec", new=spawn
+    ):
+        result = await run_synthesis(
+            lens_results=[_lens_result("security", [])],
+            claude_binary="claude",
+            token_cap=400_000,
+            timeout_seconds=900,
+            invoker=run_claude_subprocess,
+        )
+
+    assert isinstance(result, SynthesisResult)
+    # The spawn was wrapped in the sandbox (bwrap is argv[0]); synthesis is never
+    # spawned unsandboxed.
+    assert spawn.call_args.args[0] == "/usr/bin/bwrap"
 
 
 def test_synthesis_lens_is_opus_max() -> None:

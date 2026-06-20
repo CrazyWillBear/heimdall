@@ -48,6 +48,7 @@ import logging
 import os
 import shutil
 import sys
+import tempfile
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -653,14 +654,33 @@ def _sum_tokens(envelope: dict[str, object]) -> int:
     return total
 
 
+def _terminal_result_event(events: list[object]) -> dict[str, object] | None:
+    """Return the last ``type == "result"`` event from a stream-json event array."""
+    for event in reversed(events):
+        if isinstance(event, dict) and event.get("type") == "result":
+            return event
+    return None
+
+
 def _parse_envelope(stdout_bytes: bytes) -> dict[str, object]:
-    """Decode claude's ``--output-format json`` envelope; tolerate non-JSON stdout."""
+    """Decode claude's ``--output-format json`` output; tolerate non-JSON stdout.
+
+    Newer claude (>=2.1) emits the run as a JSON *array* of stream events (system
+    init, assistant turns, then a terminal ``type=="result"`` event); older runs and
+    the test mocks emit that single result object directly.  Both reduce to the
+    terminal result envelope — carrying the ``result`` text and ``usage`` block — so
+    token accounting and findings parsing see the same shape regardless of CLI version.
+    A bare object is returned as-is; anything unparseable degrades to ``{"result": text}``.
+    """
     text = stdout_bytes.decode("utf-8", errors="replace")
     try:
         obj = json.loads(text)
     except json.JSONDecodeError:
         # Fall back to treating raw stdout as the result text with unknown usage.
         return {"result": text}
+    if isinstance(obj, list):
+        result_event = _terminal_result_event(obj)
+        return result_event if result_event is not None else {"result": text}
     if isinstance(obj, dict):
         return obj
     return {"result": text}
@@ -1101,9 +1121,9 @@ async def run_synthesis(
     survivors by severity with each tagged by its originating lens.
 
     This is a pure reasoning pass over the findings JSON in the prompt: it is given
-    no workspace and no tools (see :func:`build_synthesis_argv`), so it cannot read
-    the seed and ``cwd`` is left unset.  Having nothing to confine, it is not
-    sandboxed — only the three lenses are.
+    no seed and no tools (see :func:`build_synthesis_argv`), so it cannot read PR
+    code.  It still runs in the bwrap sandbox — over a throwaway empty workspace — so
+    the fail-closed "never spawn claude unsandboxed" invariant holds for every pass.
 
     Args:
         lens_results: Results of every lens that ran (Security, Design, Cleanliness).
@@ -1132,13 +1152,23 @@ async def run_synthesis(
         len(lens_results),
         total_lens_findings,
     )
-    result = await invoker(
-        argv,
-        timeout_seconds=timeout_seconds,
-        token_cap=token_cap,
-        cwd=None,
-        env_passthrough=env_passthrough,
-    )
+    # Synthesis has no seed and no tools (build_synthesis_argv adds no --add-dir and
+    # grants nothing), so there is nothing to confine — but the fail-closed invoker
+    # refuses a cwd-less spawn and never runs claude unsandboxed.  Hand it a throwaway
+    # empty dir to bind at /workspace: the pass still cannot read a seed (no tools), and
+    # the never-unsandboxed invariant holds.  (Passing cwd=None crashed every real
+    # review with SandboxError.)
+    synthesis_workspace = tempfile.mkdtemp(prefix="heimdall-synthesis-")
+    try:
+        result = await invoker(
+            argv,
+            timeout_seconds=timeout_seconds,
+            token_cap=token_cap,
+            cwd=synthesis_workspace,
+            env_passthrough=env_passthrough,
+        )
+    finally:
+        shutil.rmtree(synthesis_workspace, ignore_errors=True)
     tagged = parse_tagged_findings(result.stdout)
     logger.info(
         "Synthesis kept %d of %d findings (%d tokens)",
