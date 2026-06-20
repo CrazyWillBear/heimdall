@@ -19,7 +19,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -27,6 +30,51 @@ import httpx
 from heimdall.webhook import compute_signature
 
 _DEFAULT_URL = "http://localhost:8000/webhook"
+
+# GitHub's pull_request webhook always carries the full 40-hex head SHA.
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _git_rev_parse(sha: str) -> str:
+    """Resolve ``sha`` to a full commit OID via ``git rev-parse`` in the local repo."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{sha}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
+def resolve_commit_sha(sha: str, *, run: Callable[[str], str] = _git_rev_parse) -> str:
+    """Expand a possibly-abbreviated ``--sha`` to the full 40-char commit OID.
+
+    GitHub's create-review REST endpoint rejects an abbreviated ``commit_id`` with a
+    422 ("Variable $commitOID of type GitObjectID was provided invalid value"), and
+    the real ``pull_request`` webhook always sends the full head SHA.  To mirror GitHub
+    faithfully the replay expands a short sha against the local repo before forwarding
+    it, so the dogfood exercises the same input production would receive.
+
+    Args:
+        sha: The ``--sha`` value (full or abbreviated commit-ish).
+        run: Resolver mapping a commit-ish to ``git rev-parse`` output (injectable for
+            tests).
+
+    Returns:
+        The full 40-hex commit SHA.
+
+    Raises:
+        ValueError: If ``sha`` cannot be resolved to a full commit SHA.
+    """
+    sha = sha.strip()
+    if _FULL_SHA.match(sha):
+        return sha
+    resolved = run(sha).strip()
+    if not _FULL_SHA.match(resolved):
+        raise ValueError(
+            f"could not resolve {sha!r} to a full commit SHA (got {resolved!r})"
+        )
+    return resolved
 
 
 def build_pull_request_payload(
@@ -117,10 +165,16 @@ def main(argv: list[str] | None = None) -> int:
         print("error: no webhook secret (pass --secret or set WEBHOOK_SECRET)", file=sys.stderr)
         return 1
 
+    try:
+        head_sha = resolve_commit_sha(args.sha)
+    except (subprocess.CalledProcessError, ValueError) as exc:
+        print(f"error: could not resolve --sha {args.sha!r}: {exc}", file=sys.stderr)
+        return 1
+
     payload = build_pull_request_payload(
         action=args.action,
         pr_number=args.pr,
-        head_sha=args.sha,
+        head_sha=head_sha,
         repo_full_name=args.repo,
         installation_id=args.installation_id,
         draft=args.draft,
