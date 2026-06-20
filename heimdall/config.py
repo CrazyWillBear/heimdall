@@ -54,4 +54,8 @@ class Settings(BaseSettings):
         description="When True, log findings and code text; default logs are metadata-only",
     )
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    # extra="ignore": the .env is SHARED with docker-compose (its header says so) and so
+    # carries compose/Caddy-only keys (e.g. DOMAIN) that are not Settings fields.  The
+    # dotenv source reads every key in the file, so the pydantic-settings default of
+    # extra="forbid" would reject the shared .env outright; ignore unknown keys instead.
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
