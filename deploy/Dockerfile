@@ -10,7 +10,7 @@
 # default seccomp profile blocks user-namespace creation, so the worker container must run
 # with `security_opt: ["seccomp=unconfined"]` (wired in docker-compose.yml).  The worker's
 # startup exec-probe (heimdall/lens.sandbox_exec_probe) verifies this at boot.
-FROM python:3.12-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 # OS packages: bubblewrap for the sandbox; curl/gnupg/ca-certificates for the NodeSource
 # repo and TLS; then Node 22 (matches the host) for the claude CLI.
