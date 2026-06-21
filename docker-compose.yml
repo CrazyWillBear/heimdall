@@ -79,8 +79,8 @@ services:
   # claude_creds volume mounted READ-WRITE, and periodically fires a throwaway `claude -p`
   # ping (heimdall-refresh) that refreshes/rotates the token as a side effect.  It runs no
   # untrusted PR code, so write access is safe, and it makes no GitHub calls, so it is given
-  # NONE of the App secrets — only its two CLAUDE_REFRESH_* knobs.  See the README
-  # "Docker deployment" → OAuth section for the one-time credential seed.
+  # NONE of the App secrets — only its two CLAUDE_REFRESH_* knobs.  See
+  # docs/self-hosting.md "Docker deployment" → OAuth section for the one-time credential seed.
   claude-refresher:
     build: *heimdall-build
     image: heimdall:latest
@@ -112,7 +112,7 @@ volumes:
   redis_data:
   worker_data:
   # Shared ~/.claude for OAuth (subscription) auth: written by claude-refresher, read by
-  # the worker.  Seeded once on a fresh host (see README "Docker deployment" → OAuth).
+  # the worker.  Seeded once on a fresh host (see docs/self-hosting.md "Docker deployment" → OAuth).
   claude_creds:
   caddy_data:
   caddy_config:

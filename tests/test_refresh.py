@@ -95,11 +95,12 @@ def test_run_refresh_once_treats_timeout_as_failure() -> None:
 # Doc-completeness: the refresher's env knobs must stay documented (no drift).
 # ---------------------------------------------------------------------------
 
-_README = Path(__file__).resolve().parent.parent / "README.md"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_DOC_SOURCES = (_REPO_ROOT / "README.md", *sorted((_REPO_ROOT / "docs").glob("*.md")))
 
 
 def test_readme_documents_refresh_env_vars() -> None:
-    """The refresher's configurable env vars appear in the README by name."""
-    text = _README.read_text(encoding="utf-8")
+    """The refresher's configurable env vars appear in the docs by name."""
+    text = "\n".join(p.read_text(encoding="utf-8") for p in _DOC_SOURCES)
     for var in ("CLAUDE_REFRESH_MODEL", "CLAUDE_REFRESH_INTERVAL_SECONDS"):
-        assert var in text, f"README is missing refresher env var: {var}"
+        assert var in text, f"docs are missing refresher env var: {var}"

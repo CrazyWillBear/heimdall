@@ -13,7 +13,7 @@ throwaway ``claude -p`` ping.  Any successful call refreshes — and rotates —
 as a side effect; the response itself is discarded.  Because the refresher runs **no
 untrusted PR code**, write access to the credentials is safe, and the worker's lens
 sandbox keeps binding the very same volume read-only — the security control is
-unchanged (see the README "Docker deployment" → OAuth section).
+unchanged (see docs/self-hosting.md "Docker deployment" → OAuth section).
 
 It is opt-in: the default deployment authenticates via ``ANTHROPIC_API_KEY`` and needs
 no refresher.  Deliberately decoupled from :class:`heimdall.config.Settings` — the
