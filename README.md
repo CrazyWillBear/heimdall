@@ -10,6 +10,8 @@
   </picture>
 </div>
 
+## Summary
+
 Heimdall is a self-hosted GitHub App that automatically reviews pull requests with a
 Claude-driven, multi-lens review engine. When a PR is opened or updated it fans out three
 independent review lenses — **Security**, **Design-fit**, and **Cleanliness** — over a
