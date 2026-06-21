@@ -356,11 +356,12 @@ def build_synthesis_argv(*, claude_binary: str, prompt: str) -> list[str]:
     """Build the ``claude -p`` argv for the no-tools, no-workspace synthesis pass.
 
     Synthesis only dedups/ranks/tags the three lenses' findings JSON it is handed in
-    the prompt, so it gets neither a workspace (no ``--add-dir``, and the caller does
-    not set ``cwd``) nor any tools (no Read/Grep/Glob and no ``heimdall-context`` Bash
-    wrapper).  Because it cannot read files at all, it has nothing to confine and is
-    not sandboxed — which is what makes it correct to sandbox only the three lenses.
-    It still runs headless on the synthesis lens's model+effort with JSON output.
+    the prompt, so the argv carries no seed scoping (no ``--add-dir``) and no tools (no
+    Read/Grep/Glob and no ``heimdall-context`` Bash wrapper).  It cannot read files at
+    all, so it has nothing of its own to confine — but :func:`run_synthesis` still runs
+    it inside the bwrap sandbox (over a throwaway empty ``cwd``) so the fail-closed
+    "never spawn claude unsandboxed" invariant holds for every pass.  It runs headless
+    on the synthesis lens's model+effort with JSON output.
 
     Args:
         claude_binary: Path or name of the claude executable.
@@ -716,11 +717,15 @@ def _build_subprocess_env(passthrough: Sequence[str] = ()) -> dict[str, str]:
     return {key: os.environ[key] for key in keep if key in os.environ}
 
 
-class SandboxError(LensError):
-    """Raised when the bwrap sandbox cannot be built (fail-closed at spawn).
+class SandboxError(Exception):
+    """Raised when the bwrap sandbox cannot be built or run (an infra/deploy fault).
 
-    A lens that hits this never runs unsandboxed; the caller drops it like a
-    timeout so a prompt-injected PR can never escape onto the host filesystem.
+    Deliberately NOT a :class:`LensError`: a missing or unrunnable bwrap is a
+    deployment fault affecting *every* lens, not a normal per-lens execution error.
+    Keeping it distinct lets callers surface a misconfigured sandbox (logged as an
+    infra fault, caught at the startup probe) instead of silently dropping the
+    affected lenses as if each had merely timed out.  A lens that hits this still
+    never runs unsandboxed — the spawn fails closed before any claude process starts.
     """
 
 
@@ -952,7 +957,7 @@ async def run_claude_subprocess(
     *,
     timeout_seconds: float,
     token_cap: int,
-    cwd: str | None = None,
+    cwd: str,
     env_passthrough: Sequence[str] = (),
     bwrap_binary: str = DEFAULT_BWRAP_BINARY,
     sandbox_extra_read_only_binds: Sequence[str] = (),
@@ -991,7 +996,10 @@ async def run_claude_subprocess(
         LensTimeoutError: The run exceeded ``timeout_seconds`` (subprocess killed).
         LensTokenCapError: The run exceeded ``token_cap`` (subprocess killed).
     """
-    if cwd is None:
+    # Defence in depth: cwd is required by the type, but a falsy/empty value would
+    # bind nothing read-only at /workspace and silently widen the sandbox, so reject
+    # it explicitly rather than spawn a misconfigured (effectively unconfined) lens.
+    if not cwd:
         raise SandboxError("a seed workspace cwd is required to build the bwrap sandbox")
     prefix = build_bwrap_prefix(
         workspace_dir=cwd,
@@ -1075,8 +1083,11 @@ async def run_lens(
         A :class:`LensResult` with the lens name and parsed findings.
 
     Raises:
-        SandboxError / LensTimeoutError / LensTokenCapError: Propagated from the
-            invoker when the run is aborted; callers handle these as a failed lens.
+        LensTimeoutError / LensTokenCapError: Propagated from the invoker when the
+            run is aborted; callers handle these as a failed (dropped) lens.
+        SandboxError: The bwrap wrap could not be built (an infra/deployment fault,
+            not a per-lens error); callers surface it distinctly while still
+            isolating it so sibling lenses keep running.
     """
     argv = build_claude_argv(
         claude_binary=claude_binary,

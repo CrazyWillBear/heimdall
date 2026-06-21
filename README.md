@@ -105,10 +105,12 @@ anything off the allowlist (including raw Bash) is already blocked. The subproce
 via `create_subprocess_exec` (no shell). PR code is therefore **never executed**.
 
 **Filesystem-read confinement** is enforced at the OS level by a **bubblewrap (`bwrap`) sandbox**
-wrapped around each **lens** `claude` subprocess. (The 4th **synthesis** pass runs *unsandboxed*: it
-is a no-tools, no-workspace reasoning pass over the findings JSON — no `--add-dir`, no Read/Grep/Glob,
-no `cwd` — so it can read nothing and there is nothing to confine. This is what makes it correct to
-sandbox only the three lenses.) The seed is bound **read-only**
+wrapped around **every** `claude` subprocess — the three lenses *and* the 4th synthesis pass. The
+synthesis pass is a no-tools, no-workspace reasoning pass over the findings JSON (no `--add-dir`, no
+Read/Grep/Glob), so it has nothing of its own to confine, but it still runs **inside the same `bwrap`
+sandbox** — over a throwaway empty workspace bound at `/workspace`, with `~/.claude` read-only — so the
+fail-closed **"never spawn `claude` unsandboxed"** invariant holds for every pass. The seed is bound
+**read-only**
 at the fixed in-sandbox path `/workspace` and nothing sensitive is reachable: the worker project
 dir (its `.env` / `heimdall.db`) is **never** bound in, `/tmp` is a private tmpfs, and `~/.claude`,
 the OS, CA, DNS, and `claude`/`node`/venv runtime paths are read-only. PID/IPC are unshared; the
@@ -133,8 +135,10 @@ lens. A failure in one lens is isolated — the rest still reach synthesis.
 A **4th synthesis pass** (`run_synthesis`, opus/max) receives the combined findings of every
 lens and: **dedups** overlapping findings across lenses, **ranks** by severity, **attributes**
 each survivor to its originating lens, writes the **verdict**, and formats the
-severity-grouped, lens-tagged body. When every lens fails or synthesis itself aborts, that run
-produces no review (the retry/failure handling above takes over).
+severity-grouped, lens-tagged body. It too runs **inside the `bwrap` sandbox** (over a throwaway
+empty workspace, `~/.claude` bound read-only), so no `claude` pass is ever spawned unsandboxed.
+When every lens fails or synthesis itself aborts, that run produces no review (the retry/failure
+handling above takes over).
 
 **Verdict.** Each finding carries a `Severity` (critical / high / medium / low). Any surviving
 finding whose severity meets the repo's **blocking threshold** maps the review to

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import ExitStack
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -13,12 +14,13 @@ from heimdall.lens import (
     LensError,
     LensResult,
     LensTimeoutError,
+    SandboxError,
     Severity,
     SynthesisResult,
     TaggedFinding,
 )
 from heimdall.repo_config import LensConfig, RepoConfig, ScopeFilters
-from heimdall.worker import WorkerSettings, run_review
+from heimdall.worker import WorkerSettings, _configure_logging, run_review
 
 _REPO = "owner/repo"
 _PR = 3
@@ -362,6 +364,112 @@ async def test_run_review_isolates_one_lens_failure() -> None:
     surviving = {r.lens_name for r in synth_mock.await_args.kwargs["lens_results"]}
     assert surviving == {"security", "cleanliness"}
     mock_gh_client.post_review.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_review_isolates_sandbox_fault_and_logs_it_as_infra(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A per-lens SandboxError is isolated (siblings survive) and logged as infra.
+
+    SandboxError is an infra/deploy fault, not a LensError, so it must NOT abort the
+    sibling lenses — synthesis still runs on the survivors — yet it must be surfaced
+    distinctly (error level) rather than swallowed like a routine failed lens.
+    """
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    lens_outcomes: list[Any] = [
+        _lens_result([Finding(Severity.HIGH, "SecretLeak", "m", None)], name="security"),
+        SandboxError("bwrap vanished mid-run"),
+        _lens_result([Finding(Severity.LOW, "DeadCode", "m", None)], name="cleanliness"),
+    ]
+    stack = ExitStack()
+    stack.enter_context(
+        patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig()))
+    )
+    _patch_guardrails(stack)
+    stack.enter_context(
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock()))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.run_lens", new=AsyncMock(side_effect=lens_outcomes))
+    )
+    synth_mock = AsyncMock(
+        return_value=_synthesis_from([_tagged(Severity.HIGH, "security", "SecretLeak")])
+    )
+    stack.enter_context(patch("heimdall.worker.run_synthesis", new=synth_mock))
+    with (
+        stack,
+        caplog.at_level("ERROR", logger="heimdall.worker"),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    # Sibling lenses survived the sandbox fault and synthesis still ran + posted.
+    synth_mock.assert_awaited_once()
+    assert synth_mock.await_args is not None
+    surviving = {r.lens_name for r in synth_mock.await_args.kwargs["lens_results"]}
+    assert surviving == {"security", "cleanliness"}
+    mock_gh_client.post_review.assert_awaited_once()
+    # The infra fault was surfaced distinctly at error level (not a plain warning drop).
+    assert any(
+        record.levelname == "ERROR" and "sandbox infra fault" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_review_synthesis_sandbox_fault_does_not_crash_worker() -> None:
+    """A SandboxError from the synthesis pass is caught — the worker never crashes.
+
+    SandboxError is no longer a LensError, so the per-review retry wrapper must catch
+    it explicitly; otherwise an infra fault in the (sandboxed) synthesis pass would
+    crash the job.  After the retry also faults, the terse failure note is posted.
+    """
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    lens_results = [_lens_result([Finding(Severity.HIGH, "x", "m", None)], name="security")]
+    # The retry re-runs the lenses, so feed enough results for two attempts.
+    stack, _ = _patch_review_pipeline(
+        lens_results=lens_results * 2,
+        synthesis_side_effect=SandboxError("bwrap cannot run here"),
+    )
+    with (
+        stack,
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()) as mock_set,
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()) as mock_persist,
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        # Must not raise even though SandboxError is not a LensError.
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    mock_gh_client.post_review.assert_awaited_once()
+    assert mock_gh_client.post_review.await_args.kwargs["event"] == "COMMENT"
+    mock_set.assert_awaited_once()
+    mock_persist.assert_not_called()
+    mock_gh_client.aclose.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1849,3 +1957,28 @@ async def test_concurrency_records_event_and_releases_on_success() -> None:
     record_mock.assert_awaited_once()
     release_mock.assert_awaited_once()
     client.post_review.assert_awaited_once()
+
+
+def test_configure_logging_emits_info_to_stdout(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """_configure_logging makes worker progress logs visible on stdout at INFO.
+
+    Without it the root logger sits at WARNING with no handler, so every
+    ``logger.info`` (per-lens / synthesis / posting progress) is silently dropped
+    and only uncaught tracebacks surface in ``docker logs``.
+    """
+    root = logging.getLogger()
+    saved_handlers = root.handlers[:]
+    saved_level = root.level
+    try:
+        _configure_logging()
+        logging.getLogger("heimdall.worker").info("observability-marker")
+        captured = capsys.readouterr()
+        assert "observability-marker" in captured.out
+        assert (
+            logging.getLogger("heimdall.worker").getEffectiveLevel() == logging.INFO
+        )
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)

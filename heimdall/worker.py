@@ -59,6 +59,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import sys
 import tempfile
 import time
 from typing import Any
@@ -91,6 +92,7 @@ from heimdall.lens import (
     DEFAULT_TOKEN_CAP,
     LensError,
     LensResult,
+    SandboxError,
     SynthesisResult,
     run_lens,
     run_synthesis,
@@ -598,6 +600,23 @@ async def _run_pipeline_with_retry(
                 ),
                 timeout=review_timeout,
             )
+        except SandboxError as exc:
+            # An infra/deployment fault (bwrap missing or unrunnable), distinct from a
+            # per-lens execution error: surface it at error level so a misconfigured
+            # deployment is visible rather than indistinguishable from a normal failed
+            # pass.  Still caught here (not propagated) so the worker never crashes; the
+            # startup probe is the primary guard, this is the runtime backstop.
+            logger.error(
+                "Review pipeline attempt %d/%d hit a sandbox infra fault for %s#%d "
+                "@ %s: %s",
+                attempt,
+                max_attempts,
+                repo_full_name,
+                pr_number,
+                head_sha,
+                exc,
+            )
+            continue
         except (LensError, TimeoutError) as exc:
             # Metadata-only: log the failure class and identifiers, never the
             # underlying findings/code or any secret.
@@ -740,6 +759,19 @@ async def _run_lenses(
     for lens, outcome in zip(lenses, outcomes, strict=True):
         if isinstance(outcome, LensResult):
             results.append(outcome)
+        elif isinstance(outcome, SandboxError):
+            # An infra/deployment fault, not a normal lens failure: it drops the lens
+            # like any other (isolation preserved — siblings still run), but log it at
+            # error level so a misconfigured sandbox is distinguishable in the logs from
+            # a routine per-lens timeout/abort.
+            logger.error(
+                "Lens %s hit a sandbox infra fault for %s#%d; dropping it from "
+                "synthesis: %s",
+                lens.name,
+                repo_full_name,
+                pr_number,
+                outcome,
+            )
         elif isinstance(outcome, BaseException):
             logger.warning(
                 "Lens %s failed for %s#%d; dropping it from synthesis: %s",
@@ -810,6 +842,25 @@ def _load_settings() -> Any:
 settings: Any = None
 
 
+def _configure_logging() -> None:
+    """Send INFO-level logs to stdout so the worker's progress is observable.
+
+    ``run_worker`` does not configure logging (only arq's CLI does that), so without
+    this the root logger sits at its default WARNING level with no handler: every
+    ``logger.info`` — the per-lens, synthesis, and posting progress lines that make a
+    review traceable in ``docker logs`` — is dropped, and only uncaught tracebacks
+    ever surface.  Install a single stdout ``StreamHandler`` at INFO; ``force=True``
+    replaces any pre-existing root config so the handler binds to the current stdout.
+    The image sets ``PYTHONUNBUFFERED`` so these lines stream rather than buffer.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stdout,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        force=True,
+    )
+
+
 def main() -> None:
     """Console-script entrypoint: start the Arq worker with WorkerSettings.
 
@@ -822,6 +873,8 @@ def main() -> None:
     where it would land after the pool has already started connecting to localhost.
     """
     from arq.worker import run_worker
+
+    _configure_logging()
 
     global settings
     if settings is None:
