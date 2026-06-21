@@ -22,6 +22,7 @@ dependencies = [
 dev = [
     "mypy>=2.1.0",
     "pytest-asyncio>=1.4.0",
+    "pytest-cov>=6.0.0",
     "pytest>=9.1.0",
     "ruff>=0.15.18",
     "anyio>=4.14.0",
@@ -58,8 +59,16 @@ exclude = ["\\.venv", "build", "dist"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q --cov=heimdall --cov-report=xml --cov-report=term-missing"
 asyncio_mode = "strict"
 # Put the repo root on sys.path so tests can import the dev-only scripts/ package
 # (the replay helper) alongside the installed heimdall package.
 pythonpath = ["."]
+
+[tool.coverage.run]
+source = ["heimdall"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "\\.\\.\\."]

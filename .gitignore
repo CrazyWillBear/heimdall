@@ -9,6 +9,8 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+.coverage
+coverage.xml
 # Deploy secrets / local state — never commit
 .env
 secrets/

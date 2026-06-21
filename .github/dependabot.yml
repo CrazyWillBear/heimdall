@@ -1,0 +1,29 @@
+version: 2
+
+updates:
+  # Python deps via uv (pyproject.toml + uv.lock). "uv" is the native ecosystem
+  # key (GA 2025-03); do NOT use "pip" — it mishandles the uv lockfile.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      python-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # The Dockerfile lives at deploy/Dockerfile, so the dir must be /deploy.
+  - package-ecosystem: "docker"
+    directory: "/deploy"
+    schedule:
+      interval: "weekly"
+    groups:
+      docker-minor-patch:
+        update-types: ["minor", "patch"]
