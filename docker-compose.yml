@@ -55,11 +55,37 @@ services:
       - systempaths=unconfined
     volumes:
       - worker_data:/data
+      # Shared OAuth credentials, mounted READ-ONLY: the worker process never writes them
+      # and the lens sandbox re-binds this same path read-only on top (defence in depth).
+      # Empty/unused in the default API-key mode; populated by claude-refresher under the
+      # `oauth` profile.
+      - claude_creds:/home/heimdall/.claude:ro
     secrets:
       - github_app_private_key
     depends_on:
       redis:
         condition: service_healthy
+
+  # Opt-in OAuth (subscription) token refresher — only started with the `oauth` profile
+  # (`docker compose --profile oauth up -d`).  OAuth access tokens expire after hours and
+  # the claude CLI refreshes them by rewriting ~/.claude/.credentials.json — a write the
+  # worker's lens sandbox blocks by design.  This sidecar shares that ~/.claude via the
+  # claude_creds volume mounted READ-WRITE, and periodically fires a throwaway `claude -p`
+  # ping (heimdall-refresh) that refreshes/rotates the token as a side effect.  It runs no
+  # untrusted PR code, so write access is safe, and it makes no GitHub calls, so it is given
+  # NONE of the App secrets — only its two CLAUDE_REFRESH_* knobs.  See the README
+  # "Docker deployment" → OAuth section for the one-time credential seed.
+  claude-refresher:
+    build: *heimdall-build
+    image: heimdall:latest
+    restart: unless-stopped
+    profiles: ["oauth"]
+    command: ["heimdall-refresh"]
+    environment:
+      CLAUDE_REFRESH_MODEL: ${CLAUDE_REFRESH_MODEL:-haiku}
+      CLAUDE_REFRESH_INTERVAL_SECONDS: ${CLAUDE_REFRESH_INTERVAL_SECONDS:-1800}
+    volumes:
+      - claude_creds:/home/heimdall/.claude
 
   caddy:
     image: caddy:2
@@ -79,6 +105,9 @@ services:
 volumes:
   redis_data:
   worker_data:
+  # Shared ~/.claude for OAuth (subscription) auth: written by claude-refresher, read by
+  # the worker.  Seeded once on a fresh host (see README "Docker deployment" → OAuth).
+  claude_creds:
   caddy_data:
   caddy_config:
 

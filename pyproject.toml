@@ -32,6 +32,7 @@ dev = [
 [project.scripts]
 heimdall-worker = "heimdall.worker:main"
 heimdall-context = "heimdall.context_cli:main"
+heimdall-refresh = "heimdall.refresh:main"
 
 [build-system]
 requires = ["hatchling"]

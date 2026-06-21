@@ -262,6 +262,40 @@ docker compose run --rm worker bwrap --ro-bind / / --unshare-all --share-net -- 
 An exit code of 0 means the sandbox works. (Do **not** add `no-new-privileges` expecting setuid
 semantics — this deployment uses the userns path, not setuid.)
 
+**OAuth (subscription) auth — optional.** By default the worker authenticates the `claude` CLI
+with `ANTHROPIC_API_KEY` (zero extra infrastructure). To bill against a Claude **subscription**
+instead, enable the `claude-refresher` sidecar with the `oauth` Compose profile. OAuth access
+tokens expire after hours and the CLI refreshes them by rewriting `~/.claude/.credentials.json` —
+a write the worker's lens sandbox blocks by design, so on a headless host nothing would keep the
+token alive. The sidecar fixes that: it shares the worker's `~/.claude` through the `claude_creds`
+volume **read-write** and periodically runs a throwaway `claude -p` ping that refreshes (and
+rotates) the token as a side effect. The worker mounts the same volume **read-only** and its lens
+sandbox re-binds it read-only on top, so credentials are never writable from any path that runs PR
+code — **the security control is unchanged**. The refresher makes no GitHub calls and is handed
+none of the App secrets.
+
+1. **Seed the credentials once.** On a fresh host the `claude_creds` volume is empty, so
+   authenticate `claude` once **into the volume** — run it interactively and complete the login,
+   or use `claude setup-token`, or copy an existing `~/.claude/.credentials.json` in:
+
+   ```
+   docker compose run --rm -it claude-refresher claude
+   ```
+
+   Then leave `ANTHROPIC_API_KEY` **empty** in `.env` so the CLI uses the subscription rather than
+   the key.
+
+2. **Bring the stack up with the sidecar:**
+
+   ```
+   docker compose --profile oauth up -d --build
+   ```
+
+   Tune the sidecar with `CLAUDE_REFRESH_MODEL` (default `haiku`, the cheapest — the reply is
+   discarded) and `CLAUDE_REFRESH_INTERVAL_SECONDS` (default `1800`; well under the token's
+   hours-long lifetime). Without the `oauth` profile the sidecar never starts and the deployment
+   stays on API-key auth.
+
 **Replaying a webhook (no public tunnel).** To exercise a real review without GitHub delivering
 a webhook (e.g. a private host), `scripts/replay_webhook.py` builds and signs a `pull_request`
 payload and POSTs it to the service (published on `127.0.0.1:8000` by Compose). The App
@@ -442,6 +476,11 @@ or a `.env` file. Secrets must come from env/`.env` — never commit them.
 
 The `claude` CLI on the worker host also needs `ANTHROPIC_API_KEY` in its environment to
 authenticate the lens calls.
+
+The optional OAuth refresher sidecar (see [Docker deployment](#docker-deployment) → OAuth) reads
+two further env vars, consumed only by `heimdall-refresh` and deliberately **not** part of
+`Settings` (the sidecar carries none of the App secrets): `CLAUDE_REFRESH_MODEL` (default `haiku`)
+and `CLAUDE_REFRESH_INTERVAL_SECONDS` (default `1800`).
 
 ## Development
 
