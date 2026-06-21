@@ -59,6 +59,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import sys
 import tempfile
 import time
 from typing import Any
@@ -841,6 +842,25 @@ def _load_settings() -> Any:
 settings: Any = None
 
 
+def _configure_logging() -> None:
+    """Send INFO-level logs to stdout so the worker's progress is observable.
+
+    ``run_worker`` does not configure logging (only arq's CLI does that), so without
+    this the root logger sits at its default WARNING level with no handler: every
+    ``logger.info`` — the per-lens, synthesis, and posting progress lines that make a
+    review traceable in ``docker logs`` — is dropped, and only uncaught tracebacks
+    ever surface.  Install a single stdout ``StreamHandler`` at INFO; ``force=True``
+    replaces any pre-existing root config so the handler binds to the current stdout.
+    The image sets ``PYTHONUNBUFFERED`` so these lines stream rather than buffer.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stdout,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        force=True,
+    )
+
+
 def main() -> None:
     """Console-script entrypoint: start the Arq worker with WorkerSettings.
 
@@ -853,6 +873,8 @@ def main() -> None:
     where it would land after the pool has already started connecting to localhost.
     """
     from arq.worker import run_worker
+
+    _configure_logging()
 
     global settings
     if settings is None:

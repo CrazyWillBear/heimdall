@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import ExitStack
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,7 +20,7 @@ from heimdall.lens import (
     TaggedFinding,
 )
 from heimdall.repo_config import LensConfig, RepoConfig, ScopeFilters
-from heimdall.worker import WorkerSettings, run_review
+from heimdall.worker import WorkerSettings, _configure_logging, run_review
 
 _REPO = "owner/repo"
 _PR = 3
@@ -1956,3 +1957,28 @@ async def test_concurrency_records_event_and_releases_on_success() -> None:
     record_mock.assert_awaited_once()
     release_mock.assert_awaited_once()
     client.post_review.assert_awaited_once()
+
+
+def test_configure_logging_emits_info_to_stdout(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """_configure_logging makes worker progress logs visible on stdout at INFO.
+
+    Without it the root logger sits at WARNING with no handler, so every
+    ``logger.info`` (per-lens / synthesis / posting progress) is silently dropped
+    and only uncaught tracebacks surface in ``docker logs``.
+    """
+    root = logging.getLogger()
+    saved_handlers = root.handlers[:]
+    saved_level = root.level
+    try:
+        _configure_logging()
+        logging.getLogger("heimdall.worker").info("observability-marker")
+        captured = capsys.readouterr()
+        assert "observability-marker" in captured.out
+        assert (
+            logging.getLogger("heimdall.worker").getEffectiveLevel() == logging.INFO
+        )
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
