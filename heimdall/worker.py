@@ -91,6 +91,7 @@ from heimdall.lens import (
     DEFAULT_TOKEN_CAP,
     LensError,
     LensResult,
+    SandboxError,
     SynthesisResult,
     run_lens,
     run_synthesis,
@@ -598,6 +599,23 @@ async def _run_pipeline_with_retry(
                 ),
                 timeout=review_timeout,
             )
+        except SandboxError as exc:
+            # An infra/deployment fault (bwrap missing or unrunnable), distinct from a
+            # per-lens execution error: surface it at error level so a misconfigured
+            # deployment is visible rather than indistinguishable from a normal failed
+            # pass.  Still caught here (not propagated) so the worker never crashes; the
+            # startup probe is the primary guard, this is the runtime backstop.
+            logger.error(
+                "Review pipeline attempt %d/%d hit a sandbox infra fault for %s#%d "
+                "@ %s: %s",
+                attempt,
+                max_attempts,
+                repo_full_name,
+                pr_number,
+                head_sha,
+                exc,
+            )
+            continue
         except (LensError, TimeoutError) as exc:
             # Metadata-only: log the failure class and identifiers, never the
             # underlying findings/code or any secret.
@@ -740,6 +758,19 @@ async def _run_lenses(
     for lens, outcome in zip(lenses, outcomes, strict=True):
         if isinstance(outcome, LensResult):
             results.append(outcome)
+        elif isinstance(outcome, SandboxError):
+            # An infra/deployment fault, not a normal lens failure: it drops the lens
+            # like any other (isolation preserved — siblings still run), but log it at
+            # error level so a misconfigured sandbox is distinguishable in the logs from
+            # a routine per-lens timeout/abort.
+            logger.error(
+                "Lens %s hit a sandbox infra fault for %s#%d; dropping it from "
+                "synthesis: %s",
+                lens.name,
+                repo_full_name,
+                pr_number,
+                outcome,
+            )
         elif isinstance(outcome, BaseException):
             logger.warning(
                 "Lens %s failed for %s#%d; dropping it from synthesis: %s",

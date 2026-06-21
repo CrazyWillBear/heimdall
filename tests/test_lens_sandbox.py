@@ -19,6 +19,7 @@ import pytest
 
 from heimdall.lens import (
     SANDBOX_WORKSPACE_PATH,
+    LensError,
     SandboxError,
     build_bwrap_prefix,
     build_sandbox_probe_argv,
@@ -27,6 +28,16 @@ from heimdall.lens import (
 )
 
 _FAKE_BWRAP = "/usr/bin/bwrap"
+
+
+def test_sandbox_error_is_an_infra_fault_not_a_lens_error() -> None:
+    """SandboxError is a distinct infra/deploy fault, NOT a per-lens LensError.
+
+    Keeping it off the LensError tree is what lets the worker surface a misconfigured
+    sandbox distinctly instead of swallowing it like a routine failed lens.
+    """
+    assert issubclass(SandboxError, Exception)
+    assert not issubclass(SandboxError, LensError)
 
 
 def _patch_bwrap_found() -> AbstractContextManager[object]:
@@ -161,6 +172,28 @@ async def test_subprocess_fails_closed_when_bwrap_unavailable() -> None:
             timeout_seconds=900,
             token_cap=400_000,
             cwd="/srv/seed",
+        )
+
+    exec_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_subprocess_fails_closed_on_empty_cwd() -> None:
+    """A falsy/empty cwd fails closed before any spawn (defence-in-depth guard).
+
+    cwd is required by the type, but an empty string would bind nothing read-only at
+    /workspace and silently widen the sandbox, so the invoker rejects it rather than
+    spawn an effectively unconfined lens.
+    """
+    exec_mock = AsyncMock()
+    with _patch_bwrap_found(), patch(
+        "heimdall.lens.asyncio.create_subprocess_exec", new=exec_mock
+    ), pytest.raises(SandboxError):
+        await run_claude_subprocess(
+            ["/real/claude", "-p"],
+            timeout_seconds=900,
+            token_cap=400_000,
+            cwd="",
         )
 
     exec_mock.assert_not_called()
