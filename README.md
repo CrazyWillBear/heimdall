@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/assets/heimdall-emblem.png" alt="Heimdall" width="420">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/heimdall-emblem-dark.png">
+    <img src="docs/assets/heimdall-emblem.png" alt="Heimdall" width="420">
+  </picture>
 </p>
 
 # Heimdall
