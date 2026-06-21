@@ -4,7 +4,7 @@
 # off the conflict to 8001.  The `!override` tag REPLACES the base port list — without it Compose
 # concatenates the two lists and the conflicting 8000 publish would remain.
 #
-# Usage on the host:
+# Usage on the host (the `oauth` profile adds the subscription-token refresher sidecar):
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml [--profile oauth] up -d
 services:
   web:
