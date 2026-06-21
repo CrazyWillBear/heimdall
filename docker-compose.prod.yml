@@ -1,0 +1,12 @@
+# Production overlay for the shared host: the base file publishes web on host port 8000, which
+# a co-tenant container already owns, so the bind would fail.  Caddy reaches web over the
+# internal Compose network either way, so this only moves the loopback-only debug/replay publish
+# off the conflict to 8001.  The `!override` tag REPLACES the base port list — without it Compose
+# concatenates the two lists and the conflicting 8000 publish would remain.
+#
+# Usage on the host:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml [--profile oauth] up -d
+services:
+  web:
+    ports: !override
+      - "127.0.0.1:8001:8000"
