@@ -248,12 +248,14 @@ docker compose up -d --build
 ```
 
 **Sandbox requirements (worker only).** The worker runs each lens under `bwrap` using the
-**unprivileged user-namespace** path — no setuid, no added capabilities. Docker's default
-seccomp profile blocks user-namespace creation and masks `/proc`, so the worker service runs
-with `seccomp=unconfined` and `systempaths=unconfined` (already wired in `docker-compose.yml`,
-and applied to the worker alone). The worker runs its `bwrap` exec-probe at startup and
-**refuses to boot** if the sandbox can't run, so a misconfiguration surfaces immediately. Verify
-the sandbox inside the built image with:
+**unprivileged user-namespace** path — no setuid, no added capabilities. Docker's defaults block
+it three ways, so the worker service runs with `seccomp=unconfined` (the default profile blocks
+user-namespace creation), `systempaths=unconfined` (the default masks `/proc`), and
+`apparmor=unconfined` (on AppArmor hosts — Debian/Ubuntu — the `docker-default` profile denies
+the mount ops bwrap needs; `seccomp=unconfined` does not lift AppArmor). All three are already
+wired in `docker-compose.yml`, applied to the worker alone. The worker runs its `bwrap`
+exec-probe at startup and **refuses to boot** if the sandbox can't run, so a misconfiguration
+surfaces immediately. Verify the sandbox inside the built image with:
 
 ```
 docker compose run --rm worker bwrap --ro-bind / / --unshare-all --share-net -- true

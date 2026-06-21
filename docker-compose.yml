@@ -46,13 +46,19 @@ services:
       REDIS_URL: redis://redis:6379
       DATABASE_URL: sqlite+aiosqlite:////data/heimdall.db
     # The lens sandbox uses bwrap's unprivileged user-namespace path (no setuid, no added
-    # capabilities).  Docker's default seccomp profile blocks user-namespace creation and
-    # masks /proc, so bwrap needs BOTH unconfined to create its namespaces and mount a
-    # fresh /proc.  The worker's startup exec-probe fails the boot if this is missing.
-    # Applies to the worker only — web/redis/caddy never run the sandbox.
+    # capabilities).  Three of Docker's default confinements block it, so all three are lifted
+    # for the worker alone (web/redis/caddy never run the sandbox):
+    #   - seccomp=unconfined     — the default seccomp profile blocks user-namespace creation.
+    #   - systempaths=unconfined — the default masks /proc, blocking bwrap's fresh /proc mount.
+    #   - apparmor=unconfined    — on AppArmor hosts (Debian/Ubuntu) the default docker-default
+    #                              profile denies the mount ops bwrap needs ("Failed to make /
+    #                              slave"); seccomp=unconfined does NOT lift AppArmor.  Harmless
+    #                              no-op on hosts without AppArmor.
+    # The worker's startup exec-probe fails the boot if any of these is missing.
     security_opt:
       - seccomp=unconfined
       - systempaths=unconfined
+      - apparmor=unconfined
     volumes:
       - worker_data:/data
       # Shared OAuth credentials, mounted READ-ONLY: the worker process never writes them
