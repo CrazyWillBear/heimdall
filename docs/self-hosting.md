@@ -25,8 +25,10 @@ Create a GitHub App and configure it to:
   reviews, dismiss, and minimize),
 - generate a **private key** (PEM) and note the **App ID** and **installation**.
 
-Install the App on the repositories you want reviewed. A repo is only reviewed once it also
-checks in a `.github/heimdall.yml` (see the [config reference](configuration.md)).
+Install the App on the repositories you want reviewed — from
+`https://github.com/apps/<your-app-slug>/installations/new` (or **App settings → Install
+App**), selecting the repos to review. A repo is only reviewed once it also checks in a
+`.github/heimdall.yml` (see the [config reference](configuration.md)).
 
 ## Configure the environment
 
