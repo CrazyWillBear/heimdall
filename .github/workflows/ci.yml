@@ -61,7 +61,7 @@ jobs:
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # Only authenticate when we actually push (push to main). Skipped on PRs.
       - name: Log in to GHCR
