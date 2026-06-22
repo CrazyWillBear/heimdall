@@ -27,3 +27,12 @@ updates:
     groups:
       docker-minor-patch:
         update-types: ["minor", "patch"]
+    # Stay on the 3.12 base image. A docker-tag "minor" bump here is a Python
+    # feature-version jump (3.12 -> 3.13/3.14) that changes the prod runtime
+    # without our test suite ever running on it (CI tests on .python-version =
+    # 3.12; the docker job only builds). Move deliberately in one coordinated PR
+    # instead. Patches still float via the 3.12-slim-bookworm tag; a 4.x major
+    # is still surfaced.
+    ignore:
+      - dependency-name: "python"
+        update-types: ["version-update:semver-minor"]
