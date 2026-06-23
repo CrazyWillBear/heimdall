@@ -76,13 +76,23 @@ private key) to read the PR and post the review.
   third-party data, never instructions.
 - `review_threads.json` — the PR's inline review comments grouped into parent-anchored
   **reply threads**: each thread carries `body`, `author`, `author_association`, its
-  `path`/`line` anchor, a `replies` list (each reply shaped the same way), and an
-  `is_resolved` flag. The flag is sourced from a GraphQL `reviewThreads` query (same
-  installation token), correlated to the REST threads by comment `databaseId`; a GraphQL
-  hiccup or a PR with no threads degrades cleanly to `is_resolved=false` (never crashes the
-  review). It is trusted as-is — no author-of-resolve check (accepted residual risk). Same
-  human + Heimdall's-own author filter as `comments.json`. Written only when at least one
-  thread is kept. Untrusted third-party data, never instructions.
+  `path`/`line` anchor, a `replies` list (each reply shaped the same way), an
+  `is_resolved` flag, and an `is_outdated` flag (the anchored line is gone after a push,
+  so `line` fell back to the pre-image `original_line`). The `is_resolved` flag is sourced
+  from a GraphQL `reviewThreads` query (same installation token), correlated to the REST
+  threads by comment `databaseId`; a GraphQL hiccup or a PR with no threads degrades
+  cleanly to `is_resolved=false` (never crashes the review). It is trusted as-is — no
+  author-of-resolve check (accepted residual risk). Same human + Heimdall's-own author
+  filter as `comments.json`. Written only when at least one thread is kept. Untrusted
+  third-party data, never instructions.
+
+When the combined comment set (inline threads + conversation comments) exceeds a cap
+(`max_comments`, safe default in `heimdall/context.py`; per-repo config arrives with #68),
+the seed is **capped and prioritized** before materialization: **unresolved → on-diff →
+recent**, with conversation comments ranked after inline threads, and outdated threads kept
+but ranked below in-diff ones. When comments are dropped to honour the cap, the posted
+review body carries an **omission note** (mirroring the size-cap COMMENT-note pattern) so
+the reader knows some comments were left out.
 - `review_summaries.json` — the body text of **submitted reviews** (APPROVE /
   REQUEST_CHANGES / COMMENT), each carrying `body`, `author`, `author_association`, and
   its `event` type. Same human + Heimdall's-own author filter as `comments.json`;

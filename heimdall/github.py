@@ -72,22 +72,27 @@ def _shape_inline_comment(raw: dict[str, Any]) -> dict[str, Any]:
     Builds on :func:`_shape_comment` (``body``/``author``/``author_association``) and
     adds the line anchor a thread needs: the ``path`` the comment is attached to and the
     ``line`` it points at — ``line`` is the comment's current line, falling back to the
-    pre-image ``original_line`` for comments on an outdated diff hunk.  Like
-    :func:`_shape_comment`, every other (potentially large or sensitive) API field is
-    dropped.
+    pre-image ``original_line`` for comments on an outdated diff hunk.  An ``is_outdated``
+    flag records that fallback: a comment whose current ``line`` is gone (a push moved or
+    removed the hunk) is outdated, so downstream prioritization can keep it but rank it
+    below comments still anchored on the live diff.  Like :func:`_shape_comment`, every
+    other (potentially large or sensitive) API field is dropped.
 
     Args:
         raw: A single comment object from the pulls review-comments REST endpoint.
 
     Returns:
-        A dict with ``body``, ``author``, ``author_association``, ``path``, and ``line``.
+        A dict with ``body``, ``author``, ``author_association``, ``path``, ``line``, and
+        ``is_outdated``.
     """
     shaped = _shape_comment(raw)
     line = raw.get("line")
-    if line is None:
+    is_outdated = line is None
+    if is_outdated:
         line = raw.get("original_line")
     shaped["path"] = str(raw.get("path") or "")
     shaped["line"] = line
+    shaped["is_outdated"] = is_outdated
     return shaped
 
 
@@ -162,8 +167,8 @@ def group_review_comments_into_threads(
 
     Returns:
         One dict per thread: the shaped root fields (``body``/``author``/
-        ``author_association``/``path``/``line``) plus a ``replies`` list of shaped
-        replies and an ``is_resolved`` bool, in API (chronological) order.
+        ``author_association``/``path``/``line``/``is_outdated``) plus a ``replies`` list
+        of shaped replies and an ``is_resolved`` bool, in API (chronological) order.
     """
     resolution = resolution_by_comment_id or {}
     threads_by_id: dict[int, dict[str, Any]] = {}
@@ -709,8 +714,8 @@ class GitHubClient:
 
         Returns:
             One dict per thread with ``body``, ``author`` (login), ``author_association``,
-            ``path``, ``line``, and a ``replies`` list (each reply shaped the same way),
-            in API (chronological) order.
+            ``path``, ``line``, ``is_outdated``, and a ``replies`` list (each reply shaped
+            the same way), in API (chronological) order.
         """
         url: str | None = (
             f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/comments"

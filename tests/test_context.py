@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from heimdall.context import PRContext, assemble_pr_context
+from heimdall.context import PRContext, assemble_pr_context, prioritize_comments
 from heimdall.context_cli import (
     cmd_comments,
     cmd_diff,
@@ -594,6 +594,137 @@ async def test_assemble_pr_context_no_comments_writes_no_file() -> None:
         )
         assert ctx.comments == []
         assert not (Path(tmp_dir) / "comments.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# prioritize_comments: cap + prioritization of the comment payload
+# ---------------------------------------------------------------------------
+
+
+def _thread(
+    body: str, *, is_resolved: bool = False, is_outdated: bool = False
+) -> dict[str, Any]:
+    """Build a minimal inline-thread dict for prioritization tests."""
+    return {
+        "body": body,
+        "author": "reviewer",
+        "author_association": "MEMBER",
+        "path": "foo.py",
+        "line": 2,
+        "replies": [],
+        "is_resolved": is_resolved,
+        "is_outdated": is_outdated,
+    }
+
+
+def _conv(body: str) -> dict[str, Any]:
+    """Build a minimal conversation-comment dict for prioritization tests."""
+    return {"body": body, "author": "octocat", "author_association": "OWNER"}
+
+
+def test_prioritize_comments_under_cap_keeps_all_no_truncation() -> None:
+    """Under the cap everything survives and nothing is reported truncated."""
+    threads = [_thread("t1"), _thread("t2")]
+    comments = [_conv("c1")]
+    kept_threads, kept_comments, truncated = prioritize_comments(
+        review_threads=threads, comments=comments, max_comments=10
+    )
+    assert kept_threads == threads
+    assert kept_comments == comments
+    assert truncated is False
+
+
+def test_prioritize_comments_over_cap_truncates_and_flags() -> None:
+    """Over the cap only the top-priority items survive and truncation is flagged."""
+    threads = [_thread(f"t{i}") for i in range(5)]
+    comments = [_conv("c1")]
+    kept_threads, kept_comments, truncated = prioritize_comments(
+        review_threads=threads, comments=comments, max_comments=2
+    )
+    assert len(kept_threads) + len(kept_comments) == 2
+    assert truncated is True
+
+
+def test_prioritize_comments_ranks_inline_threads_before_conversation() -> None:
+    """When capping, inline threads are kept before conversation comments."""
+    threads = [_thread("inline")]
+    comments = [_conv("conv")]
+    kept_threads, kept_comments, _ = prioritize_comments(
+        review_threads=threads, comments=comments, max_comments=1
+    )
+    assert kept_threads == [_thread("inline")]
+    assert kept_comments == []
+
+
+def test_prioritize_comments_unresolved_before_resolved() -> None:
+    """Unresolved threads outrank resolved ones when the cap forces a choice."""
+    resolved = _thread("resolved", is_resolved=True)
+    unresolved = _thread("unresolved", is_resolved=False)
+    kept_threads, _, truncated = prioritize_comments(
+        review_threads=[resolved, unresolved], comments=[], max_comments=1
+    )
+    assert kept_threads == [unresolved]
+    assert truncated is True
+
+
+def test_prioritize_comments_outdated_ranked_below_in_diff() -> None:
+    """Outdated inline threads are included but rank below in-diff ones."""
+    in_diff = _thread("in_diff", is_outdated=False)
+    outdated = _thread("outdated", is_outdated=True)
+    kept_threads, _, truncated = prioritize_comments(
+        review_threads=[outdated, in_diff], comments=[], max_comments=1
+    )
+    assert kept_threads == [in_diff]
+    assert truncated is True
+
+
+def test_prioritize_comments_recent_before_older_within_tier() -> None:
+    """Within the same priority tier, more recent (later in API order) ranks higher."""
+    older = _thread("older")
+    newer = _thread("newer")
+    kept_threads, _, _ = prioritize_comments(
+        review_threads=[older, newer], comments=[], max_comments=1
+    )
+    assert kept_threads == [newer]
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_caps_comments_and_flags_truncation() -> None:
+    """assemble_pr_context caps the payload and records truncation on the context."""
+    threads = [_thread(f"t{i}") for i in range(4)]
+    comments = [_conv(f"c{i}") for i in range(4)]
+    mock_client = _make_mock_github_client(
+        review_threads=threads, comments=comments
+    )
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            max_comments=3,
+        )
+    assert len(ctx.review_threads) + len(ctx.comments) == 3
+    assert ctx.comments_truncated is True
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_under_cap_no_truncation_flag() -> None:
+    """Under the cap the full payload survives and truncation is not flagged."""
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            max_comments=100,
+        )
+    assert ctx.comments == _COMMENTS
+    assert ctx.review_threads == _REVIEW_THREADS
+    assert ctx.comments_truncated is False
 
 
 def test_cmd_comments_prints_materialized_comments(

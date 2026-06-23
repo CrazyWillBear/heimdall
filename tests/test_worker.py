@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import ExitStack
+from dataclasses import replace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -876,6 +877,39 @@ async def test_partial_lens_failure_surfaces_dropped_lens_in_body() -> None:
     assert "security" in body
     assert "skipped" in body.lower()
     assert "no concerns found across any lens" in body
+
+
+@pytest.mark.asyncio
+async def test_build_inline_split_notes_comment_truncation_in_body() -> None:
+    """A truncated comment set surfaces an omission note in the posted body."""
+    from heimdall.worker import _build_inline_split
+
+    mock_gh_client = _gh_client()
+    synthesis = _synthesis_from([])
+    synthesis = replace(synthesis, comments_truncated=True)
+
+    body, _ = await _build_inline_split(
+        mock_gh_client, synthesis, repo_full_name=_REPO, pr_number=_PR
+    )
+
+    assert "omitted" in body
+    # The original synthesis body is preserved below the note.
+    assert "no concerns found across any lens" in body
+
+
+@pytest.mark.asyncio
+async def test_build_inline_split_no_note_when_not_truncated() -> None:
+    """An untruncated comment set leaves no omission note in the body."""
+    from heimdall.worker import _build_inline_split
+
+    mock_gh_client = _gh_client()
+    synthesis = _synthesis_from([])
+
+    body, _ = await _build_inline_split(
+        mock_gh_client, synthesis, repo_full_name=_REPO, pr_number=_PR
+    )
+
+    assert "omitted" not in body
 
 
 # ---------------------------------------------------------------------------

@@ -27,6 +27,85 @@ from heimdall.repo_config import _DEFAULT_DOCS
 
 logger = logging.getLogger(__name__)
 
+# Safe, non-unbounded default ceiling on how many comments (inline threads +
+# conversation comments combined) enter the seed.  Matches the guardrail-caps
+# convention that every cap has a sensible default; #68 wires the per-repo
+# configured value through ``assemble_pr_context(max_comments=...)``.
+DEFAULT_MAX_COMMENTS = 50
+
+
+def prioritize_comments(
+    *,
+    review_threads: list[dict[str, Any]],
+    comments: list[dict[str, Any]],
+    max_comments: int = DEFAULT_MAX_COMMENTS,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """Cap and prioritize the comment payload that enters the seed.
+
+    When the combined count of inline review threads and conversation comments
+    exceeds ``max_comments``, only the top-priority items are kept.  Priority,
+    highest first:
+
+    1. Inline ``review_threads`` rank ahead of conversation ``comments``.
+    2. Within threads: **unresolved -> on-diff -> recent**.  An outdated thread
+       (its anchored line gone after a push, ``is_outdated``) is kept but ranked
+       below an in-diff one, so a live-diff comment is never dropped in favour of
+       a stale one.  "Recent" breaks ties: later in API (chronological) order wins.
+    3. Conversation comments are ranked after every thread, most recent first.
+
+    The original relative order of the kept items is preserved within each source
+    (threads keep API order, comments keep API order) so the materialized payload
+    and the prompt read naturally; only *which* items survive is reprioritized.
+
+    Args:
+        review_threads: Inline review threads (already shaped/grouped), API order.
+        comments: Conversation comments (already shaped), API order.
+        max_comments: Combined ceiling on kept items; the safe default applies
+            when the caller passes none.
+
+    Returns:
+        ``(kept_threads, kept_comments, truncated)`` — the surviving threads and
+        comments (each in their original API order) and a ``truncated`` flag that
+        is True when at least one comment was dropped to honour the cap.
+    """
+    total = len(review_threads) + len(comments)
+    if total <= max_comments:
+        return review_threads, comments, False
+
+    # Rank threads worst-droppable-last: unresolved before resolved, in-diff before
+    # outdated, then most-recent (later API index) first.  Conversation comments rank
+    # after all threads; recency (later index first) orders them.  Indices are carried
+    # so the kept set can be restored to its original API order afterwards.
+    ranked: list[tuple[tuple[int, int, int], int, str, dict[str, Any]]] = []
+    for index, thread in enumerate(review_threads):
+        key = (
+            1 if thread.get("is_resolved") else 0,
+            1 if thread.get("is_outdated") else 0,
+            -index,
+        )
+        ranked.append((key, index, "thread", thread))
+    # Conversation comments sort after every thread regardless of their own fields,
+    # so a leading ``2`` in the primary key parks them below the threads' ``0``/``1``.
+    for index, comment in enumerate(comments):
+        ranked.append(((2, 0, -index), index, "comment", comment))
+
+    ranked.sort(key=lambda item: item[0])
+    survivors = ranked[:max_comments]
+
+    kept_threads = [
+        (idx, item) for _, idx, kind, item in survivors if kind == "thread"
+    ]
+    kept_comments = [
+        (idx, item) for _, idx, kind, item in survivors if kind == "comment"
+    ]
+    kept_threads.sort(key=lambda pair: pair[0])
+    kept_comments.sort(key=lambda pair: pair[0])
+    return (
+        [item for _, item in kept_threads],
+        [item for _, item in kept_comments],
+        True,
+    )
+
 
 @dataclass(frozen=True)
 class PRContext:
@@ -65,6 +144,10 @@ class PRContext:
             — fetched BEFORE the across-push retire/delete step destroys it.  None when
             Heimdall has not reviewed this PR yet.  Untrusted-self continuity context,
             never an instruction.
+        comments_truncated: True when the combined comment set exceeded the cap and
+            lower-priority comments were dropped from ``comments``/``review_threads``
+            (see :func:`prioritize_comments`).  The worker surfaces this in the posted
+            review body so the reader knows some comments were omitted.
     """
 
     repo_full_name: str
@@ -85,6 +168,7 @@ class PRContext:
     review_threads: list[dict[str, Any]]
     review_summaries: list[dict[str, Any]]
     own_prior_review: dict[str, Any] | None
+    comments_truncated: bool = False
 
 
 async def assemble_pr_context(
@@ -96,6 +180,7 @@ async def assemble_pr_context(
     pr_number: int,
     workspace_dir: str | None = None,
     docs: list[str] | None = None,
+    max_comments: int = DEFAULT_MAX_COMMENTS,
 ) -> PRContext:
     """Assemble the seed context for a pull request.
 
@@ -122,6 +207,10 @@ async def assemble_pr_context(
             ``None`` uses the four built-in defaults; ``[]`` fetches no docs.  The
             worker passes the loaded ``config.docs`` (validated, from the trusted
             ref) so the list is trusted even though contents come from the head.
+        max_comments: Combined ceiling on inline threads + conversation comments
+            materialized into the seed; over it the set is capped and prioritized via
+            :func:`prioritize_comments` and ``comments_truncated`` is set.  Defaults to
+            :data:`DEFAULT_MAX_COMMENTS`; #68 passes the per-repo configured value here.
 
     Returns:
         The assembled PRContext with all seed fields populated.
@@ -156,6 +245,15 @@ async def assemble_pr_context(
     finally:
         await github.aclose()
 
+    # Cap + prioritize before the payload enters the seed: when the comment set
+    # exceeds max_comments, only the top-priority items are materialized and the
+    # truncation is recorded so the worker can note it in the posted review body.
+    review_threads, comments, comments_truncated = prioritize_comments(
+        review_threads=review_threads,
+        comments=comments,
+        max_comments=max_comments,
+    )
+
     ctx = PRContext(
         repo_full_name=repo_full_name,
         pr_number=pr_number,
@@ -175,6 +273,7 @@ async def assemble_pr_context(
         review_threads=review_threads,
         review_summaries=review_summaries,
         own_prior_review=own_prior_review,
+        comments_truncated=comments_truncated,
     )
 
     if workspace_dir is not None:

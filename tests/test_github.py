@@ -460,6 +460,7 @@ async def test_get_pr_review_comments_hits_pulls_comments_endpoint() -> None:
             "author_association": "CONTRIBUTOR",
             "path": "foo.py",
             "line": 3,
+            "is_outdated": False,
             "replies": [],
             "is_resolved": False,
         }
@@ -562,6 +563,29 @@ async def test_get_pr_review_comments_falls_back_to_original_line() -> None:
         )
 
     assert threads[0]["line"] == 9
+    # The line fell back to original_line, so the thread is flagged outdated.
+    assert threads[0]["is_outdated"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_live_thread_not_outdated() -> None:
+    """A comment with a current ``line`` is not flagged outdated."""
+    mock_http = _single_page(
+        [_review_comment(body="live", login="alice", comment_id=1, line=4)]
+    )
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert threads[0]["line"] == 4
+    assert threads[0]["is_outdated"] is False
 
 
 @pytest.mark.asyncio

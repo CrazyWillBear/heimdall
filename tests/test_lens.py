@@ -29,6 +29,7 @@ from heimdall.lens import (
     build_claude_argv,
     format_review_body,
     parse_findings,
+    render_comments_truncated_note,
     render_dropped_lenses_warning,
     run_lens,
     run_synthesis,
@@ -659,3 +660,13 @@ def test_render_dropped_lenses_warning_names_multiple_lenses() -> None:
     assert "design" in banner
     assert "2 review lenses" in banner
     assert "were skipped" in banner
+
+
+def test_render_comments_truncated_note_empty_when_not_truncated() -> None:
+    assert render_comments_truncated_note(False) == ""
+
+
+def test_render_comments_truncated_note_present_when_truncated() -> None:
+    note = render_comments_truncated_note(True)
+    assert note != ""
+    assert "omitted" in note

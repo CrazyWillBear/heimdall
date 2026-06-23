@@ -102,6 +102,7 @@ from heimdall.lens import (
     LensResult,
     SandboxError,
     SynthesisResult,
+    render_comments_truncated_note,
     render_dropped_lenses_warning,
     run_lens,
     run_synthesis,
@@ -562,9 +563,14 @@ async def _build_inline_split(
     commentable = commentable_lines(diff)
     inline, body_findings = split_findings(synthesis.tagged_findings, commentable)
     body = render_body_for_offdiff(body_findings)
-    warning = render_dropped_lenses_warning(synthesis.dropped_lenses)
-    if warning:
-        body = f"{warning}\n\n{body}"
+    # Mirror the dropped-lenses banner: prepend any guardrail notes so the reader sees
+    # what this review did NOT cover before the findings themselves.
+    for note in (
+        render_dropped_lenses_warning(synthesis.dropped_lenses),
+        render_comments_truncated_note(synthesis.comments_truncated),
+    ):
+        if note:
+            body = f"{note}\n\n{body}"
     return body, build_inline_comments(inline)
 
 
@@ -714,6 +720,7 @@ async def _synthesize_review(
             review_threads=pr_context.review_threads,
             review_summaries=pr_context.review_summaries,
             own_prior_review=pr_context.own_prior_review,
+            comments_truncated=pr_context.comments_truncated,
             claude_binary=ctx.get("claude_binary", "claude"),
             token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
             timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
