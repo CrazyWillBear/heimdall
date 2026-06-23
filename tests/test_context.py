@@ -802,6 +802,30 @@ async def test_assemble_pr_context_toggle_on_still_fetches_comments() -> None:
     assert ctx.comments == _COMMENTS
 
 
+@pytest.mark.asyncio
+async def test_assemble_pr_context_incorporating_fetches_all_eight_sources() -> None:
+    """The incorporating path fetches each of the eight client sources exactly once."""
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    # The four core PR-data sources.
+    mock_client.get_pr.assert_called_once()
+    mock_client.get_pr_diff.assert_called_once()
+    mock_client.get_pr_files.assert_called_once()
+    mock_client.get_linked_issues.assert_called_once()
+    # The four comment sources.
+    mock_client.get_pr_conversation_comments.assert_called_once()
+    mock_client.get_pr_review_comments.assert_called_once()
+    mock_client.get_pr_review_summaries.assert_called_once()
+    mock_client.get_own_prior_review.assert_called_once()
+
+
 def test_cmd_comments_prints_materialized_comments(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

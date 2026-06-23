@@ -229,26 +229,17 @@ async def assemble_pr_context(
         installation_id=installation_id,
     )
     try:
-        (
-            pr_meta,
-            diff,
-            files,
-            linked,
-            comments,
-            review_threads,
-            review_summaries,
-            own_prior_review,
-        ) = await _fetch_pr_data(
+        fetched = await _fetch_pr_data(
             github,
             repo_full_name=repo_full_name,
             pr_number=pr_number,
             incorporate_comments=incorporate_comments,
         )
-        head_sha = pr_meta["head"]["sha"]
+        head_sha = fetched.pr_meta["head"]["sha"]
         file_contents, fetched_docs = await _fetch_file_contents_and_docs(
             github,
             repo_full_name=repo_full_name,
-            files=files,
+            files=fetched.files,
             ref=head_sha,
             doc_names=doc_names,
         )
@@ -258,31 +249,31 @@ async def assemble_pr_context(
     # Cap + prioritize before the payload enters the seed: when the comment set
     # exceeds max_comments, only the top-priority items are materialized and the
     # truncation is recorded so the worker can note it in the posted review body.
-    review_threads, comments, comments_truncated = prioritize_comments(
-        review_threads=review_threads,
-        comments=comments,
+    kept_threads, kept_comments, comments_truncated = prioritize_comments(
+        review_threads=fetched.review_threads,
+        comments=fetched.comments,
         max_comments=max_comments,
     )
 
     ctx = PRContext(
         repo_full_name=repo_full_name,
         pr_number=pr_number,
-        title=pr_meta["title"],
-        body=pr_meta.get("body") or "",
-        author=pr_meta["user"]["login"],
-        base_sha=pr_meta["base"]["sha"],
+        title=fetched.pr_meta["title"],
+        body=fetched.pr_meta.get("body") or "",
+        author=fetched.pr_meta["user"]["login"],
+        base_sha=fetched.pr_meta["base"]["sha"],
         head_sha=head_sha,
-        base_ref=pr_meta["base"]["ref"],
-        head_ref=pr_meta["head"]["ref"],
-        linked_issues=linked,
-        diff=diff,
-        changed_files=files,
+        base_ref=fetched.pr_meta["base"]["ref"],
+        head_ref=fetched.pr_meta["head"]["ref"],
+        linked_issues=fetched.linked,
+        diff=fetched.diff,
+        changed_files=fetched.files,
         file_contents=file_contents,
         docs=fetched_docs,
-        comments=comments,
-        review_threads=review_threads,
-        review_summaries=review_summaries,
-        own_prior_review=own_prior_review,
+        comments=kept_comments,
+        review_threads=kept_threads,
+        review_summaries=fetched.review_summaries,
+        own_prior_review=fetched.own_prior_review,
         comments_truncated=comments_truncated,
     )
 
@@ -299,22 +290,32 @@ async def assemble_pr_context(
     return ctx
 
 
+@dataclass(frozen=True)
+class _FetchResult:
+    """Bundled result of the parallel PR-data + comment-source fetches.
+
+    Named fields replace the prior positional 8-tuple so adding or reordering a
+    source can't silently shift the caller's bindings.  When the comment toggle
+    is off, the four comment fields carry empty values.
+    """
+
+    pr_meta: dict[str, Any]
+    diff: str
+    files: list[dict[str, Any]]
+    linked: list[dict[str, Any]]
+    comments: list[dict[str, Any]]
+    review_threads: list[dict[str, Any]]
+    review_summaries: list[dict[str, Any]]
+    own_prior_review: dict[str, Any] | None
+
+
 async def _fetch_pr_data(
     github: GitHubClient,
     *,
     repo_full_name: str,
     pr_number: int,
     incorporate_comments: bool = True,
-) -> tuple[
-    dict[str, Any],
-    str,
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    dict[str, Any] | None,
-]:
+) -> _FetchResult:
     """Fetch PR metadata, diff, files, linked issues, and all comment sources in parallel.
 
     Heimdall's own prior review is fetched HERE (during seed assembly) so it is read
@@ -328,8 +329,10 @@ async def _fetch_pr_data(
     pre-feature behavior (per-repo toggle off, #68).
 
     Returns:
-        (pr_metadata, diff_text, changed_files, linked_issues, conversation_comments,
-        review_threads, review_summaries, own_prior_review)
+        A :class:`_FetchResult` whose ``pr_meta``/``diff``/``files``/``linked`` fields
+        carry the core PR data and whose ``comments``/``review_threads``/
+        ``review_summaries``/``own_prior_review`` fields carry the comment sources
+        (empty / ``None`` when ``incorporate_comments`` is False).
     """
     import asyncio
 
@@ -345,23 +348,29 @@ async def _fetch_pr_data(
     linked_task = asyncio.create_task(
         github.get_linked_issues(repo_full_name=repo_full_name, pr_number=pr_number)
     )
-    # All tasks are already scheduled (create_task) so they run concurrently.  Gather in
-    # groups of <= six: asyncio.gather's typed overloads stop at six awaitables and
-    # would erase the per-task result types past that arity, so a single eight-way gather
-    # loses precise typing.  Both groups await tasks that are already running, so the
-    # concurrency is unchanged; the first group's exception still propagates first.
-    pr_meta, diff, files, linked = await asyncio.gather(
-        pr_meta_task,
-        diff_task,
-        files_task,
-        linked_task,
-    )
 
     if not incorporate_comments:
-        # Comment incorporation disabled for this repo: skip every comment source so
-        # nothing is fetched/materialized and the seed matches pre-feature behavior.
-        return pr_meta, diff, files, linked, [], [], [], None
+        # Comment incorporation disabled for this repo: never create the comment tasks,
+        # so nothing is fetched/materialized and the seed matches pre-feature behavior.
+        pr_meta, diff, files, linked = await asyncio.gather(
+            pr_meta_task,
+            diff_task,
+            files_task,
+            linked_task,
+        )
+        return _FetchResult(
+            pr_meta=pr_meta,
+            diff=diff,
+            files=files,
+            linked=linked,
+            comments=[],
+            review_threads=[],
+            review_summaries=[],
+            own_prior_review=None,
+        )
 
+    # Schedule all four comment tasks UP FRONT, before either gather awaits, so every
+    # one of the eight sources is in flight concurrently.
     comments_task = asyncio.create_task(
         github.get_pr_conversation_comments(
             repo_full_name=repo_full_name, pr_number=pr_number
@@ -382,21 +391,32 @@ async def _fetch_pr_data(
             repo_full_name=repo_full_name, pr_number=pr_number
         )
     )
+
+    # Gather in two groups of four purely for typing: asyncio.gather's typed overloads
+    # stop at six awaitables, so a single eight-way gather would erase the per-task
+    # result types.  Both gathers await tasks that are already running, so the split
+    # does not serialize the fetches; the first group's exception still propagates first.
+    pr_meta, diff, files, linked = await asyncio.gather(
+        pr_meta_task,
+        diff_task,
+        files_task,
+        linked_task,
+    )
     comments, review_threads, review_summaries, own_prior_review = await asyncio.gather(
         comments_task,
         review_threads_task,
         review_summaries_task,
         own_prior_task,
     )
-    return (
-        pr_meta,
-        diff,
-        files,
-        linked,
-        comments,
-        review_threads,
-        review_summaries,
-        own_prior_review,
+    return _FetchResult(
+        pr_meta=pr_meta,
+        diff=diff,
+        files=files,
+        linked=linked,
+        comments=comments,
+        review_threads=review_threads,
+        review_summaries=review_summaries,
+        own_prior_review=own_prior_review,
     )
 
 
