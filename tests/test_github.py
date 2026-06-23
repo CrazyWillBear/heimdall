@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs
 
 import httpx
 import pytest
 
-from heimdall.github import GitHubClient, make_jwt, parse_linked_issues_from_body
+from heimdall.github import (
+    _MAX_COMMENT_PAGES,
+    GitHubClient,
+    make_jwt,
+    parse_linked_issues_from_body,
+)
 
 
 def test_make_jwt_returns_string() -> None:
@@ -779,6 +785,207 @@ async def test_get_review_thread_resolutions_follows_graphql_pagination() -> Non
     assert resolutions == {1: True, 2: False}
     # The second page passed the endCursor from page one.
     assert mock_http.post.call_args_list[1][1]["json"]["variables"]["after"] == "CURSOR1"
+
+
+# ---------------------------------------------------------------------------
+# Comment/review pagination page ceiling (_MAX_COMMENT_PAGES): an attacker-
+# influenceable PR with a pathologically large discussion can't drive unbounded
+# pagination. Each loop stops at the ceiling and logs a truncation WARNING.
+# ---------------------------------------------------------------------------
+
+
+def _perpetual_next_get() -> tuple[AsyncMock, list[int]]:
+    """Build a GET mock that ALWAYS returns one row with a perpetual rel="next" link.
+
+    Returns the mock alongside a one-element call counter (``calls[0]``). The Link
+    header never terminates, so a loop with no ceiling would never stop — the ceiling
+    must cap the GET count at ``_MAX_COMMENT_PAGES``.
+    """
+    calls = [0]
+
+    async def _get(url: str, **_kwargs: object) -> MagicMock:
+        calls[0] += 1
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value=[{"id": calls[0]}])
+        resp.headers = {
+            "link": '<https://api.github.com/next>; rel="next"'
+        }
+        return resp
+
+    mock_get = AsyncMock(side_effect=_get)
+    return mock_get, calls
+
+
+@pytest.mark.asyncio
+async def test_get_pr_conversation_comments_stops_at_page_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A never-ending next-link is bounded at _MAX_COMMENT_PAGES with a WARNING."""
+    mock_get, calls = _perpetual_next_get()
+    mock_http = AsyncMock()
+    mock_http.get = mock_get
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        with caplog.at_level(logging.WARNING):
+            rows = await client.get_pr_conversation_comments(
+                repo_full_name="owner/repo", pr_number=5
+            )
+
+    assert calls[0] == _MAX_COMMENT_PAGES
+    assert len(rows) == _MAX_COMMENT_PAGES
+    assert any(
+        "ceiling" in r.message and "get_pr_conversation_comments" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_stops_at_page_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The inline-comment fetch is bounded at the ceiling, then groups what it has."""
+    mock_get, calls = _perpetual_next_get()
+    mock_http = AsyncMock()
+    mock_http.get = mock_get
+    # The trailing resolutions GraphQL call must still succeed (empty threads).
+    mock_http.post = AsyncMock(return_value=_graphql_threads_response([]))
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        with caplog.at_level(logging.WARNING):
+            await client.get_pr_review_comments(
+                repo_full_name="owner/repo", pr_number=5
+            )
+
+    assert calls[0] == _MAX_COMMENT_PAGES
+    assert any(
+        "ceiling" in r.message and "get_pr_review_comments" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_pr_reviews_stops_at_page_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The submitted-reviews fetch is bounded at the ceiling (via the public path)."""
+    mock_get, calls = _perpetual_next_get()
+    mock_http = AsyncMock()
+    mock_http.get = mock_get
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        with caplog.at_level(logging.WARNING):
+            await client.get_pr_review_summaries(
+                repo_full_name="owner/repo", pr_number=5
+            )
+
+    assert calls[0] == _MAX_COMMENT_PAGES
+    assert any(
+        "ceiling" in r.message and "_list_pr_reviews" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_review_comments_stops_at_page_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The per-review inline-comment fetch is bounded at the ceiling with a WARNING."""
+    mock_get, calls = _perpetual_next_get()
+    mock_http = AsyncMock()
+    mock_http.get = mock_get
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        with caplog.at_level(logging.WARNING):
+            rows = await client.list_review_comments(
+                repo_full_name="owner/repo", pr_number=5, review_id=77
+            )
+
+    assert calls[0] == _MAX_COMMENT_PAGES
+    assert len(rows) == _MAX_COMMENT_PAGES
+    assert any(
+        "ceiling" in r.message and "list_review_comments" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_review_thread_resolutions_stops_at_page_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A never-ending GraphQL pageInfo is bounded at the ceiling with a WARNING."""
+    calls = [0]
+
+    async def _post(url: str, **_kwargs: object) -> MagicMock:
+        calls[0] += 1
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(
+            return_value={
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "nodes": [
+                                    {
+                                        "isResolved": True,
+                                        "comments": {
+                                            "nodes": [{"databaseId": calls[0]}]
+                                        },
+                                    }
+                                ],
+                                "pageInfo": {
+                                    "hasNextPage": True,
+                                    "endCursor": "CURSOR",
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        return resp
+
+    mock_http = AsyncMock()
+    mock_http.post = AsyncMock(side_effect=_post)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        with caplog.at_level(logging.WARNING):
+            resolutions = await client.get_review_thread_resolutions(
+                repo_full_name="owner/repo", pr_number=5
+            )
+
+    assert calls[0] == _MAX_COMMENT_PAGES
+    assert resolutions
+    assert any(
+        "ceiling" in r.message and "get_review_thread_resolutions" in r.message
+        for r in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------

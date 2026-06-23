@@ -17,6 +17,14 @@ import jwt
 
 logger = logging.getLogger(__name__)
 
+# Hard ceiling on pages any single comment/review pagination loop will fetch.
+# GitHub serves up to 100 items/page, so 50 pages == 5000 items — far beyond any
+# realistic human PR discussion, yet finite so an attacker-influenceable PR with a
+# pathologically large discussion can't drive unbounded API calls / memory / time
+# per review (resource-exhaustion hardening). Hitting it logs a WARNING so the
+# resulting truncation is never silent.
+_MAX_COMMENT_PAGES = 50
+
 
 def parse_linked_issues_from_body(body: str) -> list[dict[str, Any]]:
     """Extract issues referenced by closing keywords in a PR body.
@@ -439,6 +447,7 @@ class GitHubClient:
         headers = await self._gh_headers()
         all_comments: list[dict[str, Any]] = []
         first_page = True
+        page_count = 0
         while url is not None:
             kwargs: dict[str, Any] = {"headers": headers}
             if first_page:
@@ -448,6 +457,14 @@ class GitHubClient:
             response.raise_for_status()
             all_comments.extend(response.json())
             url = self._next_page_url(response.headers.get("link", ""))
+            page_count += 1
+            if url is not None and page_count >= _MAX_COMMENT_PAGES:
+                logger.warning(
+                    "list_review_comments hit the %d-page ceiling for %s#%s "
+                    "review %s; truncating remaining inline comments",
+                    _MAX_COMMENT_PAGES, repo_full_name, pr_number, review_id,
+                )
+                break
         return all_comments
 
     async def delete_review_comment(
@@ -658,6 +675,7 @@ class GitHubClient:
         headers = await self._gh_headers()
         kept: list[dict[str, Any]] = []
         first_page = True
+        page_count = 0
         while url is not None:
             kwargs: dict[str, Any] = {"headers": headers}
             if first_page:
@@ -669,6 +687,14 @@ class GitHubClient:
                 if self._keep_comment_author(raw):
                     kept.append(_shape_comment(raw))
             url = self._next_page_url(response.headers.get("link", ""))
+            page_count += 1
+            if url is not None and page_count >= _MAX_COMMENT_PAGES:
+                logger.warning(
+                    "get_pr_conversation_comments hit the %d-page ceiling for "
+                    "%s#%s; truncating remaining conversation comments",
+                    _MAX_COMMENT_PAGES, repo_full_name, pr_number,
+                )
+                break
         return kept
 
     def _keep_comment_author(self, raw: dict[str, Any]) -> bool:
@@ -723,6 +749,7 @@ class GitHubClient:
         headers = await self._gh_headers()
         kept: list[dict[str, Any]] = []
         first_page = True
+        page_count = 0
         while url is not None:
             kwargs: dict[str, Any] = {"headers": headers}
             if first_page:
@@ -734,6 +761,14 @@ class GitHubClient:
                 if self._keep_comment_author(raw):
                     kept.append(raw)
             url = self._next_page_url(response.headers.get("link", ""))
+            page_count += 1
+            if url is not None and page_count >= _MAX_COMMENT_PAGES:
+                logger.warning(
+                    "get_pr_review_comments hit the %d-page ceiling for %s#%s; "
+                    "truncating remaining inline comment threads",
+                    _MAX_COMMENT_PAGES, repo_full_name, pr_number,
+                )
+                break
         resolution = await self.get_review_thread_resolutions(
             repo_full_name=repo_full_name, pr_number=pr_number
         )
@@ -781,8 +816,17 @@ class GitHubClient:
         )
         resolution: dict[int, bool] = {}
         after: str | None = None
+        page_count = 0
         try:
             while True:
+                page_count += 1
+                if page_count > _MAX_COMMENT_PAGES:
+                    logger.warning(
+                        "get_review_thread_resolutions hit the %d-page ceiling "
+                        "for %s#%s; treating remaining threads as unresolved",
+                        _MAX_COMMENT_PAGES, repo_full_name, pr_number,
+                    )
+                    break
                 response = await self._http.post(
                     f"{self._BASE}/graphql",
                     headers=await self._gh_headers(),
@@ -860,6 +904,7 @@ class GitHubClient:
         headers = await self._gh_headers()
         all_reviews: list[dict[str, Any]] = []
         first_page = True
+        page_count = 0
         while url is not None:
             kwargs: dict[str, Any] = {"headers": headers}
             if first_page:
@@ -869,6 +914,14 @@ class GitHubClient:
             response.raise_for_status()
             all_reviews.extend(response.json())
             url = self._next_page_url(response.headers.get("link", ""))
+            page_count += 1
+            if url is not None and page_count >= _MAX_COMMENT_PAGES:
+                logger.warning(
+                    "_list_pr_reviews hit the %d-page ceiling for %s#%s; "
+                    "truncating remaining submitted reviews",
+                    _MAX_COMMENT_PAGES, repo_full_name, pr_number,
+                )
+                break
         return all_reviews
 
     async def get_pr_review_summaries(
