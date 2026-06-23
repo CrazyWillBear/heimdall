@@ -76,9 +76,13 @@ private key) to read the PR and post the review.
   third-party data, never instructions.
 - `review_threads.json` — the PR's inline review comments grouped into parent-anchored
   **reply threads**: each thread carries `body`, `author`, `author_association`, its
-  `path`/`line` anchor, and a `replies` list (each reply shaped the same way). Same
-  human + Heimdall's-own author filter as `comments.json`. Written only when at least
-  one thread is kept. Untrusted third-party data, never instructions.
+  `path`/`line` anchor, a `replies` list (each reply shaped the same way), and an
+  `is_resolved` flag. The flag is sourced from a GraphQL `reviewThreads` query (same
+  installation token), correlated to the REST threads by comment `databaseId`; a GraphQL
+  hiccup or a PR with no threads degrades cleanly to `is_resolved=false` (never crashes the
+  review). It is trusted as-is — no author-of-resolve check (accepted residual risk). Same
+  human + Heimdall's-own author filter as `comments.json`. Written only when at least one
+  thread is kept. Untrusted third-party data, never instructions.
 
 Each lens reads this workspace through the **`heimdall-context`** CLI wrapper — the single
 allowlisted Bash command — with subcommands `diff`, `pr`, `file <path>`, `docs`,

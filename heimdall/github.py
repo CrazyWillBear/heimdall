@@ -7,12 +7,15 @@ fetching PR metadata, diffs, file lists, and file contents for seed-context asse
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from typing import Any
 
 import httpx
 import jwt
+
+logger = logging.getLogger(__name__)
 
 
 def parse_linked_issues_from_body(body: str) -> list[dict[str, Any]]:
@@ -90,6 +93,7 @@ def _shape_inline_comment(raw: dict[str, Any]) -> dict[str, Any]:
 
 def group_review_comments_into_threads(
     comments: list[dict[str, Any]],
+    resolution_by_comment_id: dict[int, bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Group flat inline review comments into parent-anchored reply threads.
 
@@ -100,29 +104,53 @@ def group_review_comments_into_threads(
     thread whose root id it answers.  A reply whose parent was dropped by author filtering
     is promoted to its own thread so its content is never silently lost.
 
+    Each thread also carries an ``is_resolved`` flag sourced from the GraphQL
+    ``reviewThreads`` resolution map (see :meth:`GitHubClient.get_review_thread_resolutions`):
+    a thread is resolved when ANY of its comment ids (root or reply) maps to ``True`` in
+    ``resolution_by_comment_id``.  A thread whose ids are absent from the map — an empty
+    map, a GraphQL hiccup, or a comment GraphQL did not return — defaults to ``False``
+    (unresolved), so resolution degrades cleanly and never crashes grouping.  The flag is
+    trusted as-is (no author-of-resolve check — accepted residual risk).
+
     Args:
         comments: Raw review-comment objects (already author-filtered), in API order.
+        resolution_by_comment_id: Optional map of REST comment id -> ``isResolved`` from
+            the GraphQL ``reviewThreads`` query.  ``None`` or empty leaves every thread
+            unresolved.
 
     Returns:
         One dict per thread: the shaped root fields (``body``/``author``/
         ``author_association``/``path``/``line``) plus a ``replies`` list of shaped
-        replies, in API (chronological) order.
+        replies and an ``is_resolved`` bool, in API (chronological) order.
     """
+    resolution = resolution_by_comment_id or {}
     threads_by_id: dict[int, dict[str, Any]] = {}
+    # Track the comment ids backing each thread so a reply's resolution can promote the
+    # whole thread to resolved even when the root comment id is absent from the map.
+    ids_by_thread: dict[int, set[int]] = {}
     ordered: list[dict[str, Any]] = []
     for raw in comments:
         parent_id = raw.get("in_reply_to_id")
         shaped = _shape_inline_comment(raw)
+        comment_id = raw.get("id")
         parent = threads_by_id.get(parent_id) if parent_id is not None else None
         if parent is not None:
             parent["replies"].append(shaped)
+            if isinstance(comment_id, int):
+                ids_by_thread[id(parent)].add(comment_id)
             continue
         # A root comment, or a reply whose parent was filtered out: start a new thread.
-        thread = {**shaped, "replies": []}
+        thread = {**shaped, "replies": [], "is_resolved": False}
         ordered.append(thread)
-        comment_id = raw.get("id")
+        thread_ids: set[int] = set()
+        ids_by_thread[id(thread)] = thread_ids
         if isinstance(comment_id, int):
             threads_by_id[comment_id] = thread
+            thread_ids.add(comment_id)
+
+    for thread in ordered:
+        thread_ids = ids_by_thread[id(thread)]
+        thread["is_resolved"] = any(resolution.get(cid, False) for cid in thread_ids)
     return ordered
 
 
@@ -659,7 +687,106 @@ class GitHubClient:
                 if self._keep_comment_author(raw):
                     kept.append(raw)
             url = self._next_page_url(response.headers.get("link", ""))
-        return group_review_comments_into_threads(kept)
+        resolution = await self.get_review_thread_resolutions(
+            repo_full_name=repo_full_name, pr_number=pr_number
+        )
+        return group_review_comments_into_threads(kept, resolution)
+
+    async def get_review_thread_resolutions(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> dict[int, bool]:
+        """Fetch each inline review thread's resolution state via GraphQL.
+
+        The REST review-comments endpoint (:meth:`get_pr_review_comments`) carries no
+        resolution signal, so this issues a GraphQL ``reviewThreads`` query — using the
+        same installation token (via :meth:`_gh_headers`) — to read each thread's
+        ``isResolved`` flag.  Each node exposes its comments' ``databaseId`` (the REST
+        comment id), so the returned map keys resolution by REST comment id, letting
+        :func:`group_review_comments_into_threads` correlate it to the REST threads.  The
+        query is paginated through ``reviewThreads.pageInfo`` so a PR with many threads is
+        fully covered.
+
+        The flag is trusted as-is — no check that the resolver was authorised (accepted
+        residual risk).  This is a **degrade-clean** read: a GraphQL ``errors`` payload, a
+        transport failure, or an unexpected shape returns whatever was collected so far
+        (often ``{}``) rather than raising, so resolution defaults to unresolved and never
+        crashes the review.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            A map of REST comment id -> ``isResolved`` for every thread comment seen.
+            Empty when the PR has no review threads or GraphQL was unavailable.
+        """
+        owner, _, name = repo_full_name.partition("/")
+        query = (
+            "query($owner: String!, $name: String!, $number: Int!, $after: String) {"
+            " repository(owner: $owner, name: $name) {"
+            " pullRequest(number: $number) {"
+            " reviewThreads(first: 100, after: $after) {"
+            " nodes { isResolved comments(first: 100) { nodes { databaseId } } }"
+            " pageInfo { hasNextPage endCursor } } } } }"
+        )
+        resolution: dict[int, bool] = {}
+        after: str | None = None
+        try:
+            while True:
+                response = await self._http.post(
+                    f"{self._BASE}/graphql",
+                    headers=await self._gh_headers(),
+                    json={
+                        "query": query,
+                        "variables": {
+                            "owner": owner,
+                            "name": name,
+                            "number": pr_number,
+                            "after": after,
+                        },
+                    },
+                )
+                response.raise_for_status()
+                payload: dict[str, Any] = response.json()
+                if payload.get("errors"):
+                    logger.warning(
+                        "GraphQL reviewThreads returned errors for %s#%s: %s; "
+                        "defaulting threads to unresolved",
+                        repo_full_name,
+                        pr_number,
+                        payload["errors"],
+                    )
+                    return resolution
+                threads = (
+                    payload.get("data", {})
+                    .get("repository", {})
+                    .get("pullRequest", {})
+                    .get("reviewThreads", {})
+                )
+                for node in threads.get("nodes", []):
+                    is_resolved = bool(node.get("isResolved", False))
+                    for comment in node.get("comments", {}).get("nodes", []):
+                        database_id = comment.get("databaseId")
+                        if isinstance(database_id, int):
+                            resolution[database_id] = is_resolved
+                page_info = threads.get("pageInfo", {})
+                if not page_info.get("hasNextPage"):
+                    break
+                after = page_info.get("endCursor")
+                if after is None:
+                    break
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            logger.warning(
+                "GraphQL reviewThreads fetch failed for %s#%s: %s; "
+                "defaulting threads to unresolved",
+                repo_full_name,
+                pr_number,
+                exc,
+            )
+        return resolution
 
     async def get_linked_issues(
         self,

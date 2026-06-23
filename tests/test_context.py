@@ -59,6 +59,7 @@ _REVIEW_THREADS = [
                 "line": 2,
             }
         ],
+        "is_resolved": True,
     }
 ]
 
@@ -644,6 +645,8 @@ def test_cmd_review_threads_prints_materialized_threads(
     captured = capsys.readouterr()
     printed = json.loads(captured.out)
     assert printed == _REVIEW_THREADS
+    # Each thread's resolution state round-trips through review_threads.json and the CLI.
+    assert printed[0]["is_resolved"] is True
 
 
 def test_main_review_threads_subcommand(

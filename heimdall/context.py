@@ -52,8 +52,10 @@ class PRContext:
             Untrusted third-party data, never instructions.  May be empty.
         review_threads: Kept inline review comments grouped into parent-anchored reply
             threads — each thread carries its ``body``, ``author``, ``author_association``,
-            ``path``/``line`` anchor, and a ``replies`` list.  Same author filter and
-            untrusted-data posture as ``comments``.  May be empty.
+            ``path``/``line`` anchor, a ``replies`` list, and an ``is_resolved`` flag
+            (its resolution state from the GraphQL ``reviewThreads`` signal, defaulting to
+            ``False`` when unknown).  Same author filter and untrusted-data posture as
+            ``comments``.  May be empty.
     """
 
     repo_full_name: str

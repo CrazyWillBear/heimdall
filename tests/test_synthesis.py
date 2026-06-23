@@ -288,6 +288,7 @@ async def test_run_synthesis_embeds_review_threads_as_untrusted_data() -> None:
                         "line": 12,
                     }
                 ],
+                "is_resolved": True,
             }
         ],
         claude_binary="claude",
@@ -305,6 +306,54 @@ async def test_run_synthesis_embeds_review_threads_as_untrusted_data() -> None:
     assert "review_threads" in prompt
     assert "inline review threads" in prompt
     assert "UNTRUSTED DATA" in prompt
+    # The per-thread resolution state reaches the prompt so the synthesizer (and the
+    # downstream suppression rule) can see which threads are resolved.
+    assert "is_resolved" in prompt
+    assert "resolved/unresolved" in prompt
+
+
+@pytest.mark.asyncio
+async def test_run_synthesis_prompt_shows_thread_resolution_state() -> None:
+    """A resolved and an unresolved thread surface distinct is_resolved values."""
+    captured: dict[str, Any] = {}
+
+    async def fake_invoker(
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
+    ) -> ClaudeResult:
+        captured["prompt"] = argv[argv.index("-p") + 1]
+        return ClaudeResult(stdout=json.dumps({"findings": []}), total_tokens=10)
+
+    await run_synthesis(
+        lens_results=[_lens_result("security", [_finding(Severity.LOW, "Nit")])],
+        review_threads=[
+            {
+                "body": "Resolved concern.",
+                "author": "rev",
+                "author_association": "MEMBER",
+                "path": "a.py",
+                "line": 1,
+                "replies": [],
+                "is_resolved": True,
+            },
+            {
+                "body": "Still open concern.",
+                "author": "rev",
+                "author_association": "MEMBER",
+                "path": "b.py",
+                "line": 2,
+                "replies": [],
+                "is_resolved": False,
+            },
+        ],
+        claude_binary="claude",
+        token_cap=400_000,
+        timeout_seconds=900,
+        invoker=fake_invoker,
+    )
+
+    prompt = captured["prompt"]
+    assert '"is_resolved": true' in prompt
+    assert '"is_resolved": false' in prompt
 
 
 @pytest.mark.asyncio
