@@ -43,6 +43,26 @@ def parse_linked_issues_from_body(body: str) -> list[dict[str, Any]]:
     return results
 
 
+def _shape_comment(raw: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a raw GitHub comment object to the fields the seed records.
+
+    Keeps only the ``body``, author ``login``, and ``author_association`` — the
+    minimum a downstream lens needs to weigh a conversation comment — and drops
+    every other (potentially large or sensitive) field from the API payload.
+
+    Args:
+        raw: A single comment object from the issues-comments REST endpoint.
+
+    Returns:
+        A dict with ``body``, ``author``, and ``author_association`` keys.
+    """
+    return {
+        "body": raw.get("body") or "",
+        "author": str((raw.get("user") or {}).get("login", "")),
+        "author_association": str(raw.get("author_association", "")),
+    }
+
+
 def _raise_with_body(response: httpx.Response) -> None:
     """Like ``response.raise_for_status()`` but include the response body in the error.
 
@@ -466,6 +486,66 @@ class GitHubClient:
             )
         raw: str = data["content"]
         return base64.b64decode(raw.replace("\n", "")).decode("utf-8")
+
+    async def get_pr_conversation_comments(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch the PR's conversation (timeline) comments, kept-author only.
+
+        Conversation comments are the issue-level comments on a PR (the timeline),
+        distinct from review/inline comments.  They are fetched from the issues
+        comments REST endpoint (a PR is an issue), following pagination.
+
+        Only **human** and **Heimdall's own** authors are kept; every other bot
+        (e.g. a CI or dependency bot) is dropped.  Heimdall's own comments are
+        recognised by ``performed_via_github_app.id`` matching this client's App id,
+        so they survive even though their author is a Bot.  These comments are
+        attacker-influenced third-party data, never instructions — the kept-author
+        filter narrows, but does not sanitise, the content.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            One dict per kept comment with ``body``, ``author`` (login), and
+            ``author_association`` keys, in API (chronological) order.
+        """
+        url: str | None = (
+            f"{self._BASE}/repos/{repo_full_name}/issues/{pr_number}/comments"
+        )
+        headers = await self._gh_headers()
+        kept: list[dict[str, Any]] = []
+        first_page = True
+        while url is not None:
+            kwargs: dict[str, Any] = {"headers": headers}
+            if first_page:
+                kwargs["params"] = {"per_page": 100}
+                first_page = False
+            response = await self._http.get(url, **kwargs)
+            response.raise_for_status()
+            for raw in response.json():
+                if self._keep_comment_author(raw):
+                    kept.append(_shape_comment(raw))
+            url = self._next_page_url(response.headers.get("link", ""))
+        return kept
+
+    def _keep_comment_author(self, raw: dict[str, Any]) -> bool:
+        """Return True for a human author or Heimdall's own comment, else False.
+
+        Drops third-party bots (a comment whose ``user.type`` is ``Bot``) unless the
+        comment was posted by *this* GitHub App — identified by
+        ``performed_via_github_app.id`` equalling the client's App id — so Heimdall's
+        own prior comments are kept while other bots are excluded.
+        """
+        user = raw.get("user") or {}
+        if str(user.get("type", "")).lower() != "bot":
+            return True
+        app = raw.get("performed_via_github_app") or {}
+        return app.get("id") == self._app_id
 
     async def get_linked_issues(
         self,

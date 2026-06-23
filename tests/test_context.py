@@ -12,7 +12,14 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from heimdall.context import PRContext, assemble_pr_context
-from heimdall.context_cli import cmd_diff, cmd_docs, cmd_file, cmd_pr, main
+from heimdall.context_cli import (
+    cmd_comments,
+    cmd_diff,
+    cmd_docs,
+    cmd_file,
+    cmd_pr,
+    main,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -29,6 +36,11 @@ _BASE_REF = "main"
 _HEAD_REF = "feature/awesome"
 
 _LINKED_ISSUES = [{"number": 42, "title": "Feature request"}]
+
+_COMMENTS = [
+    {"body": "Looks good to me!", "author": "reviewer", "author_association": "MEMBER"},
+    {"body": "One nit here.", "author": "octocat", "author_association": "OWNER"},
+]
 
 _DIFF = """\
 diff --git a/foo.py b/foo.py
@@ -67,6 +79,7 @@ def _make_mock_github_client(
     pr_metadata: dict[str, Any] | None = None,
     file_content: str = _FILE_CONTENT,
     linked_issues: list[dict[str, Any]] | None = None,
+    comments: list[dict[str, Any]] | None = None,
 ) -> AsyncMock:
     """Build a mocked GitHubClient that returns canned API data."""
     client = AsyncMock()
@@ -76,6 +89,9 @@ def _make_mock_github_client(
     client.get_file_content = AsyncMock(return_value=file_content)
     client.get_linked_issues = AsyncMock(
         return_value=linked_issues if linked_issues is not None else _LINKED_ISSUES
+    )
+    client.get_pr_conversation_comments = AsyncMock(
+        return_value=comments if comments is not None else _COMMENTS
     )
     return client
 
@@ -102,6 +118,7 @@ def test_pr_context_fields() -> None:
         changed_files=_FILES,
         file_contents={"foo.py": _FILE_CONTENT},
         docs={},
+        comments=_COMMENTS,
     )
     assert ctx.repo_full_name == _REPO
     assert ctx.pr_number == _PR_NUMBER
@@ -286,6 +303,8 @@ def _write_workspace(tmp_path: Path, ctx: PRContext) -> Path:
         file_path = files_dir / filename.replace("/", os.sep)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content)
+    if ctx.comments:
+        (tmp_path / "comments.json").write_text(json.dumps(ctx.comments))
     return tmp_path
 
 
@@ -305,6 +324,7 @@ def _make_context() -> PRContext:
         changed_files=_FILES,
         file_contents={"foo.py": _FILE_CONTENT},
         docs={},
+        comments=_COMMENTS,
     )
 
 
@@ -423,6 +443,104 @@ async def test_assemble_pr_context_materializes_file_contents() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Conversation comments: assemble, materialize, and the CLI subcommand
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_seed_contains_comments() -> None:
+    """Assembled seed carries the kept conversation comments verbatim."""
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    assert ctx.comments == _COMMENTS
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_materializes_comments_file() -> None:
+    """assemble_pr_context writes comments.json when comments were kept."""
+    mock_client = _make_mock_github_client()
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        comments_path = Path(tmp_dir) / "comments.json"
+        assert comments_path.exists()
+        materialized = json.loads(comments_path.read_text())
+        assert materialized == _COMMENTS
+        # Each comment carries its body, author login, and author_association.
+        assert materialized[0]["body"] == "Looks good to me!"
+        assert materialized[0]["author"] == "reviewer"
+        assert materialized[0]["author_association"] == "MEMBER"
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_no_comments_writes_no_file() -> None:
+    """An empty comment set leaves no comments.json (clean empty handling)."""
+    mock_client = _make_mock_github_client(comments=[])
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        assert ctx.comments == []
+        assert not (Path(tmp_dir) / "comments.json").exists()
+
+
+def test_cmd_comments_prints_materialized_comments(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """heimdall-context comments prints the materialized comments verbatim."""
+    ctx = _make_context()
+    workspace = _write_workspace(tmp_path, ctx)
+    cmd_comments(str(workspace))
+    captured = capsys.readouterr()
+    printed = json.loads(captured.out)
+    assert printed == _COMMENTS
+
+
+def test_main_comments_subcommand(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """main() dispatches the 'comments' subcommand."""
+    ctx = _make_context()
+    workspace = _write_workspace(tmp_path, ctx)
+    main(["comments", str(workspace)])
+    captured = capsys.readouterr()
+    assert "Looks good to me!" in captured.out
+
+
+def test_cmd_comments_empty_when_no_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no comments.json, the comments subcommand prints an empty JSON array."""
+    cmd_comments(str(tmp_path))
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == []
+
+
+# ---------------------------------------------------------------------------
 # subprocess import guard: verify subprocess is never imported by context module
 # ---------------------------------------------------------------------------
 
@@ -458,6 +576,7 @@ def _make_context_with_files(file_contents: dict[str, str]) -> PRContext:
         changed_files=[],
         file_contents=file_contents,
         docs={},
+        comments=[],
     )
 
 
@@ -536,6 +655,7 @@ def test_materialize_rejects_traversal_doc_name(tmp_path: Path) -> None:
         changed_files=[],
         file_contents={},
         docs={"../../evil-conv.txt": "evil content"},
+        comments=[],
     )
     _materialize(ctx, str(workspace))
 
@@ -727,6 +847,7 @@ def _make_mock_github_client_with_docs(
     client.get_pr = AsyncMock(return_value=_PR_METADATA)
     client.get_file_content = _get_file_content
     client.get_linked_issues = AsyncMock(return_value=_LINKED_ISSUES)
+    client.get_pr_conversation_comments = AsyncMock(return_value=_COMMENTS)
     return client
 
 
@@ -879,6 +1000,7 @@ def _make_context_with_docs() -> PRContext:
         changed_files=_FILES,
         file_contents={"foo.py": _FILE_CONTENT},
         docs=_DOCS,
+        comments=_COMMENTS,
     )
 
 

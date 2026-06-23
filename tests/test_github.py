@@ -221,6 +221,132 @@ async def test_delete_review_comment_hits_pulls_comments_endpoint() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Conversation (timeline) comments: fetch + kept-author filter
+# ---------------------------------------------------------------------------
+
+
+def _comment(
+    *,
+    body: str,
+    login: str,
+    user_type: str = "User",
+    association: str = "CONTRIBUTOR",
+    app_id: int | None = None,
+) -> dict[str, object]:
+    """Build a raw issues-comments API object for the filter tests."""
+    raw: dict[str, object] = {
+        "body": body,
+        "user": {"login": login, "type": user_type},
+        "author_association": association,
+    }
+    if app_id is not None:
+        raw["performed_via_github_app"] = {"id": app_id}
+    return raw
+
+
+@pytest.mark.asyncio
+async def test_get_pr_conversation_comments_hits_issues_comments_endpoint() -> None:
+    """Conversation comments come from the issues comments endpoint (a PR is an issue)."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(
+        return_value=[_comment(body="hi", login="alice")]
+    )
+    mock_response.headers = {}
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=mock_response)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        rows = await client.get_pr_conversation_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert "issues/5/comments" in mock_http.get.call_args[0][0]
+    assert rows == [
+        {"body": "hi", "author": "alice", "author_association": "CONTRIBUTOR"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_pr_conversation_comments_keeps_humans_and_heimdall_drops_bots() -> None:
+    """Humans + Heimdall's own are kept; other bots are dropped."""
+    app_id = 4242
+    raw = [
+        _comment(body="from a human", login="alice", association="MEMBER"),
+        _comment(body="from CI bot", login="ci-bot", user_type="Bot"),
+        _comment(
+            body="from heimdall",
+            login="heimdall[bot]",
+            user_type="Bot",
+            app_id=app_id,
+        ),
+        _comment(
+            body="from another app bot",
+            login="dependabot[bot]",
+            user_type="Bot",
+            app_id=9999,
+        ),
+    ]
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value=raw)
+    mock_response.headers = {}
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=mock_response)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=app_id, private_key="key", installation_id=42, http_client=mock_http
+        )
+        rows = await client.get_pr_conversation_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    bodies = [r["body"] for r in rows]
+    assert bodies == ["from a human", "from heimdall"]
+    # Each kept comment carries body, author login, and author_association.
+    assert rows[0] == {
+        "body": "from a human",
+        "author": "alice",
+        "author_association": "MEMBER",
+    }
+    assert rows[1]["author"] == "heimdall[bot]"
+
+
+@pytest.mark.asyncio
+async def test_get_pr_conversation_comments_empty() -> None:
+    """No comments yields an empty list (clean empty-set handling)."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value=[])
+    mock_response.headers = {}
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=mock_response)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        rows = await client.get_pr_conversation_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert rows == []
+
+
+# ---------------------------------------------------------------------------
 # Across-push review lifecycle: dismiss (REQUEST_CHANGES) / minimize (COMMENT)
 # ---------------------------------------------------------------------------
 

@@ -21,12 +21,15 @@ a PR over the diff-size/file-count cap is skipped WITH a posted note, a repo ove
 per-window review budget is skipped silently, and a review that would exceed the
 per-installation concurrency cap defers (a DB-backed in-flight slot, released on every
 exit path).  If it proceeds, it
-assembles the PR seed context into a temporary workspace once, fans out the
+assembles the PR seed context into a temporary workspace once (including the PR's kept
+conversation comments — human and Heimdall's own — exposed via ``heimdall-context
+comments``), fans out the
 config-tuned lenses (built-ins Security opus/max, Design-fit sonnet/high, Cleanliness
 sonnet/high, each with per-lens model/effort/enable overrides plus optional appended
 instructions, alongside any custom lenses defined in the config) over that shared seed —
 each bounded by its own token cap and timeout — then runs a 4th synthesis ``claude -p``
-pass that dedups overlapping findings across lenses, ranks by severity, writes the
+pass that dedups overlapping findings across lenses, ranks by severity, embeds the
+conversation comments as untrusted context, writes the
 verdict, and formats the review (findings grouped by severity, each tagged with the
 originating lens).  Exactly one PR review is posted: findings on a changed diff line
 ride as inline comments in that same submission, while off-diff (or unparseable-
@@ -678,7 +681,7 @@ async def _synthesize_review(
     """
     workspace = tempfile.mkdtemp(prefix="heimdall-lens-")
     try:
-        await assemble_pr_context(
+        pr_context = await assemble_pr_context(
             app_id=ctx["app_id"],
             private_key=ctx["private_key"],
             installation_id=installation_id,
@@ -703,6 +706,7 @@ async def _synthesize_review(
 
         synthesis = await run_synthesis(
             lens_results=lens_results,
+            comments=pr_context.comments,
             claude_binary=ctx.get("claude_binary", "claude"),
             token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
             timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),

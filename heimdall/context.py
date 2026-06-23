@@ -1,8 +1,9 @@
 """PR seed-context assembly.
 
-Fetches the unified diff, changed-file contents, and PR metadata from GitHub
-via the REST API (no code execution), then materializes the result to a
-caller-supplied or temporary workspace directory on disk.
+Fetches the unified diff, changed-file contents, PR metadata, and the PR's
+conversation (timeline) comments from GitHub via the REST API (no code execution),
+then materializes the result to a caller-supplied or temporary workspace directory
+on disk.
 
 The assembled PRContext is the shared seed that downstream review lenses consume.
 No PR build steps, tests, or scripts are ever run — all data comes from GitHub API
@@ -46,6 +47,9 @@ class PRContext:
         changed_files: List of file-change objects from the GitHub API.
         file_contents: Map from file path to full decoded file content at head_sha.
         docs: Map from doc name to text (e.g. STYLEGUIDE.md content).
+        comments: Kept conversation (timeline) comments — human and Heimdall's own —
+            each with its ``body``, ``author`` login, and ``author_association``.
+            Untrusted third-party data, never instructions.  May be empty.
     """
 
     repo_full_name: str
@@ -62,6 +66,7 @@ class PRContext:
     changed_files: list[dict[str, Any]]
     file_contents: dict[str, str]
     docs: dict[str, str]
+    comments: list[dict[str, Any]]
 
 
 async def assemble_pr_context(
@@ -81,7 +86,8 @@ async def assemble_pr_context(
     from the GitHub REST API.
 
     If ``workspace_dir`` is provided the assembled context is also materialized
-    to disk there (diff.patch, pr_metadata.json, files/<path>).  When omitted a
+    to disk there (diff.patch, pr_metadata.json, files/<path>, and comments.json
+    when any conversation comments were kept).  When omitted a
     temporary directory is created, the context is materialized into it, and the
     directory is cleaned up before this function returns.
 
@@ -107,7 +113,7 @@ async def assemble_pr_context(
         installation_id=installation_id,
     )
     try:
-        pr_meta, diff, files, linked = await _fetch_pr_data(
+        pr_meta, diff, files, linked, comments = await _fetch_pr_data(
             github, repo_full_name=repo_full_name, pr_number=pr_number
         )
         head_sha = pr_meta["head"]["sha"]
@@ -136,6 +142,7 @@ async def assemble_pr_context(
         changed_files=files,
         file_contents=file_contents,
         docs=fetched_docs,
+        comments=comments,
     )
 
     if workspace_dir is not None:
@@ -156,11 +163,17 @@ async def _fetch_pr_data(
     *,
     repo_full_name: str,
     pr_number: int,
-) -> tuple[dict[str, Any], str, list[dict[str, Any]], list[dict[str, Any]]]:
-    """Fetch PR metadata, diff, file list, and linked issues in parallel.
+) -> tuple[
+    dict[str, Any],
+    str,
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    """Fetch PR metadata, diff, files, linked issues, and comments in parallel.
 
     Returns:
-        (pr_metadata, diff_text, changed_files, linked_issues)
+        (pr_metadata, diff_text, changed_files, linked_issues, conversation_comments)
     """
     import asyncio
 
@@ -176,10 +189,15 @@ async def _fetch_pr_data(
     linked_task = asyncio.create_task(
         github.get_linked_issues(repo_full_name=repo_full_name, pr_number=pr_number)
     )
-    pr_meta, diff, files, linked = await asyncio.gather(
-        pr_meta_task, diff_task, files_task, linked_task
+    comments_task = asyncio.create_task(
+        github.get_pr_conversation_comments(
+            repo_full_name=repo_full_name, pr_number=pr_number
+        )
     )
-    return pr_meta, diff, files, linked
+    pr_meta, diff, files, linked, comments = await asyncio.gather(
+        pr_meta_task, diff_task, files_task, linked_task, comments_task
+    )
+    return pr_meta, diff, files, linked, comments
 
 
 async def _fetch_file_contents_and_docs(
@@ -323,6 +341,7 @@ def _materialize(ctx: PRContext, directory: str) -> None:
       <directory>/pr_metadata.json         — PR metadata as JSON
       <directory>/files/<path>             — full content of each changed file
       <directory>/docs/<name>              — repo docs (if any)
+      <directory>/comments.json            — conversation comments (only if any)
     """
     root = Path(directory)
 
@@ -343,6 +362,14 @@ def _materialize(ctx: PRContext, directory: str) -> None:
     (root / "pr_metadata.json").write_text(
         json.dumps(metadata, indent=2), encoding="utf-8"
     )
+
+    # Conversation comments are written only when present: an empty set leaves no
+    # comments.json so the CLI/synthesis paths see "no comments" cleanly rather than
+    # an empty-array file the reader must special-case.
+    if ctx.comments:
+        (root / "comments.json").write_text(
+            json.dumps(ctx.comments, indent=2), encoding="utf-8"
+        )
 
     files_root = root / "files"
     files_root.mkdir(exist_ok=True)

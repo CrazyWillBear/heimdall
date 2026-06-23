@@ -234,6 +234,44 @@ async def test_run_review_fans_out_three_lenses_into_synthesis() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_review_passes_assembled_comments_into_synthesis() -> None:
+    """The seed's conversation comments reach run_synthesis (the end-to-end pipe)."""
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    comments = [
+        {"body": "ship it", "author": "alice", "author_association": "MEMBER"},
+    ]
+    seed = MagicMock()
+    seed.comments = comments
+
+    stack, synth_mock = _patch_review_pipeline(
+        synthesis_result=_synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")]),
+    )
+    with (
+        stack,
+        patch(
+            "heimdall.worker.assemble_pr_context",
+            new=AsyncMock(return_value=seed),
+        ),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    synth_mock.assert_awaited_once()
+    assert synth_mock.await_args is not None
+    assert synth_mock.await_args.kwargs["comments"] == comments
+
+
+@pytest.mark.asyncio
 async def test_run_review_body_is_severity_grouped_and_lens_tagged() -> None:
     """The posted body groups synthesized findings by severity, each tagged by lens."""
     mock_gh_client = _gh_client()

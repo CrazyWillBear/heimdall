@@ -1,13 +1,15 @@
 """heimdall-context — CLI wrapper for reading materialized PR seed context.
 
 Provides subcommands:
-  heimdall-context diff  <workspace>            — print the unified diff
-  heimdall-context pr    <workspace>            — print PR metadata as JSON
-  heimdall-context file  <workspace> <path>     — print a materialized file's content
-  heimdall-context docs  <workspace>            — print all repo docs
+  heimdall-context diff     <workspace>         — print the unified diff
+  heimdall-context pr       <workspace>         — print PR metadata as JSON
+  heimdall-context file     <workspace> <path>  — print a materialized file's content
+  heimdall-context docs     <workspace>         — print all repo docs
+  heimdall-context comments <workspace>         — print conversation comments as JSON
 
 The workspace must be a directory previously produced by assemble_pr_context()
-(i.e. it contains diff.patch, pr_metadata.json, files/, and optionally docs/).
+(i.e. it contains diff.patch, pr_metadata.json, files/, and optionally docs/ and
+comments.json).
 
 This wrapper is the ONLY allowlisted Bash command used during AI-driven lens review
 sessions — it reads from pre-materialized data and executes nothing.  The ``file``
@@ -99,6 +101,24 @@ def cmd_docs(workspace: str) -> None:
             print(doc_path.read_text(encoding="utf-8"))
 
 
+def cmd_comments(workspace: str) -> None:
+    """Print the materialized conversation comments as JSON from the workspace.
+
+    Reads ``comments.json`` (the kept human + Heimdall's-own conversation comments).
+    When no ``comments.json`` is present — the empty-comment-set case — an empty JSON
+    array is printed so the reader always sees valid JSON and never an error.
+
+    Args:
+        workspace: Path to the directory written by assemble_pr_context().
+    """
+    comments_path = Path(workspace) / "comments.json"
+    if not comments_path.exists():
+        print("[]")
+        return
+    comments = json.loads(comments_path.read_text(encoding="utf-8"))
+    print(json.dumps(comments, indent=2))
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry point for the heimdall-context CLI.
 
@@ -127,6 +147,13 @@ def main(argv: list[str] | None = None) -> None:
     docs_parser = sub.add_parser("docs", help="Print all repo docs")
     docs_parser.add_argument("workspace", help="Path to the materialized workspace")
 
+    comments_parser = sub.add_parser(
+        "comments", help="Print conversation comments as JSON"
+    )
+    comments_parser.add_argument(
+        "workspace", help="Path to the materialized workspace"
+    )
+
     args = parser.parse_args(argv)
 
     if args.subcommand == "diff":
@@ -137,6 +164,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_file(args.workspace, args.path)
     elif args.subcommand == "docs":
         cmd_docs(args.workspace)
+    elif args.subcommand == "comments":
+        cmd_comments(args.workspace)
     else:
         # argparse makes this unreachable, but keeps mypy happy
         parser.print_help()
