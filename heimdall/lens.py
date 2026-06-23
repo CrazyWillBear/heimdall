@@ -158,11 +158,15 @@ class SynthesisResult:
         tagged_findings: Deduped, severity-ranked survivors, each lens-tagged.
         verdict: "REQUEST_CHANGES" or "COMMENT" over the surviving set.
         body: The rendered Markdown review body (severity-grouped, lens-tagged).
+        dropped_lenses: Names of lenses that failed to run and were excluded from this
+            review (timeout, token cap, or no usable output).  Surfaced in the posted
+            body so an absent lens is never presented as part of a clean review.
     """
 
     tagged_findings: list[TaggedFinding]
     verdict: str
     body: str
+    dropped_lenses: tuple[str, ...] = ()
 
 
 @dataclass
@@ -437,7 +441,7 @@ def _finding_from_raw(item: dict[str, object]) -> Finding:
     )
 
 
-def _findings_list(obj: dict[str, object]) -> list[object]:
+def _findings_from_envelope(obj: dict[str, object]) -> list[object]:
     """Return the ``findings`` list from a parsed envelope, empty when absent/not a list."""
     raw_findings = obj.get("findings", [])
     return raw_findings if isinstance(raw_findings, list) else []
@@ -455,27 +459,16 @@ def _raw_findings(text: str) -> list[object]:
     if obj is None:
         logger.warning("No findings JSON in lens output; treating as no findings")
         return []
-    return _findings_list(obj)
+    return _findings_from_envelope(obj)
 
 
 def _require_lens_output(
     stdout: str, *, total_tokens: int, label: str
 ) -> dict[str, object]:
-    """Return the findings-JSON envelope, raising :class:`LensOutputError` on a failed run.
+    """Return the findings-JSON envelope, or raise :class:`LensOutputError`.
 
-    A genuine review run reports a positive token count and emits a parseable
-    ``{"findings": [...]}`` object.  Zero tokens (a 401/auth failure, empty output,
-    or a crash before any API call) or stdout with no parseable findings JSON means
-    the lens never actually reviewed the PR — raise so the run fails loudly instead
-    of being mistaken for a clean ``no findings`` review.
-
-    Args:
-        stdout: The run's textual output (claude's ``result`` field).
-        total_tokens: Cumulative tokens the run reported; ``<= 0`` means it never ran.
-        label: Human-readable run identifier for the error message (e.g. "Lens security").
-
-    Returns:
-        The parsed findings envelope, ready for :func:`_findings_list`.
+    See :class:`LensOutputError` for the failed-run criteria; ``label`` names the run
+    in the error message (e.g. "Lens security").
     """
     if total_tokens <= 0:
         raise LensOutputError(
@@ -586,6 +579,25 @@ def verdict_for_tagged(
 
 _NO_SYNTHESIS_FINDINGS_BODY = "Heimdall review: no concerns found across any lens."
 
+
+def render_dropped_lenses_warning(dropped: Sequence[str]) -> str:
+    """Render a banner naming lenses that failed to run, empty string when none.
+
+    A dropped lens (timeout, token-cap breach, or no usable output) is excluded from
+    synthesis; without this banner an absent lens — most consequentially the security
+    lens — would be silently presented as part of an otherwise-clean review (the
+    genesisx-agents #82 footgun, partial-failure case).
+    """
+    if not dropped:
+        return ""
+    names = ", ".join(f"`{name}`" for name in dropped)
+    one = len(dropped) == 1
+    return (
+        f"> ⚠️ {len(dropped)} review {'lens' if one else 'lenses'} failed to run and "
+        f"{'was' if one else 'were'} skipped: {names}. This review does not cover "
+        f"{'that lens' if one else 'those lenses'}."
+    )
+
 _SEVERITY_HEADERS = (
     (Severity.CRITICAL, "Critical"),
     (Severity.HIGH, "High"),
@@ -630,14 +642,28 @@ def format_synthesis_body(tagged: list[TaggedFinding]) -> str:
     return "\n".join(lines).rstrip()
 
 
+def _tagged_from_raw_list(raw: list[object]) -> list[TaggedFinding]:
+    """Build lens-tagged findings from a raw list, ranked worst-first.
+
+    Derives each survivor's finding fields and its ``lens`` tag from the SAME raw
+    dict in one filtered pass, so a malformed (non-dict) entry cannot misalign a
+    finding with a neighbour's lens tag.  Reuses :func:`_finding_from_raw` for the
+    severity/title/message/location coercion.  Shared by :func:`parse_tagged_findings`
+    and the synthesis run path.
+    """
+    tagged = [
+        TaggedFinding(lens=_lens_tag(item), finding=_finding_from_raw(item))
+        for item in raw
+        if isinstance(item, dict)
+    ]
+    return sorted(tagged, key=lambda t: _SEVERITY_ORDER[t.finding.severity])
+
+
 def parse_tagged_findings(text: str) -> list[TaggedFinding]:
     """Parse synthesis output into lens-tagged findings, ranked worst-first.
 
-    Derives each survivor's finding fields and its ``lens`` tag from the SAME raw
-    dict in one filtered pass, so a malformed (non-dict) entry anywhere in the array
-    cannot misalign a finding with a neighbour's lens tag.  Reuses
-    :func:`_finding_from_raw` for the severity/title/message/location coercion.  The
-    result is sorted worst-first so the verdict and body see a stable ranking.
+    Tolerates prose around the JSON block; see :func:`_tagged_from_raw_list` for the
+    per-entry coercion and the misalignment-safety invariant.
 
     Args:
         text: The synthesis lens output (claude's ``result`` text or bare JSON).
@@ -646,21 +672,6 @@ def parse_tagged_findings(text: str) -> list[TaggedFinding]:
         The deduped survivors, lens-tagged and severity-ranked. Empty when none.
     """
     return _tagged_from_raw_list(_raw_findings(text))
-
-
-def _tagged_from_raw_list(raw: list[object]) -> list[TaggedFinding]:
-    """Build lens-tagged findings from a raw list, ranked worst-first.
-
-    Derives each survivor's finding fields and its ``lens`` tag from the SAME raw
-    dict so a malformed (non-dict) entry cannot misalign a finding with a neighbour's
-    tag.  Shared by :func:`parse_tagged_findings` and the synthesis run path.
-    """
-    tagged = [
-        TaggedFinding(lens=_lens_tag(item), finding=_finding_from_raw(item))
-        for item in raw
-        if isinstance(item, dict)
-    ]
-    return sorted(tagged, key=lambda t: _SEVERITY_ORDER[t.finding.severity])
 
 
 def _lens_tag(item: dict[str, object]) -> str:
@@ -1173,7 +1184,7 @@ async def run_lens(
     obj = _require_lens_output(
         result.stdout, total_tokens=result.total_tokens, label=f"Lens {lens.name}"
     )
-    findings = _findings_from_raw_list(_findings_list(obj))
+    findings = _findings_from_raw_list(_findings_from_envelope(obj))
     logger.info(
         "Lens %s produced %d findings (%d tokens)",
         lens.name,
@@ -1255,7 +1266,7 @@ async def run_synthesis(
     obj = _require_lens_output(
         result.stdout, total_tokens=result.total_tokens, label="Synthesis"
     )
-    tagged = _tagged_from_raw_list(_findings_list(obj))
+    tagged = _tagged_from_raw_list(_findings_from_envelope(obj))
     logger.info(
         "Synthesis kept %d of %d findings (%d tokens)",
         len(tagged),

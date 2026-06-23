@@ -26,6 +26,7 @@ from heimdall.lens import (
     build_claude_argv,
     format_review_body,
     parse_findings,
+    render_dropped_lenses_warning,
     run_lens,
     run_synthesis,
     verdict_for,
@@ -455,7 +456,7 @@ async def test_run_lens_raises_on_zero_tokens() -> None:
     async def zero_token_invoker(
         argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
     ) -> ClaudeResult:
-        return _claude_result([], tokens=0)
+        return _raw_result("", tokens=0)
 
     with pytest.raises(LensOutputError):
         await run_lens(
@@ -507,7 +508,7 @@ async def test_run_synthesis_raises_on_zero_tokens() -> None:
     async def zero_token_invoker(
         argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
     ) -> ClaudeResult:
-        return _claude_result([], tokens=0)
+        return _raw_result("", tokens=0)
 
     with pytest.raises(LensOutputError):
         await run_synthesis(
@@ -556,3 +557,27 @@ def _lens_result_for_synthesis() -> LensResult:
         lens_name="security",
         findings=[Finding(Severity.HIGH, "SecretLeak", "m", None)],
     )
+
+
+# ---------------------------------------------------------------------------
+# Dropped-lens warning banner (partial-failure surfacing)
+# ---------------------------------------------------------------------------
+
+
+def test_render_dropped_lenses_warning_empty_when_none() -> None:
+    assert render_dropped_lenses_warning([]) == ""
+
+
+def test_render_dropped_lenses_warning_names_single_lens() -> None:
+    banner = render_dropped_lenses_warning(["security"])
+    assert "security" in banner
+    assert "1 review lens" in banner
+    assert "was skipped" in banner
+
+
+def test_render_dropped_lenses_warning_names_multiple_lenses() -> None:
+    banner = render_dropped_lenses_warning(["security", "design"])
+    assert "security" in banner
+    assert "design" in banner
+    assert "2 review lenses" in banner
+    assert "were skipped" in banner

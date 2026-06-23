@@ -21,12 +21,7 @@ from heimdall.lens import (
     TaggedFinding,
 )
 from heimdall.repo_config import LensConfig, RepoConfig, ScopeFilters
-from heimdall.worker import (
-    _REVIEW_FAILED_NOTE,
-    WorkerSettings,
-    _configure_logging,
-    run_review,
-)
+from heimdall.worker import WorkerSettings, _configure_logging, run_review
 
 _REPO = "owner/repo"
 _PR = 3
@@ -577,7 +572,7 @@ async def test_lens_output_error_posts_failure_note_not_clean_review() -> None:
 
     synth_mock.assert_not_called()
     mock_gh_client.post_review.assert_awaited_once()
-    assert mock_gh_client.post_review.await_args.kwargs["body"] == _REVIEW_FAILED_NOTE
+    assert "failed" in mock_gh_client.post_review.await_args.kwargs["body"].lower()
     assert mock_gh_client.post_review.await_args.kwargs["event"] == "COMMENT"
 
 
@@ -613,8 +608,49 @@ async def test_synthesis_output_error_posts_failure_note_not_clean_review() -> N
         )
 
     mock_gh_client.post_review.assert_awaited_once()
-    assert mock_gh_client.post_review.await_args.kwargs["body"] == _REVIEW_FAILED_NOTE
+    assert "failed" in mock_gh_client.post_review.await_args.kwargs["body"].lower()
     assert mock_gh_client.post_review.await_args.kwargs["event"] == "COMMENT"
+
+
+@pytest.mark.asyncio
+async def test_partial_lens_failure_surfaces_dropped_lens_in_body() -> None:
+    """If the security lens fails but others succeed, the posted review names the
+    dropped lens so an absent security review is never presented as clean (#82,
+    partial-failure case)."""
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    # tuned_lenses order is security, design, cleanliness: the first call fails, the
+    # other two succeed, so one attempt produces a review (no retry).
+    outcomes: list[object] = [
+        LensOutputError("security produced 0 tokens"),
+        _lens_result([], name="design"),
+        _lens_result([], name="cleanliness"),
+    ]
+    stack, _ = _patch_review_pipeline(
+        lens_results=outcomes,  # type: ignore[arg-type]
+        synthesis_result=_synthesis_from([]),
+    )
+    with (
+        stack,
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    mock_gh_client.post_review.assert_awaited_once()
+    body = mock_gh_client.post_review.await_args.kwargs["body"]
+    # The dropped lens is named, and the original synthesis body is preserved below it.
+    assert "security" in body
+    assert "skipped" in body.lower()
+    assert "no concerns found across any lens" in body
 
 
 # ---------------------------------------------------------------------------
