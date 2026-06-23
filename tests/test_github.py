@@ -382,14 +382,56 @@ def _review_comment(
     return raw
 
 
-def _single_page(rows: list[dict[str, object]]) -> AsyncMock:
-    """Build a mock http client whose GET returns one page of ``rows``."""
+def _graphql_threads_response(
+    threads: list[dict[str, object]], *, errors: object | None = None
+) -> MagicMock:
+    """Build a mock httpx response for a reviewThreads GraphQL page.
+
+    ``threads`` is the list of node dicts (each ``{"isResolved": bool, "comments":
+    {"nodes": [{"databaseId": int}]}}``).  ``errors`` injects a GraphQL errors payload
+    so the degrade-clean path can be exercised.
+    """
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    if errors is not None:
+        resp.json = MagicMock(return_value={"errors": errors})
+    else:
+        resp.json = MagicMock(
+            return_value={
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "nodes": threads,
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            }
+                        }
+                    }
+                }
+            }
+        )
+    return resp
+
+
+def _single_page(
+    rows: list[dict[str, object]],
+    *,
+    resolutions: list[dict[str, object]] | None = None,
+) -> AsyncMock:
+    """Build a mock http client whose GET returns one page of ``rows``.
+
+    ``post`` (the reviewThreads GraphQL call) returns ``resolutions`` — a list of
+    thread node dicts, defaulting to none so unmatched threads degrade to unresolved.
+    """
     mock_response = MagicMock()
     mock_response.raise_for_status = MagicMock()
     mock_response.json = MagicMock(return_value=rows)
     mock_response.headers = {}
     mock_http = AsyncMock()
     mock_http.get = AsyncMock(return_value=mock_response)
+    mock_http.post = AsyncMock(
+        return_value=_graphql_threads_response(resolutions or [])
+    )
     return mock_http
 
 
@@ -419,6 +461,7 @@ async def test_get_pr_review_comments_hits_pulls_comments_endpoint() -> None:
             "path": "foo.py",
             "line": 3,
             "replies": [],
+            "is_resolved": False,
         }
     ]
 
@@ -552,6 +595,166 @@ def test_group_review_comments_promotes_orphan_reply_to_thread() -> None:
     assert len(threads) == 1
     assert threads[0]["body"] == "orphan reply"
     assert threads[0]["replies"] == []
+    assert threads[0]["is_resolved"] is False
+
+
+# ---------------------------------------------------------------------------
+# Inline-thread resolution state via GraphQL reviewThreads
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_tags_resolved_thread() -> None:
+    """A reviewThread reported isResolved tags its correlated REST thread resolved."""
+    rows = [
+        _review_comment(body="root", login="alice", comment_id=1, path="a.py", line=7),
+        _review_comment(
+            body="reply", login="bob", comment_id=2, in_reply_to_id=1, line=7
+        ),
+        _review_comment(body="open", login="carol", comment_id=9, path="b.py", line=2),
+    ]
+    # GraphQL: thread for comments 1/2 is resolved; the comment-9 thread is open.
+    resolutions = [
+        {
+            "isResolved": True,
+            "comments": {"nodes": [{"databaseId": 1}, {"databaseId": 2}]},
+        },
+        {"isResolved": False, "comments": {"nodes": [{"databaseId": 9}]}},
+    ]
+    mock_http = _single_page(rows, resolutions=resolutions)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    # The GraphQL query went to /graphql and named reviewThreads.
+    graphql_call = mock_http.post.call_args
+    assert graphql_call[0][0].endswith("/graphql")
+    assert "reviewThreads" in graphql_call[1]["json"]["query"]
+
+    by_body = {t["body"]: t for t in threads}
+    assert by_body["root"]["is_resolved"] is True
+    assert by_body["open"]["is_resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_defaults_unresolved_without_graphql_match() -> None:
+    """A thread with no matching reviewThread node defaults to unresolved, not crash."""
+    rows = [_review_comment(body="lonely", login="alice", comment_id=1)]
+    # GraphQL returns a thread for an unrelated comment id, so nothing correlates.
+    resolutions = [
+        {"isResolved": True, "comments": {"nodes": [{"databaseId": 999}]}}
+    ]
+    mock_http = _single_page(rows, resolutions=resolutions)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert threads[0]["is_resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_graphql_error_degrades_to_unresolved() -> None:
+    """A GraphQL errors payload degrades cleanly: threads default to unresolved."""
+    rows = [_review_comment(body="root", login="alice", comment_id=1)]
+    mock_http = _single_page(rows)
+    mock_http.post = AsyncMock(
+        return_value=_graphql_threads_response([], errors=[{"message": "boom"}])
+    )
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert len(threads) == 1
+    assert threads[0]["is_resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_graphql_raises_degrades_to_unresolved() -> None:
+    """A transport-level GraphQL failure never crashes the review path."""
+    rows = [_review_comment(body="root", login="alice", comment_id=1)]
+    mock_http = _single_page(rows)
+    mock_http.post = AsyncMock(side_effect=httpx.ConnectError("network down"))
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert threads[0]["is_resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_review_thread_resolutions_follows_graphql_pagination() -> None:
+    """reviewThreads pages are followed; every node's databaseId maps to isResolved."""
+    page1 = MagicMock()
+    page1.raise_for_status = MagicMock()
+    page1.json = MagicMock(
+        return_value={
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "isResolved": True,
+                                    "comments": {"nodes": [{"databaseId": 1}]},
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": True,
+                                "endCursor": "CURSOR1",
+                            },
+                        }
+                    }
+                }
+            }
+        }
+    )
+    page2 = _graphql_threads_response(
+        [{"isResolved": False, "comments": {"nodes": [{"databaseId": 2}]}}]
+    )
+    mock_http = AsyncMock()
+    mock_http.post = AsyncMock(side_effect=[page1, page2])
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        resolutions = await client.get_review_thread_resolutions(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert resolutions == {1: True, 2: False}
+    # The second page passed the endCursor from page one.
+    assert mock_http.post.call_args_list[1][1]["json"]["variables"]["after"] == "CURSOR1"
 
 
 # ---------------------------------------------------------------------------

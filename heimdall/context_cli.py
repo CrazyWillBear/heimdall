@@ -135,7 +135,8 @@ def cmd_review_threads(workspace: str) -> None:
     """Print the materialized inline review threads as JSON from the workspace.
 
     Reads ``review_threads.json`` (the kept inline review comments grouped into
-    parent-anchored reply threads, each with its ``path``/``line`` anchor).  This is
+    parent-anchored reply threads, each with its ``path``/``line`` anchor and an
+    ``is_resolved`` flag from the GraphQL ``reviewThreads`` resolution signal).  This is
     distinct from ``comments`` (the conversation timeline).  When no
     ``review_threads.json`` is present — the empty case — an empty JSON array is
     printed so the reader always sees valid JSON and never an error.
