@@ -62,6 +62,7 @@ import shutil
 import sys
 import tempfile
 import time
+from dataclasses import replace
 from typing import Any
 
 from arq.connections import RedisSettings
@@ -94,6 +95,7 @@ from heimdall.lens import (
     LensResult,
     SandboxError,
     SynthesisResult,
+    render_dropped_lenses_warning,
     run_lens,
     run_synthesis,
     sandbox_exec_probe,
@@ -553,6 +555,9 @@ async def _build_inline_split(
     commentable = commentable_lines(diff)
     inline, body_findings = split_findings(synthesis.tagged_findings, commentable)
     body = render_body_for_offdiff(body_findings)
+    warning = render_dropped_lenses_warning(synthesis.dropped_lenses)
+    if warning:
+        body = f"{warning}\n\n{body}"
     return body, build_inline_comments(inline)
 
 
@@ -683,7 +688,7 @@ async def _synthesize_review(
             docs=config.docs,
         )
 
-        lens_results = await _run_lenses(
+        lens_results, dropped_lenses = await _run_lenses(
             ctx,
             config=config,
             workspace_dir=workspace,
@@ -707,6 +712,13 @@ async def _synthesize_review(
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
+    # Partial failure: some lenses ran but others were dropped (timeout, cap, or no
+    # usable output).  Record the dropped lenses on the result so the post step can
+    # surface them in the body — an absent lens, most consequentially security, must
+    # never be presented as part of a clean review (the #82 footgun, partial-failure case).
+    if dropped_lenses:
+        synthesis = replace(synthesis, dropped_lenses=tuple(dropped_lenses))
+
     # Metadata-only by default; the synthesized body (findings + code text) is
     # logged only under the debug-logging flag.
     _log_findings(
@@ -722,7 +734,7 @@ async def _run_lenses(
     workspace_dir: str,
     repo_full_name: str,
     pr_number: int,
-) -> list[LensResult]:
+) -> tuple[list[LensResult], list[str]]:
     """Run the config-tuned lenses over the shared workspace, isolating failures.
 
     The repo config decides which lenses run and with what model/effort/prompt: a
@@ -730,12 +742,15 @@ async def _run_lenses(
     and any custom lenses defined in the config run here too (all via tuned_lenses).
     A disabled lens never reaches synthesis.  Each surviving lens is bounded
     independently (its own token cap + timeout via run_lens).  A lens that aborts
-    (timeout or token-cap breach) is logged and dropped so the remaining lenses
-    still reach synthesis; an unexpected error in one lens is likewise contained
-    rather than crashing the whole run.
+    (timeout, token-cap breach, or no usable output) is logged and dropped so the
+    remaining lenses still reach synthesis; an unexpected error in one lens is likewise
+    contained rather than crashing the whole run.  Dropped lenses are returned by name
+    so the caller can surface them in the posted review (an absent lens must never read
+    as clean — the genesisx-agents #82 footgun, partial-failure case).
 
     Returns:
-        The results of the lenses that succeeded (possibly empty if all failed).
+        ``(results, dropped)`` — the succeeded lens results (possibly empty if all
+        failed) and the names of the lenses that were dropped.
     """
     lenses = tuned_lenses(config)
     outcomes = await asyncio.gather(
@@ -756,10 +771,13 @@ async def _run_lenses(
     )
 
     results: list[LensResult] = []
+    dropped: list[str] = []
     for lens, outcome in zip(lenses, outcomes, strict=True):
         if isinstance(outcome, LensResult):
             results.append(outcome)
-        elif isinstance(outcome, SandboxError):
+            continue
+        dropped.append(lens.name)
+        if isinstance(outcome, SandboxError):
             # An infra/deployment fault, not a normal lens failure: it drops the lens
             # like any other (isolation preserved — siblings still run), but log it at
             # error level so a misconfigured sandbox is distinguishable in the logs from
@@ -780,7 +798,7 @@ async def _run_lenses(
                 pr_number,
                 outcome,
             )
-    return results
+    return results, dropped
 
 
 def _log_findings(

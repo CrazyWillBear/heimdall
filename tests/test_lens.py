@@ -16,15 +16,19 @@ from heimdall.lens import (
     SECURITY_LENS,
     ClaudeResult,
     Finding,
+    LensOutputError,
     LensResult,
     LensTimeoutError,
     LensTokenCapError,
     Severity,
+    SynthesisResult,
     _build_subprocess_env,
     build_claude_argv,
     format_review_body,
     parse_findings,
+    render_dropped_lenses_warning,
     run_lens,
+    run_synthesis,
     verdict_for,
 )
 
@@ -432,3 +436,148 @@ async def test_run_lens_propagates_token_cap() -> None:
             timeout_seconds=900,
             invoker=capping_invoker,
         )
+
+
+# ---------------------------------------------------------------------------
+# Loud-fail: a run that never actually reviewed (0 tokens / no parseable JSON)
+# must raise rather than masquerade as a clean "no findings" review.
+# ---------------------------------------------------------------------------
+
+
+def _raw_result(stdout: str, *, tokens: int) -> ClaudeResult:
+    """A ClaudeResult carrying arbitrary (possibly non-JSON) stdout."""
+    return ClaudeResult(stdout=stdout, total_tokens=tokens, killed=False)
+
+
+@pytest.mark.asyncio
+async def test_run_lens_raises_on_zero_tokens() -> None:
+    """A 0-token run (e.g. a 401 before any API call) is a failed run, not clean."""
+
+    async def zero_token_invoker(
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
+    ) -> ClaudeResult:
+        return _raw_result("", tokens=0)
+
+    with pytest.raises(LensOutputError):
+        await run_lens(
+            lens=SECURITY_LENS,
+            workspace_dir=_WORKSPACE,
+            invoker=zero_token_invoker,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_lens_raises_on_no_findings_json() -> None:
+    """Tokens burned but no parseable findings JSON (garbage/error text) -> raise."""
+
+    async def garbage_invoker(
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
+    ) -> ClaudeResult:
+        return _raw_result("401 Invalid authentication credentials", tokens=50)
+
+    with pytest.raises(LensOutputError):
+        await run_lens(
+            lens=SECURITY_LENS,
+            workspace_dir=_WORKSPACE,
+            invoker=garbage_invoker,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_lens_clean_pr_returns_empty_findings() -> None:
+    """A genuine clean run (tokens > 0, parseable empty findings) still succeeds."""
+
+    async def clean_invoker(
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
+    ) -> ClaudeResult:
+        return _claude_result([], tokens=120)
+
+    result = await run_lens(
+        lens=SECURITY_LENS,
+        workspace_dir=_WORKSPACE,
+        invoker=clean_invoker,
+    )
+    assert isinstance(result, LensResult)
+    assert result.findings == []
+
+
+@pytest.mark.asyncio
+async def test_run_synthesis_raises_on_zero_tokens() -> None:
+    """Synthesis that reports 0 tokens never ran -> raise (it builds the posted body)."""
+
+    async def zero_token_invoker(
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
+    ) -> ClaudeResult:
+        return _raw_result("", tokens=0)
+
+    with pytest.raises(LensOutputError):
+        await run_synthesis(
+            lens_results=[_lens_result_for_synthesis()],
+            invoker=zero_token_invoker,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_synthesis_raises_on_no_findings_json() -> None:
+    """Synthesis output with no parseable findings JSON -> raise, not clean review."""
+
+    async def garbage_invoker(
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
+    ) -> ClaudeResult:
+        return _raw_result("error: could not complete", tokens=80)
+
+    with pytest.raises(LensOutputError):
+        await run_synthesis(
+            lens_results=[_lens_result_for_synthesis()],
+            invoker=garbage_invoker,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_synthesis_clean_returns_empty_comment() -> None:
+    """Genuine clean synthesis (tokens > 0, empty findings) -> COMMENT, no survivors."""
+
+    async def clean_invoker(
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
+    ) -> ClaudeResult:
+        return _claude_result([], tokens=200)
+
+    result = await run_synthesis(
+        lens_results=[_lens_result_for_synthesis()],
+        invoker=clean_invoker,
+    )
+    assert isinstance(result, SynthesisResult)
+    assert result.tagged_findings == []
+    assert result.verdict == "COMMENT"
+
+
+def _lens_result_for_synthesis() -> LensResult:
+    """A minimal LensResult to feed run_synthesis in the loud-fail tests."""
+    return LensResult(
+        lens_name="security",
+        findings=[Finding(Severity.HIGH, "SecretLeak", "m", None)],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dropped-lens warning banner (partial-failure surfacing)
+# ---------------------------------------------------------------------------
+
+
+def test_render_dropped_lenses_warning_empty_when_none() -> None:
+    assert render_dropped_lenses_warning([]) == ""
+
+
+def test_render_dropped_lenses_warning_names_single_lens() -> None:
+    banner = render_dropped_lenses_warning(["security"])
+    assert "security" in banner
+    assert "1 review lens" in banner
+    assert "was skipped" in banner
+
+
+def test_render_dropped_lenses_warning_names_multiple_lenses() -> None:
+    banner = render_dropped_lenses_warning(["security", "design"])
+    assert "security" in banner
+    assert "design" in banner
+    assert "2 review lenses" in banner
+    assert "were skipped" in banner

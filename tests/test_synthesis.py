@@ -339,7 +339,7 @@ async def test_run_synthesis_uses_synthesis_lens_spec() -> None:
         argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
     ) -> ClaudeResult:
         captured["argv"] = argv
-        return ClaudeResult(stdout=json.dumps({"findings": []}), total_tokens=0)
+        return ClaudeResult(stdout=json.dumps({"findings": []}), total_tokens=10)
 
     await run_synthesis(
         lens_results=[_lens_result("security", [])],
@@ -375,7 +375,7 @@ async def test_run_synthesis_grants_no_seed_workspace_but_supplies_a_sandbox_cwd
     ) -> ClaudeResult:
         captured["argv"] = argv
         captured["cwd"] = cwd
-        return ClaudeResult(stdout=json.dumps({"findings": []}), total_tokens=0)
+        return ClaudeResult(stdout=json.dumps({"findings": []}), total_tokens=10)
 
     await run_synthesis(
         lens_results=[_lens_result("security", [])],

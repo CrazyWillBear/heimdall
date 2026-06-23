@@ -158,11 +158,15 @@ class SynthesisResult:
         tagged_findings: Deduped, severity-ranked survivors, each lens-tagged.
         verdict: "REQUEST_CHANGES" or "COMMENT" over the surviving set.
         body: The rendered Markdown review body (severity-grouped, lens-tagged).
+        dropped_lenses: Names of lenses that failed to run and were excluded from this
+            review (timeout, token cap, or no usable output).  Surfaced in the posted
+            body so an absent lens is never presented as part of a clean review.
     """
 
     tagged_findings: list[TaggedFinding]
     verdict: str
     body: str
+    dropped_lenses: tuple[str, ...] = ()
 
 
 @dataclass
@@ -192,6 +196,17 @@ class LensTimeoutError(LensError):
 
 class LensTokenCapError(LensError):
     """Raised when a lens run exceeds the cumulative-token cap and is killed."""
+
+
+class LensOutputError(LensError):
+    """Raised when a lens or synthesis run produced no usable output.
+
+    A genuine review run reports a positive token count and emits a parseable
+    ``{"findings": [...]}`` object.  Zero tokens (a 401/auth failure, empty output,
+    or a crash before any API call) or stdout with no parseable findings JSON means
+    the lens never actually reviewed the PR; raising here keeps a failed run from
+    masquerading as a clean "no findings" review (the genesisx-agents #82 footgun).
+    """
 
 
 # An invoker takes the fully-built argv plus the caps and returns a ClaudeResult.
@@ -426,20 +441,51 @@ def _finding_from_raw(item: dict[str, object]) -> Finding:
     )
 
 
+def _findings_from_envelope(obj: dict[str, object]) -> list[object]:
+    """Return the ``findings`` list from a parsed envelope, empty when absent/not a list."""
+    raw_findings = obj.get("findings", [])
+    return raw_findings if isinstance(raw_findings, list) else []
+
+
 def _raw_findings(text: str) -> list[object]:
     """Return the raw ``findings`` list from a lens's output, empty when absent.
 
     Tolerates prose around the JSON block and a missing or non-list ``findings``
-    field.  Callers filter the list for dict entries themselves.
+    field.  Callers filter the list for dict entries themselves.  This is the
+    *tolerant* path used by the standalone parsers; the run-time guard
+    :func:`_require_lens_output` is what turns a missing envelope into a loud failure.
     """
     obj = _extract_findings_json(text)
     if obj is None:
         logger.warning("No findings JSON in lens output; treating as no findings")
         return []
-    raw_findings = obj.get("findings", [])
-    if not isinstance(raw_findings, list):
-        return []
-    return raw_findings
+    return _findings_from_envelope(obj)
+
+
+def _require_lens_output(
+    stdout: str, *, total_tokens: int, label: str
+) -> dict[str, object]:
+    """Return the findings-JSON envelope, or raise :class:`LensOutputError`.
+
+    See :class:`LensOutputError` for the failed-run criteria; ``label`` names the run
+    in the error message (e.g. "Lens security").
+    """
+    if total_tokens <= 0:
+        raise LensOutputError(
+            f"{label} produced 0 tokens; treating as a failed run, not a clean review"
+        )
+    obj = _extract_findings_json(stdout)
+    if obj is None:
+        raise LensOutputError(
+            f"{label} produced no parseable findings JSON; treating as a failed run, "
+            "not a clean review"
+        )
+    return obj
+
+
+def _findings_from_raw_list(raw: list[object]) -> list[Finding]:
+    """Coerce a raw findings list into :class:`Finding` objects, skipping non-dicts."""
+    return [_finding_from_raw(item) for item in raw if isinstance(item, dict)]
 
 
 def parse_findings(text: str) -> list[Finding]:
@@ -454,7 +500,7 @@ def parse_findings(text: str) -> list[Finding]:
     Returns:
         The parsed findings, empty when none are present.
     """
-    return [_finding_from_raw(item) for item in _raw_findings(text) if isinstance(item, dict)]
+    return _findings_from_raw_list(_raw_findings(text))
 
 
 _NO_FINDINGS_BODY = "Heimdall security review: no security concerns found."
@@ -533,6 +579,25 @@ def verdict_for_tagged(
 
 _NO_SYNTHESIS_FINDINGS_BODY = "Heimdall review: no concerns found across any lens."
 
+
+def render_dropped_lenses_warning(dropped: Sequence[str]) -> str:
+    """Render a banner naming lenses that failed to run, empty string when none.
+
+    A dropped lens (timeout, token-cap breach, or no usable output) is excluded from
+    synthesis; without this banner an absent lens — most consequentially the security
+    lens — would be silently presented as part of an otherwise-clean review (the
+    genesisx-agents #82 footgun, partial-failure case).
+    """
+    if not dropped:
+        return ""
+    names = ", ".join(f"`{name}`" for name in dropped)
+    one = len(dropped) == 1
+    return (
+        f"> ⚠️ {len(dropped)} review {'lens' if one else 'lenses'} failed to run and "
+        f"{'was' if one else 'were'} skipped: {names}. This review does not cover "
+        f"{'that lens' if one else 'those lenses'}."
+    )
+
 _SEVERITY_HEADERS = (
     (Severity.CRITICAL, "Critical"),
     (Severity.HIGH, "High"),
@@ -577,14 +642,28 @@ def format_synthesis_body(tagged: list[TaggedFinding]) -> str:
     return "\n".join(lines).rstrip()
 
 
+def _tagged_from_raw_list(raw: list[object]) -> list[TaggedFinding]:
+    """Build lens-tagged findings from a raw list, ranked worst-first.
+
+    Derives each survivor's finding fields and its ``lens`` tag from the SAME raw
+    dict in one filtered pass, so a malformed (non-dict) entry cannot misalign a
+    finding with a neighbour's lens tag.  Reuses :func:`_finding_from_raw` for the
+    severity/title/message/location coercion.  Shared by :func:`parse_tagged_findings`
+    and the synthesis run path.
+    """
+    tagged = [
+        TaggedFinding(lens=_lens_tag(item), finding=_finding_from_raw(item))
+        for item in raw
+        if isinstance(item, dict)
+    ]
+    return sorted(tagged, key=lambda t: _SEVERITY_ORDER[t.finding.severity])
+
+
 def parse_tagged_findings(text: str) -> list[TaggedFinding]:
     """Parse synthesis output into lens-tagged findings, ranked worst-first.
 
-    Derives each survivor's finding fields and its ``lens`` tag from the SAME raw
-    dict in one filtered pass, so a malformed (non-dict) entry anywhere in the array
-    cannot misalign a finding with a neighbour's lens tag.  Reuses
-    :func:`_finding_from_raw` for the severity/title/message/location coercion.  The
-    result is sorted worst-first so the verdict and body see a stable ranking.
+    Tolerates prose around the JSON block; see :func:`_tagged_from_raw_list` for the
+    per-entry coercion and the misalignment-safety invariant.
 
     Args:
         text: The synthesis lens output (claude's ``result`` text or bare JSON).
@@ -592,12 +671,7 @@ def parse_tagged_findings(text: str) -> list[TaggedFinding]:
     Returns:
         The deduped survivors, lens-tagged and severity-ranked. Empty when none.
     """
-    tagged = [
-        TaggedFinding(lens=_lens_tag(item), finding=_finding_from_raw(item))
-        for item in _raw_findings(text)
-        if isinstance(item, dict)
-    ]
-    return sorted(tagged, key=lambda t: _SEVERITY_ORDER[t.finding.severity])
+    return _tagged_from_raw_list(_raw_findings(text))
 
 
 def _lens_tag(item: dict[str, object]) -> str:
@@ -1085,6 +1159,9 @@ async def run_lens(
     Raises:
         LensTimeoutError / LensTokenCapError: Propagated from the invoker when the
             run is aborted; callers handle these as a failed (dropped) lens.
+        LensOutputError: The run produced no usable output (0 tokens or no parseable
+            findings JSON) — a failed run, not a clean review; callers drop it like a
+            timeout so a silently-broken lens can never masquerade as "no findings".
         SandboxError: The bwrap wrap could not be built (an infra/deployment fault,
             not a per-lens error); callers surface it distinctly while still
             isolating it so sibling lenses keep running.
@@ -1104,7 +1181,10 @@ async def run_lens(
         bwrap_binary=bwrap_binary,
         sandbox_extra_read_only_binds=sandbox_extra_read_only_binds,
     )
-    findings = parse_findings(result.stdout)
+    obj = _require_lens_output(
+        result.stdout, total_tokens=result.total_tokens, label=f"Lens {lens.name}"
+    )
+    findings = _findings_from_raw_list(_findings_from_envelope(obj))
     logger.info(
         "Lens %s produced %d findings (%d tokens)",
         lens.name,
@@ -1152,6 +1232,9 @@ async def run_synthesis(
     Raises:
         LensTimeoutError / LensTokenCapError: Propagated from the invoker when the
             synthesis run is aborted; the caller handles these as a failed pass.
+        LensOutputError: The synthesis run produced no usable output (0 tokens or no
+            parseable findings JSON); the caller retries once and then posts the
+            review-failed note rather than a bogus clean review.
     """
     argv = build_synthesis_argv(
         claude_binary=claude_binary,
@@ -1180,7 +1263,10 @@ async def run_synthesis(
         )
     finally:
         shutil.rmtree(synthesis_workspace, ignore_errors=True)
-    tagged = parse_tagged_findings(result.stdout)
+    obj = _require_lens_output(
+        result.stdout, total_tokens=result.total_tokens, label="Synthesis"
+    )
+    tagged = _tagged_from_raw_list(_findings_from_envelope(obj))
     logger.info(
         "Synthesis kept %d of %d findings (%d tokens)",
         len(tagged),
