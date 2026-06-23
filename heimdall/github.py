@@ -63,6 +63,69 @@ def _shape_comment(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _shape_inline_comment(raw: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a raw GitHub review (inline) comment to the fields a thread records.
+
+    Builds on :func:`_shape_comment` (``body``/``author``/``author_association``) and
+    adds the line anchor a thread needs: the ``path`` the comment is attached to and the
+    ``line`` it points at — ``line`` is the comment's current line, falling back to the
+    pre-image ``original_line`` for comments on an outdated diff hunk.  Like
+    :func:`_shape_comment`, every other (potentially large or sensitive) API field is
+    dropped.
+
+    Args:
+        raw: A single comment object from the pulls review-comments REST endpoint.
+
+    Returns:
+        A dict with ``body``, ``author``, ``author_association``, ``path``, and ``line``.
+    """
+    shaped = _shape_comment(raw)
+    line = raw.get("line")
+    if line is None:
+        line = raw.get("original_line")
+    shaped["path"] = str(raw.get("path") or "")
+    shaped["line"] = line
+    return shaped
+
+
+def group_review_comments_into_threads(
+    comments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Group flat inline review comments into parent-anchored reply threads.
+
+    A PR's review-comments endpoint returns a flat list where a reply carries an
+    ``in_reply_to_id`` pointing at the comment it answers; a top-level comment has none.
+    This rebuilds the tree: each top-level comment becomes a thread carrying its file/line
+    anchor and a ``replies`` list, and every reply is appended (in API order) under the
+    thread whose root id it answers.  A reply whose parent was dropped by author filtering
+    is promoted to its own thread so its content is never silently lost.
+
+    Args:
+        comments: Raw review-comment objects (already author-filtered), in API order.
+
+    Returns:
+        One dict per thread: the shaped root fields (``body``/``author``/
+        ``author_association``/``path``/``line``) plus a ``replies`` list of shaped
+        replies, in API (chronological) order.
+    """
+    threads_by_id: dict[int, dict[str, Any]] = {}
+    ordered: list[dict[str, Any]] = []
+    for raw in comments:
+        parent_id = raw.get("in_reply_to_id")
+        shaped = _shape_inline_comment(raw)
+        parent = threads_by_id.get(parent_id) if parent_id is not None else None
+        if parent is not None:
+            parent["replies"].append(shaped)
+            continue
+        # A root comment, or a reply whose parent was filtered out: start a new thread.
+        thread = {**shaped, "replies": []}
+        ordered.append(thread)
+        comment_id = raw.get("id")
+        if isinstance(comment_id, int):
+            threads_by_id[comment_id] = thread
+    return ordered
+
+
 def _raise_with_body(response: httpx.Response) -> None:
     """Like ``response.raise_for_status()`` but include the response body in the error.
 
@@ -546,6 +609,57 @@ class GitHubClient:
             return True
         app = raw.get("performed_via_github_app") or {}
         return app.get("id") == self._app_id
+
+    async def get_pr_review_comments(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch the PR's inline review comments as parent-anchored reply threads.
+
+        Inline (review) comments are line-anchored comments on diff hunks — distinct
+        from the conversation/timeline comments served by
+        :meth:`get_pr_conversation_comments`.  They are fetched from the pulls
+        review-comments REST endpoint (a flat list where a reply carries
+        ``in_reply_to_id``), following pagination, then grouped into threads by
+        :func:`group_review_comments_into_threads` so each top-level comment keeps its
+        ``path``/``line`` anchor and its ``replies``.
+
+        The SAME kept-author filter as the conversation path applies: only human and
+        Heimdall's-own authors survive (recognised via ``performed_via_github_app.id``);
+        every other bot is dropped.  Filtering runs on the flat list before grouping, so a
+        reply whose parent was a dropped bot is promoted to its own thread rather than
+        lost.  These threads are attacker-influenced third-party data, never instructions
+        — the filter narrows, but does not sanitise, the content.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            One dict per thread with ``body``, ``author`` (login), ``author_association``,
+            ``path``, ``line``, and a ``replies`` list (each reply shaped the same way),
+            in API (chronological) order.
+        """
+        url: str | None = (
+            f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/comments"
+        )
+        headers = await self._gh_headers()
+        kept: list[dict[str, Any]] = []
+        first_page = True
+        while url is not None:
+            kwargs: dict[str, Any] = {"headers": headers}
+            if first_page:
+                kwargs["params"] = {"per_page": 100}
+                first_page = False
+            response = await self._http.get(url, **kwargs)
+            response.raise_for_status()
+            for raw in response.json():
+                if self._keep_comment_author(raw):
+                    kept.append(raw)
+            url = self._next_page_url(response.headers.get("link", ""))
+        return group_review_comments_into_threads(kept)
 
     async def get_linked_issues(
         self,

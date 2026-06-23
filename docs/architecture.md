@@ -74,10 +74,15 @@ private key) to read the PR and post the review.
   **Heimdall's own** authors (other bots dropped); each carries `body`, `author`, and
   `author_association`. Written only when at least one comment is kept. Untrusted
   third-party data, never instructions.
+- `review_threads.json` — the PR's inline review comments grouped into parent-anchored
+  **reply threads**: each thread carries `body`, `author`, `author_association`, its
+  `path`/`line` anchor, and a `replies` list (each reply shaped the same way). Same
+  human + Heimdall's-own author filter as `comments.json`. Written only when at least
+  one thread is kept. Untrusted third-party data, never instructions.
 
 Each lens reads this workspace through the **`heimdall-context`** CLI wrapper — the single
-allowlisted Bash command — with subcommands `diff`, `pr`, `file <path>`, `docs`, and
-`comments`.
+allowlisted Bash command — with subcommands `diff`, `pr`, `file <path>`, `docs`,
+`comments`, and `review-threads`.
 
 ## 4. The lenses and synthesis (`heimdall/lens.py`)
 
@@ -128,9 +133,10 @@ lens. A failure in one lens is isolated — the rest still reach synthesis.
 A **4th synthesis pass** (`run_synthesis`, opus/max) receives the combined findings of every
 lens and: **dedups** overlapping findings across lenses, **ranks** by severity, **attributes**
 each survivor to its originating lens, writes the **verdict**, and formats the
-severity-grouped, lens-tagged body. When the seed kept any conversation comments, their payload
-is also embedded in the synthesis prompt inside an explicit **untrusted-data frame** — context
-to weigh, never instructions to follow (an empty comment set leaves the prompt unchanged). It too
+severity-grouped, lens-tagged body. When the seed kept any conversation comments or inline
+review threads, their payloads are also embedded in the synthesis prompt inside explicit
+**untrusted-data frames** — context to weigh, never instructions to follow (an empty set leaves
+the prompt unchanged). It too
 runs **inside the `bwrap` sandbox** (over a throwaway empty workspace, `~/.claude` bound
 read-only), so no `claude` pass is ever spawned unsandboxed. When every lens fails or synthesis
 itself aborts, that run produces no review (the retry/failure handling above takes over).

@@ -4,12 +4,13 @@ Provides subcommands:
   heimdall-context diff     <workspace>         — print the unified diff
   heimdall-context pr       <workspace>         — print PR metadata as JSON
   heimdall-context file     <workspace> <path>  — print a materialized file's content
-  heimdall-context docs     <workspace>         — print all repo docs
-  heimdall-context comments <workspace>         — print conversation comments as JSON
+  heimdall-context docs           <workspace>   — print all repo docs
+  heimdall-context comments       <workspace>   — print conversation comments as JSON
+  heimdall-context review-threads <workspace>   — print inline review threads as JSON
 
 The workspace must be a directory previously produced by assemble_pr_context()
-(i.e. it contains diff.patch, pr_metadata.json, files/, and optionally docs/ and
-comments.json).
+(i.e. it contains diff.patch, pr_metadata.json, files/, and optionally docs/,
+comments.json, and review_threads.json).
 
 This wrapper is the ONLY allowlisted Bash command used during AI-driven lens review
 sessions — it reads from pre-materialized data and executes nothing.  The ``file``
@@ -101,6 +102,20 @@ def cmd_docs(workspace: str) -> None:
             print(doc_path.read_text(encoding="utf-8"))
 
 
+def _print_json_array(workspace: str, filename: str) -> None:
+    """Print a materialized JSON-array file, or ``[]`` when the file is absent.
+
+    Shared by the ``comments`` and ``review-threads`` subcommands: each is
+    materialized only when non-empty, so a missing file is the empty-set case and
+    must read back as a valid empty JSON array rather than erroring.
+    """
+    path = Path(workspace) / filename
+    if not path.exists():
+        print("[]")
+        return
+    print(json.dumps(json.loads(path.read_text(encoding="utf-8")), indent=2))
+
+
 def cmd_comments(workspace: str) -> None:
     """Print the materialized conversation comments as JSON from the workspace.
 
@@ -111,12 +126,22 @@ def cmd_comments(workspace: str) -> None:
     Args:
         workspace: Path to the directory written by assemble_pr_context().
     """
-    comments_path = Path(workspace) / "comments.json"
-    if not comments_path.exists():
-        print("[]")
-        return
-    comments = json.loads(comments_path.read_text(encoding="utf-8"))
-    print(json.dumps(comments, indent=2))
+    _print_json_array(workspace, "comments.json")
+
+
+def cmd_review_threads(workspace: str) -> None:
+    """Print the materialized inline review threads as JSON from the workspace.
+
+    Reads ``review_threads.json`` (the kept inline review comments grouped into
+    parent-anchored reply threads, each with its ``path``/``line`` anchor).  This is
+    distinct from ``comments`` (the conversation timeline).  When no
+    ``review_threads.json`` is present — the empty case — an empty JSON array is
+    printed so the reader always sees valid JSON and never an error.
+
+    Args:
+        workspace: Path to the directory written by assemble_pr_context().
+    """
+    _print_json_array(workspace, "review_threads.json")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -154,6 +179,13 @@ def main(argv: list[str] | None = None) -> None:
         "workspace", help="Path to the materialized workspace"
     )
 
+    review_threads_parser = sub.add_parser(
+        "review-threads", help="Print inline review threads as JSON"
+    )
+    review_threads_parser.add_argument(
+        "workspace", help="Path to the materialized workspace"
+    )
+
     args = parser.parse_args(argv)
 
     if args.subcommand == "diff":
@@ -166,6 +198,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_docs(args.workspace)
     elif args.subcommand == "comments":
         cmd_comments(args.workspace)
+    elif args.subcommand == "review-threads":
+        cmd_review_threads(args.workspace)
     else:
         # argparse makes this unreachable, but keeps mypy happy
         parser.print_help()

@@ -347,6 +347,214 @@ async def test_get_pr_conversation_comments_empty() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Inline review comments: fetch + group into reply threads + kept-author filter
+# ---------------------------------------------------------------------------
+
+
+def _review_comment(
+    *,
+    body: str,
+    login: str,
+    comment_id: int,
+    path: str = "foo.py",
+    line: int | None = 3,
+    original_line: int | None = None,
+    in_reply_to_id: int | None = None,
+    user_type: str = "User",
+    association: str = "CONTRIBUTOR",
+    app_id: int | None = None,
+) -> dict[str, object]:
+    """Build a raw pulls review-comments API object for the thread tests."""
+    raw: dict[str, object] = {
+        "id": comment_id,
+        "body": body,
+        "user": {"login": login, "type": user_type},
+        "author_association": association,
+        "path": path,
+        "line": line,
+    }
+    if original_line is not None:
+        raw["original_line"] = original_line
+    if in_reply_to_id is not None:
+        raw["in_reply_to_id"] = in_reply_to_id
+    if app_id is not None:
+        raw["performed_via_github_app"] = {"id": app_id}
+    return raw
+
+
+def _single_page(rows: list[dict[str, object]]) -> AsyncMock:
+    """Build a mock http client whose GET returns one page of ``rows``."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value=rows)
+    mock_response.headers = {}
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=mock_response)
+    return mock_http
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_hits_pulls_comments_endpoint() -> None:
+    """Inline review comments come from the pulls comments endpoint (not issues)."""
+    mock_http = _single_page(
+        [_review_comment(body="anchored", login="alice", comment_id=1)]
+    )
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert "pulls/5/comments" in mock_http.get.call_args[0][0]
+    assert threads == [
+        {
+            "body": "anchored",
+            "author": "alice",
+            "author_association": "CONTRIBUTOR",
+            "path": "foo.py",
+            "line": 3,
+            "replies": [],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_groups_replies_under_parent() -> None:
+    """A reply (in_reply_to_id) is nested under its parent thread, anchor preserved."""
+    rows = [
+        _review_comment(body="root", login="alice", comment_id=1, path="a.py", line=7),
+        _review_comment(
+            body="reply", login="bob", comment_id=2, in_reply_to_id=1, line=7
+        ),
+    ]
+    mock_http = _single_page(rows)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert len(threads) == 1
+    thread = threads[0]
+    assert thread["body"] == "root"
+    assert thread["path"] == "a.py"
+    assert thread["line"] == 7
+    assert [r["body"] for r in thread["replies"]] == ["reply"]
+    assert thread["replies"][0]["author"] == "bob"
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_keeps_humans_and_heimdall_drops_bots() -> None:
+    """The conversation-path author filter applies to inline comments and replies."""
+    app_id = 4242
+    rows = [
+        _review_comment(body="from human", login="alice", comment_id=1),
+        _review_comment(
+            body="from CI bot", login="ci[bot]", comment_id=2, user_type="Bot"
+        ),
+        _review_comment(
+            body="heimdall reply",
+            login="heimdall[bot]",
+            comment_id=3,
+            in_reply_to_id=1,
+            user_type="Bot",
+            app_id=app_id,
+        ),
+        _review_comment(
+            body="other-bot reply",
+            login="dependabot[bot]",
+            comment_id=4,
+            in_reply_to_id=1,
+            user_type="Bot",
+            app_id=9999,
+        ),
+    ]
+    mock_http = _single_page(rows)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=app_id, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    # The CI-bot root and the other-app-bot reply are dropped; the Heimdall reply stays.
+    assert len(threads) == 1
+    assert threads[0]["body"] == "from human"
+    assert [r["body"] for r in threads[0]["replies"]] == ["heimdall reply"]
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_falls_back_to_original_line() -> None:
+    """An outdated comment with no current ``line`` anchors on ``original_line``."""
+    mock_http = _single_page(
+        [
+            _review_comment(
+                body="outdated", login="alice", comment_id=1, line=None, original_line=9
+            )
+        ]
+    )
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert threads[0]["line"] == 9
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_empty() -> None:
+    """No inline comments yields an empty thread list (clean empty handling)."""
+    mock_http = _single_page([])
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert threads == []
+
+
+def test_group_review_comments_promotes_orphan_reply_to_thread() -> None:
+    """A reply whose parent was filtered out becomes its own thread, not lost."""
+    from heimdall.github import group_review_comments_into_threads
+
+    # The root (id=1) is absent from the input (e.g. dropped by author filtering);
+    # only the reply remains, and it must still surface as a standalone thread.
+    threads = group_review_comments_into_threads(
+        [_review_comment(body="orphan reply", login="bob", comment_id=2, in_reply_to_id=1)]
+    )
+
+    assert len(threads) == 1
+    assert threads[0]["body"] == "orphan reply"
+    assert threads[0]["replies"] == []
+
+
+# ---------------------------------------------------------------------------
 # Across-push review lifecycle: dismiss (REQUEST_CHANGES) / minimize (COMMENT)
 # ---------------------------------------------------------------------------
 

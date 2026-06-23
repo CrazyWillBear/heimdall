@@ -18,6 +18,7 @@ from heimdall.context_cli import (
     cmd_docs,
     cmd_file,
     cmd_pr,
+    cmd_review_threads,
     main,
 )
 
@@ -40,6 +41,25 @@ _LINKED_ISSUES = [{"number": 42, "title": "Feature request"}]
 _COMMENTS = [
     {"body": "Looks good to me!", "author": "reviewer", "author_association": "MEMBER"},
     {"body": "One nit here.", "author": "octocat", "author_association": "OWNER"},
+]
+
+_REVIEW_THREADS = [
+    {
+        "body": "This line looks off.",
+        "author": "reviewer",
+        "author_association": "MEMBER",
+        "path": "foo.py",
+        "line": 2,
+        "replies": [
+            {
+                "body": "Good catch, fixed.",
+                "author": "octocat",
+                "author_association": "OWNER",
+                "path": "foo.py",
+                "line": 2,
+            }
+        ],
+    }
 ]
 
 _DIFF = """\
@@ -80,6 +100,7 @@ def _make_mock_github_client(
     file_content: str = _FILE_CONTENT,
     linked_issues: list[dict[str, Any]] | None = None,
     comments: list[dict[str, Any]] | None = None,
+    review_threads: list[dict[str, Any]] | None = None,
 ) -> AsyncMock:
     """Build a mocked GitHubClient that returns canned API data."""
     client = AsyncMock()
@@ -92,6 +113,9 @@ def _make_mock_github_client(
     )
     client.get_pr_conversation_comments = AsyncMock(
         return_value=comments if comments is not None else _COMMENTS
+    )
+    client.get_pr_review_comments = AsyncMock(
+        return_value=review_threads if review_threads is not None else _REVIEW_THREADS
     )
     return client
 
@@ -119,6 +143,7 @@ def test_pr_context_fields() -> None:
         file_contents={"foo.py": _FILE_CONTENT},
         docs={},
         comments=_COMMENTS,
+        review_threads=_REVIEW_THREADS,
     )
     assert ctx.repo_full_name == _REPO
     assert ctx.pr_number == _PR_NUMBER
@@ -305,6 +330,8 @@ def _write_workspace(tmp_path: Path, ctx: PRContext) -> Path:
         file_path.write_text(content)
     if ctx.comments:
         (tmp_path / "comments.json").write_text(json.dumps(ctx.comments))
+    if ctx.review_threads:
+        (tmp_path / "review_threads.json").write_text(json.dumps(ctx.review_threads))
     return tmp_path
 
 
@@ -325,6 +352,7 @@ def _make_context() -> PRContext:
         file_contents={"foo.py": _FILE_CONTENT},
         docs={},
         comments=_COMMENTS,
+        review_threads=_REVIEW_THREADS,
     )
 
 
@@ -541,6 +569,106 @@ def test_cmd_comments_empty_when_no_file(
 
 
 # ---------------------------------------------------------------------------
+# Inline review threads: assemble, materialize, and the CLI subcommand
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_seed_contains_review_threads() -> None:
+    """Assembled seed carries the kept inline review threads verbatim."""
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    assert ctx.review_threads == _REVIEW_THREADS
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_materializes_review_threads_file() -> None:
+    """assemble_pr_context writes review_threads.json when inline threads were kept."""
+    mock_client = _make_mock_github_client()
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        threads_path = Path(tmp_dir) / "review_threads.json"
+        assert threads_path.exists()
+        materialized = json.loads(threads_path.read_text())
+        assert materialized == _REVIEW_THREADS
+        # The thread keeps its file/line anchor and its nested reply.
+        assert materialized[0]["path"] == "foo.py"
+        assert materialized[0]["line"] == 2
+        assert materialized[0]["replies"][0]["body"] == "Good catch, fixed."
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_no_review_threads_writes_no_file() -> None:
+    """An empty inline-thread set leaves no review_threads.json (clean empty handling)."""
+    mock_client = _make_mock_github_client(review_threads=[])
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        assert ctx.review_threads == []
+        assert not (Path(tmp_dir) / "review_threads.json").exists()
+
+
+def test_cmd_review_threads_prints_materialized_threads(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """heimdall-context review-threads prints the materialized threads verbatim."""
+    ctx = _make_context()
+    workspace = _write_workspace(tmp_path, ctx)
+    cmd_review_threads(str(workspace))
+    captured = capsys.readouterr()
+    printed = json.loads(captured.out)
+    assert printed == _REVIEW_THREADS
+
+
+def test_main_review_threads_subcommand(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """main() dispatches the 'review-threads' subcommand, distinct from comments."""
+    ctx = _make_context()
+    workspace = _write_workspace(tmp_path, ctx)
+    main(["review-threads", str(workspace)])
+    captured = capsys.readouterr()
+    # The inline-thread body appears, not the conversation-comment body.
+    assert "This line looks off." in captured.out
+    assert "Looks good to me!" not in captured.out
+
+
+def test_cmd_review_threads_empty_when_no_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no review_threads.json, the subcommand prints an empty JSON array."""
+    cmd_review_threads(str(tmp_path))
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == []
+
+
+# ---------------------------------------------------------------------------
 # subprocess import guard: verify subprocess is never imported by context module
 # ---------------------------------------------------------------------------
 
@@ -577,6 +705,7 @@ def _make_context_with_files(file_contents: dict[str, str]) -> PRContext:
         file_contents=file_contents,
         docs={},
         comments=[],
+        review_threads=[],
     )
 
 
@@ -656,6 +785,7 @@ def test_materialize_rejects_traversal_doc_name(tmp_path: Path) -> None:
         file_contents={},
         docs={"../../evil-conv.txt": "evil content"},
         comments=[],
+        review_threads=[],
     )
     _materialize(ctx, str(workspace))
 
@@ -848,6 +978,7 @@ def _make_mock_github_client_with_docs(
     client.get_file_content = _get_file_content
     client.get_linked_issues = AsyncMock(return_value=_LINKED_ISSUES)
     client.get_pr_conversation_comments = AsyncMock(return_value=_COMMENTS)
+    client.get_pr_review_comments = AsyncMock(return_value=_REVIEW_THREADS)
     return client
 
 
@@ -1001,6 +1132,7 @@ def _make_context_with_docs() -> PRContext:
         file_contents={"foo.py": _FILE_CONTENT},
         docs=_DOCS,
         comments=_COMMENTS,
+        review_threads=_REVIEW_THREADS,
     )
 
 

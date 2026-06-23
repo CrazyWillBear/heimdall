@@ -50,6 +50,10 @@ class PRContext:
         comments: Kept conversation (timeline) comments — human and Heimdall's own —
             each with its ``body``, ``author`` login, and ``author_association``.
             Untrusted third-party data, never instructions.  May be empty.
+        review_threads: Kept inline review comments grouped into parent-anchored reply
+            threads — each thread carries its ``body``, ``author``, ``author_association``,
+            ``path``/``line`` anchor, and a ``replies`` list.  Same author filter and
+            untrusted-data posture as ``comments``.  May be empty.
     """
 
     repo_full_name: str
@@ -67,6 +71,7 @@ class PRContext:
     file_contents: dict[str, str]
     docs: dict[str, str]
     comments: list[dict[str, Any]]
+    review_threads: list[dict[str, Any]]
 
 
 async def assemble_pr_context(
@@ -86,8 +91,9 @@ async def assemble_pr_context(
     from the GitHub REST API.
 
     If ``workspace_dir`` is provided the assembled context is also materialized
-    to disk there (diff.patch, pr_metadata.json, files/<path>, and comments.json
-    when any conversation comments were kept).  When omitted a
+    to disk there (diff.patch, pr_metadata.json, files/<path>, comments.json when any
+    conversation comments were kept, and review_threads.json when any inline review
+    threads were kept).  When omitted a
     temporary directory is created, the context is materialized into it, and the
     directory is cleaned up before this function returns.
 
@@ -113,7 +119,7 @@ async def assemble_pr_context(
         installation_id=installation_id,
     )
     try:
-        pr_meta, diff, files, linked, comments = await _fetch_pr_data(
+        pr_meta, diff, files, linked, comments, review_threads = await _fetch_pr_data(
             github, repo_full_name=repo_full_name, pr_number=pr_number
         )
         head_sha = pr_meta["head"]["sha"]
@@ -143,6 +149,7 @@ async def assemble_pr_context(
         file_contents=file_contents,
         docs=fetched_docs,
         comments=comments,
+        review_threads=review_threads,
     )
 
     if workspace_dir is not None:
@@ -169,11 +176,13 @@ async def _fetch_pr_data(
     list[dict[str, Any]],
     list[dict[str, Any]],
     list[dict[str, Any]],
+    list[dict[str, Any]],
 ]:
     """Fetch PR metadata, diff, files, linked issues, and comments in parallel.
 
     Returns:
-        (pr_metadata, diff_text, changed_files, linked_issues, conversation_comments)
+        (pr_metadata, diff_text, changed_files, linked_issues, conversation_comments,
+        review_threads)
     """
     import asyncio
 
@@ -194,10 +203,20 @@ async def _fetch_pr_data(
             repo_full_name=repo_full_name, pr_number=pr_number
         )
     )
-    pr_meta, diff, files, linked, comments = await asyncio.gather(
-        pr_meta_task, diff_task, files_task, linked_task, comments_task
+    review_threads_task = asyncio.create_task(
+        github.get_pr_review_comments(
+            repo_full_name=repo_full_name, pr_number=pr_number
+        )
     )
-    return pr_meta, diff, files, linked, comments
+    pr_meta, diff, files, linked, comments, review_threads = await asyncio.gather(
+        pr_meta_task,
+        diff_task,
+        files_task,
+        linked_task,
+        comments_task,
+        review_threads_task,
+    )
+    return pr_meta, diff, files, linked, comments, review_threads
 
 
 async def _fetch_file_contents_and_docs(
@@ -342,6 +361,7 @@ def _materialize(ctx: PRContext, directory: str) -> None:
       <directory>/files/<path>             — full content of each changed file
       <directory>/docs/<name>              — repo docs (if any)
       <directory>/comments.json            — conversation comments (only if any)
+      <directory>/review_threads.json       — inline review threads (only if any)
     """
     root = Path(directory)
 
@@ -369,6 +389,14 @@ def _materialize(ctx: PRContext, directory: str) -> None:
     if ctx.comments:
         (root / "comments.json").write_text(
             json.dumps(ctx.comments, indent=2), encoding="utf-8"
+        )
+
+    # Inline review threads follow the same write-only-when-present rule as
+    # comments.json, so an empty set leaves no file and the CLI/synthesis paths
+    # see "no threads" cleanly rather than an empty-array file to special-case.
+    if ctx.review_threads:
+        (root / "review_threads.json").write_text(
+            json.dumps(ctx.review_threads, indent=2), encoding="utf-8"
         )
 
     files_root = root / "files"
