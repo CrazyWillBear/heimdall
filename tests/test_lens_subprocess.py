@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -25,14 +26,21 @@ from heimdall.lens import (
 )
 
 
-def _fake_proc(*, stdout: bytes, exhausts_wait: bool = False) -> MagicMock:
+def _fake_proc(
+    *,
+    stdout: bytes,
+    exhausts_wait: bool = False,
+    returncode: int = 0,
+    stderr: bytes = b"",
+) -> MagicMock:
     """Build a fake asyncio subprocess.
 
     When ``exhausts_wait`` is True, communicate() never returns (simulating a
-    hung claude run) so wait_for must time out.
+    hung claude run) so wait_for must time out.  ``returncode``/``stderr`` drive the
+    failure-diagnostic path (a non-zero exit or an error written to stderr).
     """
     proc = MagicMock()
-    proc.returncode = 0
+    proc.returncode = returncode
     proc.kill = MagicMock()
     proc.wait = AsyncMock()
 
@@ -43,7 +51,7 @@ def _fake_proc(*, stdout: bytes, exhausts_wait: bool = False) -> MagicMock:
 
         proc.communicate = _never
     else:
-        proc.communicate = AsyncMock(return_value=(stdout, b""))
+        proc.communicate = AsyncMock(return_value=(stdout, stderr))
     return proc
 
 
@@ -199,3 +207,61 @@ async def test_subprocess_killed_when_token_cap_exceeded() -> None:
         )
 
     proc.kill.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_subprocess_logs_returncode_and_stderr_on_failed_run(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-zero exit / empty (0-token) run logs claude's returncode + stderr tail.
+
+    This is the diagnostic seam: without it a failed claude run collapses to the
+    generic "produced 0 tokens" guard downstream, hiding the real cause (an API
+    overload/rate-limit, an oversized prompt, a crash).
+    """
+    proc = _fake_proc(
+        stdout=b"",
+        returncode=1,
+        stderr=b"API Error: 529 overloaded_error",
+    )
+
+    with patch(
+        "heimdall.lens._resolve_bwrap", return_value="/usr/bin/bwrap"
+    ), patch(
+        "heimdall.lens.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=proc),
+    ), caplog.at_level(logging.WARNING, logger="heimdall.lens"):
+        result = await run_claude_subprocess(
+            ["claude", "-p"], timeout_seconds=900, token_cap=400_000, cwd="/srv/seed"
+        )
+
+    # The run still returns (the 0-token guard fires downstream), but the cause is
+    # now in the logs: the exit code and the stderr tail.
+    assert result.total_tokens == 0
+    assert "529 overloaded_error" in caplog.text
+    assert "exit 1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_subprocess_does_not_warn_on_successful_run(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A clean run (exit 0, tokens > 0) emits no failure-diagnostic warning."""
+    stdout = _claude_json(
+        [{"severity": "low", "title": "nit", "message": "style"}],
+        total_tokens=1234,
+    )
+    proc = _fake_proc(stdout=stdout, stderr=b"some benign stderr chatter")
+
+    with patch(
+        "heimdall.lens._resolve_bwrap", return_value="/usr/bin/bwrap"
+    ), patch(
+        "heimdall.lens.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=proc),
+    ), caplog.at_level(logging.WARNING, logger="heimdall.lens"):
+        result = await run_claude_subprocess(
+            ["claude", "-p"], timeout_seconds=900, token_cap=400_000, cwd="/srv/seed"
+        )
+
+    assert result.total_tokens == 1234
+    assert caplog.text == ""

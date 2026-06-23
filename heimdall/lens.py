@@ -61,6 +61,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_TOKEN_CAP = 400_000
 # Generous wall-clock timeout; a lens that runs longer is killed.
 DEFAULT_TIMEOUT_SECONDS = 1_800.0
+# How much of a failed claude run's stderr to keep in the diagnostic log line.
+_STDERR_LOG_TAIL_CHARS = 2_000
 
 
 class Severity(Enum):
@@ -1367,7 +1369,7 @@ async def run_claude_subprocess(
         env=_build_subprocess_env(env_passthrough),
     )
     try:
-        stdout_bytes, _ = await asyncio.wait_for(
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(), timeout=timeout_seconds
         )
     except TimeoutError as exc:
@@ -1383,6 +1385,20 @@ async def run_claude_subprocess(
         raise LensTokenCapError(
             f"Lens run used {total_tokens} tokens, exceeding cap {token_cap}; "
             "subprocess killed"
+        )
+
+    # Surface the cause of a failed run. A non-zero exit, an error-tagged result, or
+    # zero usage all collapse downstream to the generic "produced 0 tokens" guard,
+    # which hides *why* (an API overload/rate-limit, an oversized prompt, a crash).
+    # claude writes that detail to stderr, so log the exit code and stderr tail here —
+    # the one place both are still in hand — rather than discarding them.
+    if proc.returncode != 0 or total_tokens <= 0 or envelope.get("is_error"):
+        stderr_tail = stderr_bytes.decode("utf-8", errors="replace").strip()
+        logger.warning(
+            "claude subprocess failed (exit %s, %d tokens); stderr tail: %s",
+            proc.returncode,
+            total_tokens,
+            stderr_tail[-_STDERR_LOG_TAIL_CHARS:] if stderr_tail else "<empty>",
         )
 
     result_text = envelope.get("result")
