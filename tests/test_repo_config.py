@@ -14,6 +14,7 @@ import pytest
 from heimdall.lens import DESIGN_LENS, SECURITY_LENS, Severity
 from heimdall.repo_config import (
     CONFIG_PATH,
+    DEFAULT_MAX_COMMENTS,
     GuardrailCaps,
     RepoConfig,
     RepoConfigError,
@@ -551,3 +552,64 @@ def test_diff_cap_note_over_line_cap() -> None:
     note = diff_cap_skip_note(caps, file_count=3, diff_lines=1001)
     assert note is not None
     assert "1001 changed lines" in note
+
+
+# ---------------------------------------------------------------------------
+# Issue #68 — comment-incorporation toggle (default on) + max-comments cap
+# ---------------------------------------------------------------------------
+
+
+def test_comments_block_defaults_when_absent() -> None:
+    """An absent comments block defaults to enabled with the safe max-comments cap."""
+    config = parse_repo_config("")
+    assert config.comments.enabled is True
+    assert config.comments.max_comments == DEFAULT_MAX_COMMENTS
+
+
+def test_comments_block_is_configurable() -> None:
+    """Both the toggle and the cap can be overridden from heimdall.yml."""
+    config = parse_repo_config("comments:\n  enabled: false\n  max_comments: 5\n")
+    assert config.comments.enabled is False
+    assert config.comments.max_comments == 5
+
+
+def test_comments_toggle_off_keeps_safe_cap_default() -> None:
+    """Disabling the toggle without a cap still carries the safe default cap."""
+    config = parse_repo_config("comments:\n  enabled: false\n")
+    assert config.comments.enabled is False
+    assert config.comments.max_comments == DEFAULT_MAX_COMMENTS
+
+
+def test_comments_max_comments_zero_or_negative_rejected() -> None:
+    """A non-positive cap is meaningless — reject it like the guardrail caps."""
+    with pytest.raises(RepoConfigError):
+        parse_repo_config("comments:\n  max_comments: 0\n")
+
+
+def test_unknown_comments_key_rejected() -> None:
+    """An unknown comments key is a typo signal — reject rather than ignore."""
+    with pytest.raises(RepoConfigError):
+        parse_repo_config("comments:\n  bogus: 1\n")
+
+
+@pytest.mark.asyncio
+async def test_fork_pr_cannot_flip_comments_toggle_from_head() -> None:
+    """A fork PR reads the comments block from the BASE ref, not its own head.
+
+    The head config could try to flip ``enabled`` on, but the trust-resolved ref
+    forces the base, so the head version is never honored (fork-safety inherited).
+    """
+    github = AsyncMock()
+    github.get_file_content = AsyncMock(return_value="comments:\n  enabled: false\n")
+    pr = _pr(head_repo="attacker/repo", base_sha="BASE_SHA", head_sha="HEAD_SHA")
+
+    config = await load_repo_config(github, repo_full_name=_REPO, pr=pr)
+
+    assert config is not None
+    assert config.comments.enabled is False
+    github.get_file_content.assert_awaited_once_with(
+        repo_full_name=_REPO,
+        path=CONFIG_PATH,
+        ref="BASE_SHA",
+        tolerate_missing=True,
+    )

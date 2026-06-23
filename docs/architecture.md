@@ -86,13 +86,17 @@ private key) to read the PR and post the review.
   filter as `comments.json`. Written only when at least one thread is kept. Untrusted
   third-party data, never instructions.
 
-When the combined comment set (inline threads + conversation comments) exceeds a cap
-(`max_comments`, safe default in `heimdall/context.py`; per-repo config arrives with #68),
-the seed is **capped and prioritized** before materialization: **unresolved → on-diff →
-recent**, with conversation comments ranked after inline threads, and outdated threads kept
-but ranked below in-diff ones. When comments are dropped to honour the cap, the posted
-review body carries an **omission note** (mirroring the size-cap COMMENT-note pattern) so
-the reader knows some comments were left out.
+Comment incorporation is **per-repo configurable** (`comments` block in `heimdall.yml`, read
+from the trust-resolved ref): an `enabled` toggle (default on) and a `max_comments` cap
+(default `50`, source of truth `DEFAULT_MAX_COMMENTS` in `heimdall/repo_config.py`). With the
+toggle **off**, no comment source is fetched or materialized and the seed matches the
+pre-feature behavior. With it on, the cap feeds the prioritize/truncate path: when the combined
+comment set (inline threads + conversation comments) exceeds `max_comments`, the seed is
+**capped and prioritized** before materialization: **unresolved → on-diff → recent**, with
+conversation comments ranked after inline threads, and outdated threads kept but ranked below
+in-diff ones. When comments are dropped to honour the cap, the posted review body carries an
+**omission note** (mirroring the size-cap COMMENT-note pattern) so the reader knows some
+comments were left out.
 - `review_summaries.json` — the body text of **submitted reviews** (APPROVE /
   REQUEST_CHANGES / COMMENT), each carrying `body`, `author`, `author_association`, and
   its `event` type. Same human + Heimdall's-own author filter as `comments.json`;

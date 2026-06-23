@@ -699,6 +699,11 @@ async def _synthesize_review(
             pr_number=pr_number,
             workspace_dir=workspace,
             docs=config.docs,
+            # Per-repo comment-incorporation control (#68): the toggle gates whether
+            # any comment plumbing runs; the cap feeds the prioritize/truncate path.
+            # Both come from the trust-resolved config, so a fork can't flip them.
+            incorporate_comments=config.comments.enabled,
+            max_comments=config.comments.max_comments,
         )
 
         lens_results, dropped_lenses = await _run_lenses(
