@@ -7,10 +7,12 @@ Provides subcommands:
   heimdall-context docs           <workspace>   — print all repo docs
   heimdall-context comments       <workspace>   — print conversation comments as JSON
   heimdall-context review-threads <workspace>   — print inline review threads as JSON
+  heimdall-context review-summaries <workspace> — print submitted-review summaries as JSON
+  heimdall-context own-prior      <workspace>   — print Heimdall's own prior review as JSON
 
 The workspace must be a directory previously produced by assemble_pr_context()
 (i.e. it contains diff.patch, pr_metadata.json, files/, and optionally docs/,
-comments.json, and review_threads.json).
+comments.json, review_threads.json, review_summaries.json, and own_prior_review.json).
 
 This wrapper is the ONLY allowlisted Bash command used during AI-driven lens review
 sessions — it reads from pre-materialized data and executes nothing.  The ``file``
@@ -144,6 +146,40 @@ def cmd_review_threads(workspace: str) -> None:
     _print_json_array(workspace, "review_threads.json")
 
 
+def cmd_review_summaries(workspace: str) -> None:
+    """Print the materialized review summaries as JSON from the workspace.
+
+    Reads ``review_summaries.json`` (the kept submitted-review summary bodies — human
+    and Heimdall's own — each carrying its ``event`` type APPROVE/REQUEST_CHANGES/
+    COMMENT).  This is distinct from ``comments`` (timeline) and ``review-threads``
+    (line-anchored).  When no ``review_summaries.json`` is present — the empty case —
+    an empty JSON array is printed so the reader always sees valid JSON.
+
+    Args:
+        workspace: Path to the directory written by assemble_pr_context().
+    """
+    _print_json_array(workspace, "review_summaries.json")
+
+
+def cmd_own_prior_review(workspace: str) -> None:
+    """Print Heimdall's own materialized prior review as JSON from the workspace.
+
+    Reads ``own_prior_review.json`` (Heimdall's own latest prior review: its body,
+    event type, and inline comments), fetched before the across-push retire/delete
+    step destroyed it.  Unlike the other comment subcommands this is a single object,
+    not an array; when no ``own_prior_review.json`` is present — Heimdall has not
+    reviewed this PR yet — ``null`` is printed so the reader always sees valid JSON.
+
+    Args:
+        workspace: Path to the directory written by assemble_pr_context().
+    """
+    path = Path(workspace) / "own_prior_review.json"
+    if not path.exists():
+        print("null")
+        return
+    print(json.dumps(json.loads(path.read_text(encoding="utf-8")), indent=2))
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry point for the heimdall-context CLI.
 
@@ -186,6 +222,20 @@ def main(argv: list[str] | None = None) -> None:
         "workspace", help="Path to the materialized workspace"
     )
 
+    review_summaries_parser = sub.add_parser(
+        "review-summaries", help="Print submitted-review summaries as JSON"
+    )
+    review_summaries_parser.add_argument(
+        "workspace", help="Path to the materialized workspace"
+    )
+
+    own_prior_parser = sub.add_parser(
+        "own-prior", help="Print Heimdall's own prior review as JSON"
+    )
+    own_prior_parser.add_argument(
+        "workspace", help="Path to the materialized workspace"
+    )
+
     args = parser.parse_args(argv)
 
     if args.subcommand == "diff":
@@ -200,6 +250,10 @@ def main(argv: list[str] | None = None) -> None:
         cmd_comments(args.workspace)
     elif args.subcommand == "review-threads":
         cmd_review_threads(args.workspace)
+    elif args.subcommand == "review-summaries":
+        cmd_review_summaries(args.workspace)
+    elif args.subcommand == "own-prior":
+        cmd_own_prior_review(args.workspace)
     else:
         # argparse makes this unreachable, but keeps mypy happy
         parser.print_help()

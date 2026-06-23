@@ -317,6 +317,148 @@ async def test_run_review_passes_assembled_review_threads_into_synthesis() -> No
 
 
 @pytest.mark.asyncio
+async def test_run_review_passes_assembled_review_summaries_into_synthesis() -> None:
+    """The seed's review summaries reach run_synthesis (the end-to-end pipe)."""
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    review_summaries = [
+        {
+            "body": "Approving overall.",
+            "author": "alice",
+            "author_association": "MEMBER",
+            "event": "APPROVE",
+        },
+    ]
+    seed = MagicMock()
+    seed.review_summaries = review_summaries
+
+    stack, synth_mock = _patch_review_pipeline(
+        synthesis_result=_synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")]),
+    )
+    with (
+        stack,
+        patch(
+            "heimdall.worker.assemble_pr_context",
+            new=AsyncMock(return_value=seed),
+        ),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    synth_mock.assert_awaited_once()
+    assert synth_mock.await_args is not None
+    assert synth_mock.await_args.kwargs["review_summaries"] == review_summaries
+
+
+@pytest.mark.asyncio
+async def test_run_review_passes_own_prior_review_into_synthesis() -> None:
+    """The seed's Heimdall-own prior review reaches run_synthesis (end-to-end pipe)."""
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    own_prior_review = {
+        "body": "Heimdall review: 1 finding.",
+        "author": "heimdall[bot]",
+        "author_association": "NONE",
+        "event": "REQUEST_CHANGES",
+        "inline_comments": [],
+    }
+    seed = MagicMock()
+    seed.own_prior_review = own_prior_review
+
+    stack, synth_mock = _patch_review_pipeline(
+        synthesis_result=_synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")]),
+    )
+    with (
+        stack,
+        patch(
+            "heimdall.worker.assemble_pr_context",
+            new=AsyncMock(return_value=seed),
+        ),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    synth_mock.assert_awaited_once()
+    assert synth_mock.await_args is not None
+    assert synth_mock.await_args.kwargs["own_prior_review"] == own_prior_review
+
+
+@pytest.mark.asyncio
+async def test_own_prior_review_fetched_before_prior_review_retire_delete() -> None:
+    """Regression: the seed (which fetches the own-prior review) is assembled BEFORE the
+    across-push retire/delete step destroys it.
+
+    The retire/delete step (``_refresh_prior_review`` → ``delete_review_comment`` /
+    ``dismiss_review``) runs only after ``_synthesize_review`` — which calls
+    ``assemble_pr_context`` to read Heimdall's own prior review.  Locking that order
+    guards against a future refactor that retires the prior review before its context is
+    captured, silently destroying the own-prior signal this slice adds.
+    """
+    order: list[str] = []
+
+    async def _assemble(*_args: object, **_kwargs: object) -> MagicMock:
+        order.append("assemble")
+        return MagicMock()
+
+    mock_gh_client = _gh_client(review_id=2, node_id="NODE2")
+    mock_gh_client.list_review_comments = AsyncMock(return_value=[{"id": 101}])
+
+    async def _delete(**_kwargs: object) -> None:
+        order.append("delete")
+
+    async def _dismiss(**_kwargs: object) -> None:
+        order.append("dismiss")
+
+    mock_gh_client.delete_review_comment = AsyncMock(side_effect=_delete)
+    mock_gh_client.dismiss_review = AsyncMock(side_effect=_dismiss)
+
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+    prior = {"review_id": 1, "node_id": "NODE1", "verdict": "REQUEST_CHANGES"}
+    stack, _ = _patch_review_pipeline(
+        synthesis_result=_synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")]),
+        prior_review=prior,
+    )
+    with (
+        stack,
+        patch("heimdall.worker.assemble_pr_context", new=_assemble),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    # Assembly (own-prior fetch) must happen before the prior review is deleted/dismissed.
+    assert "assemble" in order
+    assert "delete" in order
+    assert order.index("assemble") < order.index("delete")
+    assert order.index("assemble") < order.index("dismiss")
+
+
+@pytest.mark.asyncio
 async def test_run_review_body_is_severity_grouped_and_lens_tagged() -> None:
     """The posted body groups synthesized findings by severity, each tagged by lens."""
     mock_gh_client = _gh_client()

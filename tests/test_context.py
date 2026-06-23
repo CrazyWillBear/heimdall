@@ -17,7 +17,9 @@ from heimdall.context_cli import (
     cmd_diff,
     cmd_docs,
     cmd_file,
+    cmd_own_prior_review,
     cmd_pr,
+    cmd_review_summaries,
     cmd_review_threads,
     main,
 )
@@ -25,6 +27,10 @@ from heimdall.context_cli import (
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+# Distinguishes "caller did not pass own_prior_review" (use the default fixture) from an
+# explicit own_prior_review=None (simulate a PR with no prior Heimdall review).
+_SENTINEL = object()
 
 _REPO = "owner/repo"
 _PR_NUMBER = 7
@@ -61,6 +67,37 @@ _REVIEW_THREADS = [
         ],
     }
 ]
+
+_REVIEW_SUMMARIES = [
+    {
+        "body": "Approving, looks solid.",
+        "author": "reviewer",
+        "author_association": "MEMBER",
+        "event": "APPROVE",
+    },
+    {
+        "body": "Needs a tweak before merge.",
+        "author": "maintainer",
+        "author_association": "OWNER",
+        "event": "REQUEST_CHANGES",
+    },
+]
+
+_OWN_PRIOR_REVIEW = {
+    "body": "Heimdall review: 1 finding.",
+    "author": "heimdall[bot]",
+    "author_association": "NONE",
+    "event": "REQUEST_CHANGES",
+    "inline_comments": [
+        {
+            "body": "Prior inline note from Heimdall.",
+            "author": "heimdall[bot]",
+            "author_association": "NONE",
+            "path": "foo.py",
+            "line": 2,
+        }
+    ],
+}
 
 _DIFF = """\
 diff --git a/foo.py b/foo.py
@@ -101,6 +138,8 @@ def _make_mock_github_client(
     linked_issues: list[dict[str, Any]] | None = None,
     comments: list[dict[str, Any]] | None = None,
     review_threads: list[dict[str, Any]] | None = None,
+    review_summaries: list[dict[str, Any]] | None = None,
+    own_prior_review: dict[str, Any] | None | object = _SENTINEL,
 ) -> AsyncMock:
     """Build a mocked GitHubClient that returns canned API data."""
     client = AsyncMock()
@@ -116,6 +155,14 @@ def _make_mock_github_client(
     )
     client.get_pr_review_comments = AsyncMock(
         return_value=review_threads if review_threads is not None else _REVIEW_THREADS
+    )
+    client.get_pr_review_summaries = AsyncMock(
+        return_value=review_summaries if review_summaries is not None else _REVIEW_SUMMARIES
+    )
+    client.get_own_prior_review = AsyncMock(
+        return_value=_OWN_PRIOR_REVIEW
+        if own_prior_review is _SENTINEL
+        else own_prior_review
     )
     return client
 
@@ -144,6 +191,8 @@ def test_pr_context_fields() -> None:
         docs={},
         comments=_COMMENTS,
         review_threads=_REVIEW_THREADS,
+        review_summaries=_REVIEW_SUMMARIES,
+        own_prior_review=_OWN_PRIOR_REVIEW,
     )
     assert ctx.repo_full_name == _REPO
     assert ctx.pr_number == _PR_NUMBER
@@ -332,6 +381,14 @@ def _write_workspace(tmp_path: Path, ctx: PRContext) -> Path:
         (tmp_path / "comments.json").write_text(json.dumps(ctx.comments))
     if ctx.review_threads:
         (tmp_path / "review_threads.json").write_text(json.dumps(ctx.review_threads))
+    if ctx.review_summaries:
+        (tmp_path / "review_summaries.json").write_text(
+            json.dumps(ctx.review_summaries)
+        )
+    if ctx.own_prior_review:
+        (tmp_path / "own_prior_review.json").write_text(
+            json.dumps(ctx.own_prior_review)
+        )
     return tmp_path
 
 
@@ -353,6 +410,8 @@ def _make_context() -> PRContext:
         docs={},
         comments=_COMMENTS,
         review_threads=_REVIEW_THREADS,
+        review_summaries=_REVIEW_SUMMARIES,
+        own_prior_review=_OWN_PRIOR_REVIEW,
     )
 
 
@@ -669,6 +728,189 @@ def test_cmd_review_threads_empty_when_no_file(
 
 
 # ---------------------------------------------------------------------------
+# Review summaries + Heimdall's own prior review: assemble, materialize, CLI
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_seed_contains_review_summaries() -> None:
+    """Assembled seed carries the kept review summaries (with event type) verbatim."""
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    assert ctx.review_summaries == _REVIEW_SUMMARIES
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_seed_contains_own_prior_review() -> None:
+    """Assembled seed carries Heimdall's own prior review (body + inline comments)."""
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    assert ctx.own_prior_review == _OWN_PRIOR_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_materializes_review_summaries_file() -> None:
+    """assemble_pr_context writes review_summaries.json when summaries were kept."""
+    mock_client = _make_mock_github_client()
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        summaries_path = Path(tmp_dir) / "review_summaries.json"
+        assert summaries_path.exists()
+        materialized = json.loads(summaries_path.read_text())
+        assert materialized == _REVIEW_SUMMARIES
+        assert materialized[0]["event"] == "APPROVE"
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_materializes_own_prior_review_file() -> None:
+    """assemble_pr_context writes own_prior_review.json when a prior review exists."""
+    mock_client = _make_mock_github_client()
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        own_path = Path(tmp_dir) / "own_prior_review.json"
+        assert own_path.exists()
+        materialized = json.loads(own_path.read_text())
+        assert materialized == _OWN_PRIOR_REVIEW
+        assert materialized["inline_comments"][0]["path"] == "foo.py"
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_no_review_summaries_writes_no_file() -> None:
+    """An empty summary set leaves no review_summaries.json (clean empty handling)."""
+    mock_client = _make_mock_github_client(review_summaries=[])
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        assert ctx.review_summaries == []
+        assert not (Path(tmp_dir) / "review_summaries.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_no_own_prior_review_writes_no_file() -> None:
+    """No prior Heimdall review leaves no own_prior_review.json (clean empty handling)."""
+    mock_client = _make_mock_github_client(own_prior_review=None)
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        assert ctx.own_prior_review is None
+        assert not (Path(tmp_dir) / "own_prior_review.json").exists()
+
+
+def test_cmd_review_summaries_prints_materialized_summaries(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """heimdall-context review-summaries prints the materialized summaries verbatim."""
+    ctx = _make_context()
+    workspace = _write_workspace(tmp_path, ctx)
+    cmd_review_summaries(str(workspace))
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == _REVIEW_SUMMARIES
+
+
+def test_cmd_own_prior_review_prints_materialized_review(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """heimdall-context own-prior prints Heimdall's materialized prior review verbatim."""
+    ctx = _make_context()
+    workspace = _write_workspace(tmp_path, ctx)
+    cmd_own_prior_review(str(workspace))
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == _OWN_PRIOR_REVIEW
+
+
+def test_main_review_summaries_and_own_prior_distinguishable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The summary and own-prior subcommands surface content distinct from other kinds."""
+    ctx = _make_context()
+    workspace = _write_workspace(tmp_path, ctx)
+
+    main(["review-summaries", str(workspace)])
+    summaries_out = capsys.readouterr().out
+    # The review-summary body + its event type appear, not a conversation comment.
+    assert "Approving, looks solid." in summaries_out
+    assert "APPROVE" in summaries_out
+    assert "Looks good to me!" not in summaries_out
+
+    main(["own-prior", str(workspace)])
+    own_out = capsys.readouterr().out
+    # Heimdall's own prior body + inline note appear, distinct from the summaries.
+    assert "Heimdall review: 1 finding." in own_out
+    assert "Prior inline note from Heimdall." in own_out
+    assert "Approving, looks solid." not in own_out
+
+
+def test_cmd_review_summaries_empty_when_no_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no review_summaries.json, the subcommand prints an empty JSON array."""
+    cmd_review_summaries(str(tmp_path))
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == []
+
+
+def test_cmd_own_prior_review_empty_when_no_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no own_prior_review.json, the own-prior subcommand prints null."""
+    cmd_own_prior_review(str(tmp_path))
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) is None
+
+
+# ---------------------------------------------------------------------------
 # subprocess import guard: verify subprocess is never imported by context module
 # ---------------------------------------------------------------------------
 
@@ -706,6 +948,8 @@ def _make_context_with_files(file_contents: dict[str, str]) -> PRContext:
         docs={},
         comments=[],
         review_threads=[],
+        review_summaries=[],
+        own_prior_review=None,
     )
 
 
@@ -786,6 +1030,8 @@ def test_materialize_rejects_traversal_doc_name(tmp_path: Path) -> None:
         docs={"../../evil-conv.txt": "evil content"},
         comments=[],
         review_threads=[],
+        review_summaries=[],
+        own_prior_review=None,
     )
     _materialize(ctx, str(workspace))
 
@@ -979,6 +1225,8 @@ def _make_mock_github_client_with_docs(
     client.get_linked_issues = AsyncMock(return_value=_LINKED_ISSUES)
     client.get_pr_conversation_comments = AsyncMock(return_value=_COMMENTS)
     client.get_pr_review_comments = AsyncMock(return_value=_REVIEW_THREADS)
+    client.get_pr_review_summaries = AsyncMock(return_value=_REVIEW_SUMMARIES)
+    client.get_own_prior_review = AsyncMock(return_value=_OWN_PRIOR_REVIEW)
     return client
 
 
@@ -1133,6 +1381,8 @@ def _make_context_with_docs() -> PRContext:
         docs=_DOCS,
         comments=_COMMENTS,
         review_threads=_REVIEW_THREADS,
+        review_summaries=_REVIEW_SUMMARIES,
+        own_prior_review=_OWN_PRIOR_REVIEW,
     )
 
 

@@ -54,6 +54,15 @@ class PRContext:
             threads — each thread carries its ``body``, ``author``, ``author_association``,
             ``path``/``line`` anchor, and a ``replies`` list.  Same author filter and
             untrusted-data posture as ``comments``.  May be empty.
+        review_summaries: Kept submitted-review summary bodies — human and Heimdall's own —
+            each with its ``body``, ``author`` login, ``author_association``, and ``event``
+            (APPROVE/REQUEST_CHANGES/COMMENT).  Same author filter and untrusted-data
+            posture as ``comments``.  May be empty.
+        own_prior_review: Heimdall's own latest prior review on this PR — its ``body``,
+            ``author``, ``author_association``, ``event``, and an ``inline_comments`` list
+            — fetched BEFORE the across-push retire/delete step destroys it.  None when
+            Heimdall has not reviewed this PR yet.  Untrusted-self continuity context,
+            never an instruction.
     """
 
     repo_full_name: str
@@ -72,6 +81,8 @@ class PRContext:
     docs: dict[str, str]
     comments: list[dict[str, Any]]
     review_threads: list[dict[str, Any]]
+    review_summaries: list[dict[str, Any]]
+    own_prior_review: dict[str, Any] | None
 
 
 async def assemble_pr_context(
@@ -92,8 +103,9 @@ async def assemble_pr_context(
 
     If ``workspace_dir`` is provided the assembled context is also materialized
     to disk there (diff.patch, pr_metadata.json, files/<path>, comments.json when any
-    conversation comments were kept, and review_threads.json when any inline review
-    threads were kept).  When omitted a
+    conversation comments were kept, review_threads.json when any inline review threads
+    were kept, review_summaries.json when any submitted-review summaries were kept, and
+    own_prior_review.json when Heimdall has a prior review on the PR).  When omitted a
     temporary directory is created, the context is materialized into it, and the
     directory is cleaned up before this function returns.
 
@@ -119,7 +131,16 @@ async def assemble_pr_context(
         installation_id=installation_id,
     )
     try:
-        pr_meta, diff, files, linked, comments, review_threads = await _fetch_pr_data(
+        (
+            pr_meta,
+            diff,
+            files,
+            linked,
+            comments,
+            review_threads,
+            review_summaries,
+            own_prior_review,
+        ) = await _fetch_pr_data(
             github, repo_full_name=repo_full_name, pr_number=pr_number
         )
         head_sha = pr_meta["head"]["sha"]
@@ -150,6 +171,8 @@ async def assemble_pr_context(
         docs=fetched_docs,
         comments=comments,
         review_threads=review_threads,
+        review_summaries=review_summaries,
+        own_prior_review=own_prior_review,
     )
 
     if workspace_dir is not None:
@@ -177,12 +200,19 @@ async def _fetch_pr_data(
     list[dict[str, Any]],
     list[dict[str, Any]],
     list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any] | None,
 ]:
-    """Fetch PR metadata, diff, files, linked issues, and comments in parallel.
+    """Fetch PR metadata, diff, files, linked issues, and all comment sources in parallel.
+
+    Heimdall's own prior review is fetched HERE (during seed assembly) so it is read
+    BEFORE the across-push retire/delete step in the worker dismisses/minimizes that
+    review and deletes its inline comments — assembly always precedes that step, so the
+    context is captured before it is destroyed.
 
     Returns:
         (pr_metadata, diff_text, changed_files, linked_issues, conversation_comments,
-        review_threads)
+        review_threads, review_summaries, own_prior_review)
     """
     import asyncio
 
@@ -208,15 +238,43 @@ async def _fetch_pr_data(
             repo_full_name=repo_full_name, pr_number=pr_number
         )
     )
-    pr_meta, diff, files, linked, comments, review_threads = await asyncio.gather(
+    review_summaries_task = asyncio.create_task(
+        github.get_pr_review_summaries(
+            repo_full_name=repo_full_name, pr_number=pr_number
+        )
+    )
+    own_prior_task = asyncio.create_task(
+        github.get_own_prior_review(
+            repo_full_name=repo_full_name, pr_number=pr_number
+        )
+    )
+    # All tasks are already scheduled (create_task) so they run concurrently.  Gather in
+    # two groups of <= six: asyncio.gather's typed overloads stop at six awaitables and
+    # would erase the per-task result types past that arity, so a single eight-way gather
+    # loses precise typing.  Both groups await tasks that are already running, so the
+    # concurrency is unchanged; the first group's exception still propagates first.
+    pr_meta, diff, files, linked = await asyncio.gather(
         pr_meta_task,
         diff_task,
         files_task,
         linked_task,
+    )
+    comments, review_threads, review_summaries, own_prior_review = await asyncio.gather(
         comments_task,
         review_threads_task,
+        review_summaries_task,
+        own_prior_task,
     )
-    return pr_meta, diff, files, linked, comments, review_threads
+    return (
+        pr_meta,
+        diff,
+        files,
+        linked,
+        comments,
+        review_threads,
+        review_summaries,
+        own_prior_review,
+    )
 
 
 async def _fetch_file_contents_and_docs(
@@ -362,6 +420,8 @@ def _materialize(ctx: PRContext, directory: str) -> None:
       <directory>/docs/<name>              — repo docs (if any)
       <directory>/comments.json            — conversation comments (only if any)
       <directory>/review_threads.json       — inline review threads (only if any)
+      <directory>/review_summaries.json     — submitted-review summary bodies (only if any)
+      <directory>/own_prior_review.json     — Heimdall's own prior review (only if present)
     """
     root = Path(directory)
 
@@ -397,6 +457,20 @@ def _materialize(ctx: PRContext, directory: str) -> None:
     if ctx.review_threads:
         (root / "review_threads.json").write_text(
             json.dumps(ctx.review_threads, indent=2), encoding="utf-8"
+        )
+
+    # Review summaries follow the same write-only-when-present rule: an empty set
+    # leaves no review_summaries.json so the reader sees "no summaries" cleanly.
+    if ctx.review_summaries:
+        (root / "review_summaries.json").write_text(
+            json.dumps(ctx.review_summaries, indent=2), encoding="utf-8"
+        )
+
+    # Heimdall's own prior review is written only when one exists; absence leaves no
+    # own_prior_review.json so the CLI's own-prior subcommand reads back ``null``.
+    if ctx.own_prior_review:
+        (root / "own_prior_review.json").write_text(
+            json.dumps(ctx.own_prior_review, indent=2), encoding="utf-8"
         )
 
     files_root = root / "files"

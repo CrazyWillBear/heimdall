@@ -555,6 +555,280 @@ def test_group_review_comments_promotes_orphan_reply_to_thread() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Review summaries: submitted-review bodies + their event type, kept-author only
+# ---------------------------------------------------------------------------
+
+
+def _review(
+    *,
+    body: str,
+    login: str,
+    review_id: int,
+    state: str = "COMMENTED",
+    user_type: str = "User",
+    association: str = "CONTRIBUTOR",
+    app_id: int | None = None,
+) -> dict[str, object]:
+    """Build a raw pulls-reviews API object for the review-summary tests."""
+    raw: dict[str, object] = {
+        "id": review_id,
+        "body": body,
+        "state": state,
+        "user": {"login": login, "type": user_type},
+        "author_association": association,
+    }
+    if app_id is not None:
+        raw["performed_via_github_app"] = {"id": app_id}
+    return raw
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_summaries_hits_pulls_reviews_endpoint() -> None:
+    """Review summaries come from the pulls reviews endpoint, with their event type."""
+    mock_http = _single_page(
+        [_review(body="LGTM overall", login="alice", review_id=1, state="APPROVED")]
+    )
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        rows = await client.get_pr_review_summaries(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert "pulls/5/reviews" in mock_http.get.call_args[0][0]
+    assert rows == [
+        {
+            "body": "LGTM overall",
+            "author": "alice",
+            "author_association": "CONTRIBUTOR",
+            "event": "APPROVE",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_summaries_maps_states_to_events() -> None:
+    """Each review state maps to its APPROVE/REQUEST_CHANGES/COMMENT event type."""
+    rows = [
+        _review(body="approve me", login="a", review_id=1, state="APPROVED"),
+        _review(body="needs work", login="b", review_id=2, state="CHANGES_REQUESTED"),
+        _review(body="just a note", login="c", review_id=3, state="COMMENTED"),
+    ]
+    mock_http = _single_page(rows)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        summaries = await client.get_pr_review_summaries(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert [s["event"] for s in summaries] == [
+        "APPROVE",
+        "REQUEST_CHANGES",
+        "COMMENT",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_summaries_drops_empty_body_reviews() -> None:
+    """A bare review with no body (e.g. a click-approve) carries no summary text."""
+    rows = [
+        _review(body="", login="a", review_id=1, state="APPROVED"),
+        _review(body="real feedback", login="b", review_id=2, state="COMMENTED"),
+    ]
+    mock_http = _single_page(rows)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        summaries = await client.get_pr_review_summaries(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert [s["body"] for s in summaries] == ["real feedback"]
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_summaries_keeps_humans_and_heimdall_drops_bots() -> None:
+    """The shared author filter applies: humans + Heimdall kept, other bots dropped."""
+    app_id = 4242
+    rows = [
+        _review(body="from human", login="alice", review_id=1, state="COMMENTED"),
+        _review(
+            body="from CI bot",
+            login="ci[bot]",
+            review_id=2,
+            state="COMMENTED",
+            user_type="Bot",
+        ),
+        _review(
+            body="heimdall prior",
+            login="heimdall[bot]",
+            review_id=3,
+            state="CHANGES_REQUESTED",
+            user_type="Bot",
+            app_id=app_id,
+        ),
+        _review(
+            body="other-bot review",
+            login="dependabot[bot]",
+            review_id=4,
+            state="COMMENTED",
+            user_type="Bot",
+            app_id=9999,
+        ),
+    ]
+    mock_http = _single_page(rows)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=app_id, private_key="key", installation_id=42, http_client=mock_http
+        )
+        summaries = await client.get_pr_review_summaries(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert [s["body"] for s in summaries] == ["from human", "heimdall prior"]
+
+
+# ---------------------------------------------------------------------------
+# Heimdall's own prior review: body + its inline comments, before retire/delete
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_own_prior_review_returns_body_and_inline_comments() -> None:
+    """Heimdall's own latest review surfaces its body plus its shaped inline comments."""
+    app_id = 4242
+    reviews = [
+        _review(body="human review", login="alice", review_id=1, state="COMMENTED"),
+        _review(
+            body="Heimdall review: 1 finding",
+            login="heimdall[bot]",
+            review_id=7,
+            state="CHANGES_REQUESTED",
+            user_type="Bot",
+            app_id=app_id,
+        ),
+    ]
+
+    inline = [
+        _review_comment(body="inline nit", login="heimdall[bot]", comment_id=11),
+    ]
+
+    def _get(url: str, **_kwargs: object) -> MagicMock:
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.headers = {}
+        resp.json = MagicMock(return_value=inline if "reviews/7/comments" in url else reviews)
+        return resp
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(side_effect=_get)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=app_id, private_key="key", installation_id=42, http_client=mock_http
+        )
+        own = await client.get_own_prior_review(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert own is not None
+    assert own["body"] == "Heimdall review: 1 finding"
+    assert own["event"] == "REQUEST_CHANGES"
+    assert own["author"] == "heimdall[bot]"
+    assert [c["body"] for c in own["inline_comments"]] == ["inline nit"]
+    assert own["inline_comments"][0]["path"] == "foo.py"
+    assert own["inline_comments"][0]["line"] == 3
+
+
+@pytest.mark.asyncio
+async def test_get_own_prior_review_returns_latest_when_several() -> None:
+    """When Heimdall posted several reviews, the most recent one is returned."""
+    app_id = 4242
+    reviews = [
+        _review(
+            body="older heimdall",
+            login="heimdall[bot]",
+            review_id=3,
+            state="COMMENTED",
+            user_type="Bot",
+            app_id=app_id,
+        ),
+        _review(
+            body="newer heimdall",
+            login="heimdall[bot]",
+            review_id=9,
+            state="COMMENTED",
+            user_type="Bot",
+            app_id=app_id,
+        ),
+    ]
+
+    def _get(url: str, **_kwargs: object) -> MagicMock:
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.headers = {}
+        resp.json = MagicMock(return_value=[] if "comments" in url else reviews)
+        return resp
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(side_effect=_get)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=app_id, private_key="key", installation_id=42, http_client=mock_http
+        )
+        own = await client.get_own_prior_review(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert own is not None
+    assert own["body"] == "newer heimdall"
+    # The latest review's inline comments are listed by its id (9), not an older one.
+    listed = [c for c in mock_http.get.await_args_list if "reviews/9/comments" in str(c)]
+    assert listed
+
+
+@pytest.mark.asyncio
+async def test_get_own_prior_review_none_when_no_own_review() -> None:
+    """No Heimdall review on the PR yields None (nothing of our own to surface)."""
+    app_id = 4242
+    reviews = [_review(body="just humans", login="alice", review_id=1)]
+    mock_http = _single_page(reviews)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=app_id, private_key="key", installation_id=42, http_client=mock_http
+        )
+        own = await client.get_own_prior_review(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert own is None
+
+
+# ---------------------------------------------------------------------------
 # Across-push review lifecycle: dismiss (REQUEST_CHANGES) / minimize (COMMENT)
 # ---------------------------------------------------------------------------
 

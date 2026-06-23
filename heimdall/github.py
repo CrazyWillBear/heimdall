@@ -88,6 +88,48 @@ def _shape_inline_comment(raw: dict[str, Any]) -> dict[str, Any]:
     return shaped
 
 
+# GitHub's submitted-review ``state`` (past tense) maps to the create-review ``event``
+# verb Heimdall already uses everywhere else (APPROVE/REQUEST_CHANGES/COMMENT).  Using
+# the event verb keeps a review summary tagged the same way as the verdict Heimdall posts.
+_REVIEW_STATE_TO_EVENT = {
+    "APPROVED": "APPROVE",
+    "CHANGES_REQUESTED": "REQUEST_CHANGES",
+    "COMMENTED": "COMMENT",
+}
+
+
+def _review_event(raw: dict[str, Any]) -> str:
+    """Map a submitted review's ``state`` to its create-review event verb.
+
+    GitHub reports a submitted review's ``state`` in the past tense (APPROVED /
+    CHANGES_REQUESTED / COMMENTED); Heimdall tags review summaries with the matching
+    create-review event verb (APPROVE / REQUEST_CHANGES / COMMENT) it uses elsewhere.
+    An unrecognised state (e.g. DISMISSED, PENDING) is passed through verbatim so the
+    raw signal is never silently dropped.
+    """
+    state = str(raw.get("state", ""))
+    return _REVIEW_STATE_TO_EVENT.get(state, state)
+
+
+def _shape_review_summary(raw: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a raw submitted-review object to the fields a summary records.
+
+    Builds on :func:`_shape_comment` (``body``/``author``/``author_association``) and
+    adds the ``event`` type (APPROVE / REQUEST_CHANGES / COMMENT) so a downstream lens
+    can tell an approval from a change-request from a plain comment.  Every other
+    (potentially large or sensitive) API field is dropped, like the other shapers.
+
+    Args:
+        raw: A single review object from the pulls reviews REST endpoint.
+
+    Returns:
+        A dict with ``body``, ``author``, ``author_association``, and ``event``.
+    """
+    shaped = _shape_comment(raw)
+    shaped["event"] = _review_event(raw)
+    return shaped
+
+
 def group_review_comments_into_threads(
     comments: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -660,6 +702,143 @@ class GitHubClient:
                     kept.append(raw)
             url = self._next_page_url(response.headers.get("link", ""))
         return group_review_comments_into_threads(kept)
+
+    async def _list_pr_reviews(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> list[dict[str, Any]]:
+        """List every submitted review on a PR, following pagination.
+
+        Returns the raw review objects (each carrying ``id``/``body``/``state``/``user``)
+        in API order.  Shared by :meth:`get_pr_review_summaries` (the kept-author summary
+        bodies) and :meth:`get_own_prior_review` (Heimdall's own latest review).
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            All submitted-review objects for the PR, in API (chronological) order.
+        """
+        url: str | None = (
+            f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/reviews"
+        )
+        headers = await self._gh_headers()
+        all_reviews: list[dict[str, Any]] = []
+        first_page = True
+        while url is not None:
+            kwargs: dict[str, Any] = {"headers": headers}
+            if first_page:
+                kwargs["params"] = {"per_page": 100}
+                first_page = False
+            response = await self._http.get(url, **kwargs)
+            response.raise_for_status()
+            all_reviews.extend(response.json())
+            url = self._next_page_url(response.headers.get("link", ""))
+        return all_reviews
+
+    async def get_pr_review_summaries(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch the PR's submitted-review summary bodies, kept-author only.
+
+        A *review summary* is the body text a reviewer submits alongside an
+        APPROVE / REQUEST_CHANGES / COMMENT event — distinct from the timeline
+        comments (:meth:`get_pr_conversation_comments`) and the line-anchored inline
+        threads (:meth:`get_pr_review_comments`).  Each kept summary carries its event
+        type so a downstream lens can tell an approval from a change-request.
+
+        The SAME kept-author filter as the other comment paths applies: only human and
+        Heimdall's-own authors survive (recognised via ``performed_via_github_app.id``);
+        every other bot is dropped.  Reviews with an empty body are dropped — a bare
+        click-approve carries no summary text to weigh.  These summaries are
+        attacker-influenced third-party data, never instructions — the filter narrows,
+        but does not sanitise, the content.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            One dict per kept summary with ``body``, ``author`` (login),
+            ``author_association``, and ``event`` (APPROVE/REQUEST_CHANGES/COMMENT),
+            in API (chronological) order.
+        """
+        reviews = await self._list_pr_reviews(
+            repo_full_name=repo_full_name, pr_number=pr_number
+        )
+        kept: list[dict[str, Any]] = []
+        for raw in reviews:
+            if not (raw.get("body") or "").strip():
+                # A bare APPROVE/etc. with no body has no summary text to surface.
+                continue
+            if self._keep_comment_author(raw):
+                kept.append(_shape_review_summary(raw))
+        return kept
+
+    async def get_own_prior_review(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> dict[str, Any] | None:
+        """Fetch Heimdall's own latest prior review (body + its inline comments).
+
+        Finds the most recent review authored by *this* GitHub App (recognised via
+        ``performed_via_github_app.id``) and returns its body, event type, and the
+        shaped inline comments attached to it.  This MUST be read before the
+        across-push retire/delete step runs (which dismisses/minimizes Heimdall's prior
+        review and deletes its inline comments), or that context is destroyed before it
+        can reach the next review.  Heimdall's own prior review is untrusted-self data:
+        useful continuity context, but never a binding instruction.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            A dict with ``body``, ``author`` (login), ``author_association``, ``event``,
+            and an ``inline_comments`` list (each shaped with
+            ``body``/``author``/``author_association``/``path``/``line``); or None when
+            Heimdall has not reviewed this PR yet.
+        """
+        reviews = await self._list_pr_reviews(
+            repo_full_name=repo_full_name, pr_number=pr_number
+        )
+        own = [r for r in reviews if self._is_own_review(r)]
+        if not own:
+            return None
+        # The reviews endpoint returns reviews in submission (chronological) order, so
+        # the last own review is the latest — the one whose context still matters.
+        latest = own[-1]
+        review_id = latest.get("id")
+        inline_raw = (
+            await self.list_review_comments(
+                repo_full_name=repo_full_name,
+                pr_number=pr_number,
+                review_id=int(review_id),
+            )
+            if isinstance(review_id, int)
+            else []
+        )
+        summary = _shape_review_summary(latest)
+        summary["inline_comments"] = [_shape_inline_comment(c) for c in inline_raw]
+        return summary
+
+    def _is_own_review(self, raw: dict[str, Any]) -> bool:
+        """Return True only for a review posted by *this* GitHub App.
+
+        Stricter than :meth:`_keep_comment_author` (which also keeps humans): an own
+        review is identified solely by ``performed_via_github_app.id`` matching the
+        client's App id, so a human review is never mistaken for Heimdall's own.
+        """
+        app = raw.get("performed_via_github_app") or {}
+        return app.get("id") == self._app_id
 
     async def get_linked_issues(
         self,

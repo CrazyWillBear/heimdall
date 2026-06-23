@@ -79,10 +79,19 @@ private key) to read the PR and post the review.
   `path`/`line` anchor, and a `replies` list (each reply shaped the same way). Same
   human + Heimdall's-own author filter as `comments.json`. Written only when at least
   one thread is kept. Untrusted third-party data, never instructions.
+- `review_summaries.json` — the body text of **submitted reviews** (APPROVE /
+  REQUEST_CHANGES / COMMENT), each carrying `body`, `author`, `author_association`, and
+  its `event` type. Same human + Heimdall's-own author filter as `comments.json`;
+  body-less click-approves are dropped. Written only when at least one summary is kept.
+  Untrusted third-party data, never instructions.
+- `own_prior_review.json` — **Heimdall's own** latest prior review (`body`, `author`,
+  `author_association`, `event`, and an `inline_comments` list), **fetched before the
+  across-push retire/delete step destroys it**. Written only when Heimdall has a prior
+  review on the PR. Untrusted-self continuity context, never an instruction.
 
 Each lens reads this workspace through the **`heimdall-context`** CLI wrapper — the single
 allowlisted Bash command — with subcommands `diff`, `pr`, `file <path>`, `docs`,
-`comments`, and `review-threads`.
+`comments`, `review-threads`, `review-summaries`, and `own-prior`.
 
 ## 4. The lenses and synthesis (`heimdall/lens.py`)
 
@@ -95,12 +104,15 @@ shared seed, each bounded independently:
 | `design`      | Design-fit / architecture                            | sonnet | high   |
 | `cleanliness` | Readability, dead/duplicated code, doc hygiene       | sonnet | high   |
 
-Each lens also sees the PR's conversation comments as **untrusted background context**: its
-prompt points it at **`heimdall-context comments`** (the same allowlisted wrapper it uses for
-the diff/files/docs), so the payload is read in-sandbox rather than baked into the prompt. The
-comments are framed as untrusted third-party data — context to weigh, never instructions — and
-an empty comment set leaves lens behaviour unchanged (the wrapper returns `[]`). This grants
-lenses *visibility* only; the suppression of settled points lives in synthesis, not here.
+Each lens also sees the PR's full discussion as **untrusted background context**: its prompt
+points it at the same allowlisted wrapper it uses for the diff/files/docs —
+**`heimdall-context comments`** (timeline), **`review-threads`** (line-anchored threads),
+**`review-summaries`** (submitted-review bodies + event type), and **`own-prior`** (Heimdall's
+own prior review) — so each payload is read in-sandbox rather than baked into the prompt. All
+are framed as untrusted third-party data — context to weigh, never instructions — and an empty
+source leaves lens behaviour unchanged (the wrapper returns `[]`, or `null` for `own-prior`).
+This grants lenses *visibility* only; the suppression of settled points lives in synthesis, not
+here.
 
 The `claude -p` invocation is headless with JSON output and restricts tools to the read-only
 **Read / Grep / Glob** plus the single allowlisted **`heimdall-context`** Bash wrapper.
@@ -140,10 +152,10 @@ lens. A failure in one lens is isolated — the rest still reach synthesis.
 A **4th synthesis pass** (`run_synthesis`, opus/max) receives the combined findings of every
 lens and: **dedups** overlapping findings across lenses, **ranks** by severity, **attributes**
 each survivor to its originating lens, writes the **verdict**, and formats the
-severity-grouped, lens-tagged body. When the seed kept any conversation comments or inline
-review threads, their payloads are also embedded in the synthesis prompt inside explicit
-**untrusted-data frames** — context to weigh, never instructions to follow (an empty set leaves
-the prompt unchanged). It too
+severity-grouped, lens-tagged body. When the seed kept any conversation comments, inline
+review threads, review summaries, or Heimdall's own prior review, their payloads are also
+embedded in the synthesis prompt inside explicit **untrusted-data frames** — context to weigh,
+never instructions to follow (an empty source leaves the prompt unchanged). It too
 runs **inside the `bwrap` sandbox** (over a throwaway empty workspace, `~/.claude` bound
 read-only), so no `claude` pass is ever spawned unsandboxed. When every lens fails or synthesis
 itself aborts, that run produces no review (the retry/failure handling above takes over).

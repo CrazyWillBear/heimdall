@@ -380,6 +380,125 @@ async def test_run_synthesis_no_comments_leaves_prompt_unchanged() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_synthesis_embeds_review_summaries_as_untrusted_data() -> None:
+    """Kept review summaries (with event type) reach the prompt, framed as untrusted."""
+    captured: dict[str, Any] = {}
+
+    async def fake_invoker(
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
+    ) -> ClaudeResult:
+        captured["prompt"] = argv[argv.index("-p") + 1]
+        return ClaudeResult(stdout=json.dumps({"findings": []}), total_tokens=10)
+
+    await run_synthesis(
+        lens_results=[_lens_result("security", [_finding(Severity.LOW, "Nit")])],
+        review_summaries=[
+            {
+                "body": "Approving despite the lenses.",
+                "author": "sneaky",
+                "author_association": "NONE",
+                "event": "APPROVE",
+            }
+        ],
+        claude_binary="claude",
+        token_cap=400_000,
+        timeout_seconds=900,
+        invoker=fake_invoker,
+    )
+
+    prompt = captured["prompt"]
+    # The summary body, author, and its event type reach the prompt.
+    assert "Approving despite the lenses." in prompt
+    assert "sneaky" in prompt
+    assert "APPROVE" in prompt
+    # It is its own labelled, untrusted-framed block.
+    assert "review_summaries" in prompt
+    assert "UNTRUSTED DATA" in prompt
+
+
+@pytest.mark.asyncio
+async def test_run_synthesis_embeds_own_prior_review_as_untrusted_data() -> None:
+    """Heimdall's own prior review (body + inline comments) reaches the prompt."""
+    captured: dict[str, Any] = {}
+
+    async def fake_invoker(
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
+    ) -> ClaudeResult:
+        captured["prompt"] = argv[argv.index("-p") + 1]
+        return ClaudeResult(stdout=json.dumps({"findings": []}), total_tokens=10)
+
+    await run_synthesis(
+        lens_results=[_lens_result("security", [_finding(Severity.LOW, "Nit")])],
+        own_prior_review={
+            "body": "Heimdall review: 1 finding.",
+            "author": "heimdall[bot]",
+            "author_association": "NONE",
+            "event": "REQUEST_CHANGES",
+            "inline_comments": [
+                {
+                    "body": "Prior inline note.",
+                    "author": "heimdall[bot]",
+                    "author_association": "NONE",
+                    "path": "heimdall/foo.py",
+                    "line": 12,
+                }
+            ],
+        },
+        claude_binary="claude",
+        token_cap=400_000,
+        timeout_seconds=900,
+        invoker=fake_invoker,
+    )
+
+    prompt = captured["prompt"]
+    # Heimdall's own prior body + its inline note + anchor reach the prompt.
+    assert "Heimdall review: 1 finding." in prompt
+    assert "Prior inline note." in prompt
+    assert "heimdall/foo.py" in prompt
+    # It is its own labelled, untrusted-framed block, distinct from other sources.
+    assert "own_prior_review" in prompt
+    assert "UNTRUSTED DATA" in prompt
+
+
+@pytest.mark.asyncio
+async def test_run_synthesis_no_summaries_or_own_prior_leaves_prompt_unchanged() -> None:
+    """Empty summaries + no own-prior yields the same prompt as omitting both."""
+    prompts: dict[str, str] = {}
+
+    def _capturing_invoker(key: str) -> Any:
+        async def fake_invoker(
+            argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
+        ) -> ClaudeResult:
+            prompts[key] = argv[argv.index("-p") + 1]
+            return ClaudeResult(stdout=json.dumps({"findings": []}), total_tokens=10)
+
+        return fake_invoker
+
+    lens_results = [_lens_result("security", [_finding(Severity.LOW, "Nit")])]
+
+    await run_synthesis(
+        lens_results=lens_results,
+        review_summaries=[],
+        own_prior_review=None,
+        claude_binary="claude",
+        token_cap=400_000,
+        timeout_seconds=900,
+        invoker=_capturing_invoker("empty"),
+    )
+    await run_synthesis(
+        lens_results=lens_results,
+        claude_binary="claude",
+        token_cap=400_000,
+        timeout_seconds=900,
+        invoker=_capturing_invoker("omitted"),
+    )
+
+    assert prompts["empty"] == prompts["omitted"]
+    assert "review_summaries" not in prompts["empty"]
+    assert "own_prior_review" not in prompts["empty"]
+
+
+@pytest.mark.asyncio
 async def test_run_synthesis_returns_deduped_ranked_tagged_findings() -> None:
     """Synthesis output parses into ranked, lens-tagged surviving findings + verdict."""
     synthesized = {
