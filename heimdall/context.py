@@ -23,15 +23,14 @@ from typing import Any
 import httpx
 
 from heimdall.github import GitHubClient
-from heimdall.repo_config import _DEFAULT_DOCS
+from heimdall.repo_config import _DEFAULT_DOCS, DEFAULT_MAX_COMMENTS
 
 logger = logging.getLogger(__name__)
 
-# Safe, non-unbounded default ceiling on how many comments (inline threads +
-# conversation comments combined) enter the seed.  Matches the guardrail-caps
-# convention that every cap has a sensible default; #68 wires the per-repo
-# configured value through ``assemble_pr_context(max_comments=...)``.
-DEFAULT_MAX_COMMENTS = 50
+# DEFAULT_MAX_COMMENTS — the safe, non-unbounded default comment ceiling — is the
+# single source of truth in heimdall.repo_config (where the comment-incorporation
+# config block lives) and re-exported here as the function default below.
+__all__ = ["DEFAULT_MAX_COMMENTS", "PRContext", "assemble_pr_context", "prioritize_comments"]
 
 
 def prioritize_comments(
@@ -180,6 +179,7 @@ async def assemble_pr_context(
     pr_number: int,
     workspace_dir: str | None = None,
     docs: list[str] | None = None,
+    incorporate_comments: bool = True,
     max_comments: int = DEFAULT_MAX_COMMENTS,
 ) -> PRContext:
     """Assemble the seed context for a pull request.
@@ -207,6 +207,13 @@ async def assemble_pr_context(
             ``None`` uses the four built-in defaults; ``[]`` fetches no docs.  The
             worker passes the loaded ``config.docs`` (validated, from the trusted
             ref) so the list is trusted even though contents come from the head.
+        incorporate_comments: When True (the default) the PR's comment sources
+            (conversation comments, inline review threads, submitted-review
+            summaries, and Heimdall's own prior review) are fetched and folded into
+            the seed.  When False the whole comment plumbing is skipped — no comment
+            source is fetched or materialized — so the seed and the downstream
+            prompts match the pre-feature behavior.  The worker passes the per-repo
+            ``config.comments.enabled`` (from the trusted ref) here.
         max_comments: Combined ceiling on inline threads + conversation comments
             materialized into the seed; over it the set is capped and prioritized via
             :func:`prioritize_comments` and ``comments_truncated`` is set.  Defaults to
@@ -232,7 +239,10 @@ async def assemble_pr_context(
             review_summaries,
             own_prior_review,
         ) = await _fetch_pr_data(
-            github, repo_full_name=repo_full_name, pr_number=pr_number
+            github,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            incorporate_comments=incorporate_comments,
         )
         head_sha = pr_meta["head"]["sha"]
         file_contents, fetched_docs = await _fetch_file_contents_and_docs(
@@ -294,6 +304,7 @@ async def _fetch_pr_data(
     *,
     repo_full_name: str,
     pr_number: int,
+    incorporate_comments: bool = True,
 ) -> tuple[
     dict[str, Any],
     str,
@@ -310,6 +321,11 @@ async def _fetch_pr_data(
     BEFORE the across-push retire/delete step in the worker dismisses/minimizes that
     review and deletes its inline comments — assembly always precedes that step, so the
     context is captured before it is destroyed.
+
+    When ``incorporate_comments`` is False the four comment sources (conversation
+    comments, inline review threads, review summaries, own prior review) are NOT
+    fetched at all — the seed gets empty comment fields, so the pipeline matches the
+    pre-feature behavior (per-repo toggle off, #68).
 
     Returns:
         (pr_metadata, diff_text, changed_files, linked_issues, conversation_comments,
@@ -329,6 +345,23 @@ async def _fetch_pr_data(
     linked_task = asyncio.create_task(
         github.get_linked_issues(repo_full_name=repo_full_name, pr_number=pr_number)
     )
+    # All tasks are already scheduled (create_task) so they run concurrently.  Gather in
+    # groups of <= six: asyncio.gather's typed overloads stop at six awaitables and
+    # would erase the per-task result types past that arity, so a single eight-way gather
+    # loses precise typing.  Both groups await tasks that are already running, so the
+    # concurrency is unchanged; the first group's exception still propagates first.
+    pr_meta, diff, files, linked = await asyncio.gather(
+        pr_meta_task,
+        diff_task,
+        files_task,
+        linked_task,
+    )
+
+    if not incorporate_comments:
+        # Comment incorporation disabled for this repo: skip every comment source so
+        # nothing is fetched/materialized and the seed matches pre-feature behavior.
+        return pr_meta, diff, files, linked, [], [], [], None
+
     comments_task = asyncio.create_task(
         github.get_pr_conversation_comments(
             repo_full_name=repo_full_name, pr_number=pr_number
@@ -348,17 +381,6 @@ async def _fetch_pr_data(
         github.get_own_prior_review(
             repo_full_name=repo_full_name, pr_number=pr_number
         )
-    )
-    # All tasks are already scheduled (create_task) so they run concurrently.  Gather in
-    # two groups of <= six: asyncio.gather's typed overloads stop at six awaitables and
-    # would erase the per-task result types past that arity, so a single eight-way gather
-    # loses precise typing.  Both groups await tasks that are already running, so the
-    # concurrency is unchanged; the first group's exception still propagates first.
-    pr_meta, diff, files, linked = await asyncio.gather(
-        pr_meta_task,
-        diff_task,
-        files_task,
-        linked_task,
     )
     comments, review_threads, review_summaries, own_prior_review = await asyncio.gather(
         comments_task,

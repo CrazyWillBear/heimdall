@@ -727,6 +727,81 @@ async def test_assemble_pr_context_under_cap_no_truncation_flag() -> None:
     assert ctx.comments_truncated is False
 
 
+# ---------------------------------------------------------------------------
+# Issue #68 — comment-incorporation toggle: when off, no comments enter the seed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_toggle_off_fetches_no_comments() -> None:
+    """With incorporate_comments=False, no comment source is fetched at all.
+
+    The whole comment plumbing (conversation comments, inline threads, review
+    summaries, own prior review) is skipped, so the seed matches pre-feature
+    behavior and the synthesis/lens prompts see no comment context.
+    """
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            incorporate_comments=False,
+        )
+    mock_client.get_pr_conversation_comments.assert_not_called()
+    mock_client.get_pr_review_comments.assert_not_called()
+    mock_client.get_pr_review_summaries.assert_not_called()
+    mock_client.get_own_prior_review.assert_not_called()
+    assert ctx.comments == []
+    assert ctx.review_threads == []
+    assert ctx.review_summaries == []
+    assert ctx.own_prior_review is None
+    assert ctx.comments_truncated is False
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_toggle_off_materializes_no_comment_files() -> None:
+    """With the toggle off, none of the comment JSON files are written to disk."""
+    mock_client = _make_mock_github_client()
+    with tempfile.TemporaryDirectory() as workspace:
+        with patch("heimdall.context.GitHubClient", return_value=mock_client):
+            await assemble_pr_context(
+                app_id=1,
+                private_key="key",
+                installation_id=42,
+                repo_full_name=_REPO,
+                pr_number=_PR_NUMBER,
+                workspace_dir=workspace,
+                incorporate_comments=False,
+            )
+        root = Path(workspace)
+        assert not (root / "comments.json").exists()
+        assert not (root / "review_threads.json").exists()
+        assert not (root / "review_summaries.json").exists()
+        assert not (root / "own_prior_review.json").exists()
+        # The rest of the seed is unaffected.
+        assert (root / "diff.patch").exists()
+        assert (root / "pr_metadata.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_toggle_on_still_fetches_comments() -> None:
+    """The default (toggle on) keeps the full comment plumbing intact."""
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    mock_client.get_pr_conversation_comments.assert_called_once()
+    assert ctx.comments == _COMMENTS
+
+
 def test_cmd_comments_prints_materialized_comments(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

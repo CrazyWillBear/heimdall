@@ -274,6 +274,41 @@ async def test_run_review_passes_assembled_comments_into_synthesis() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_review_wires_comment_config_into_assemble() -> None:
+    """The per-repo comment toggle + cap reach assemble_pr_context (the #68 wiring)."""
+    from heimdall.repo_config import CommentIncorporation
+
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    config = RepoConfig(comments=CommentIncorporation(enabled=False, max_comments=7))
+    stack, _ = _patch_review_pipeline(
+        config=config,
+        synthesis_result=_synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")]),
+    )
+    assemble_mock = AsyncMock(return_value=MagicMock())
+    with (
+        stack,
+        patch("heimdall.worker.assemble_pr_context", new=assemble_mock),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    assemble_mock.assert_awaited_once()
+    assert assemble_mock.await_args is not None
+    assert assemble_mock.await_args.kwargs["incorporate_comments"] is False
+    assert assemble_mock.await_args.kwargs["max_comments"] == 7
+
+
+@pytest.mark.asyncio
 async def test_run_review_passes_assembled_review_threads_into_synthesis() -> None:
     """The seed's inline review threads reach run_synthesis (the end-to-end pipe)."""
     mock_gh_client = _gh_client()
