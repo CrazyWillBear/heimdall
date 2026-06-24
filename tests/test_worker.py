@@ -6,7 +6,7 @@ import logging
 from contextlib import ExitStack
 from dataclasses import replace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from arq import Retry
@@ -1195,8 +1195,9 @@ async def test_post_phase_failure_posts_failure_note_and_records_sha() -> None:
     last_post = mock_gh_client.post_review.await_args_list[-1].kwargs
     assert last_post["event"] == "COMMENT"
     assert "failed" in last_post["body"].lower()
-    # 3. The SHA is recorded so the commit is not endlessly re-reviewed (no replay).
-    mock_set.assert_awaited()
+    # 3. The SHA is recorded (with the right args) so the commit is not endlessly
+    #    re-reviewed (no replay).
+    mock_set.assert_awaited_once_with(ANY, repo_full_name=_REPO, pr_number=_PR, sha=_SHA)
     # 4. The expensive pipeline ran EXACTLY once — no full replay on a post failure.
     assert synthesize_mock.await_count == 1
 
@@ -1240,8 +1241,9 @@ async def test_post_phase_failure_swallows_failed_note_error_but_still_records_s
             head_sha=_SHA,
         )
 
-    # The SHA is still recorded — no replay even when the note can't be posted.
-    mock_set.assert_awaited()
+    # The SHA is still recorded (with the right args) — no replay even when the note
+    # can't be posted.
+    mock_set.assert_awaited_once_with(ANY, repo_full_name=_REPO, pr_number=_PR, sha=_SHA)
 
 
 @pytest.mark.asyncio

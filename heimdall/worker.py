@@ -138,10 +138,12 @@ _MAX_REVIEW_ATTEMPTS = 2
 # per-review wall-clock).
 _JOB_TIMEOUT_BUFFER_SECONDS = 300.0
 
-# Backoff before a review that hit its installation's concurrency cap re-runs.  The cap
-# miss re-queues the job via arq.Retry(defer=...) rather than dropping it; one in-flight
-# review takes a few minutes, so this spaces retries without busy-waiting.  Paired with
-# WorkerSettings.max_tries, which bounds how long the job keeps deferring.
+# Backoff before a review that hit its installation's concurrency cap re-runs.  At the cap
+# the job re-queues itself via arq.Retry(defer=...) instead of returning: a bare return ends
+# the job cleanly, so arq would never retry and the SHA would go unreviewed until a later
+# delivery/push.  One in-flight review takes a few minutes, so this spaces retries without
+# busy-waiting; WorkerSettings.max_tries bounds how long the job keeps deferring (total
+# patience = (max_tries - 1) * this).
 _CONCURRENCY_DEFER_SECONDS = 60
 
 # Posted as a COMMENT (never REQUEST_CHANGES) when both the initial run and the
@@ -242,11 +244,9 @@ async def run_review(
 
         # Per-installation concurrency guardrail: claim an in-flight slot, and if the
         # installation is already at its cap, re-queue this run via arq.Retry instead of
-        # dropping it.  A bare return would end the job cleanly — arq would never retry,
-        # so the SHA would go unreviewed until a later delivery/push.  Retry(defer=...)
-        # re-runs the same job after a backoff, by which time a slot has usually freed;
-        # WorkerSettings.max_tries bounds the deferrals.  The cap check is BEFORE the slot
-        # is claimed, so raising here leaks no slot (nothing to release).
+        # returning (see _CONCURRENCY_DEFER_SECONDS for why a bare return drops the SHA).
+        # The cap check is BEFORE the slot is claimed, so raising here leaks no slot
+        # (nothing to release).
         if not await try_acquire_inflight(
             db,
             installation_id=installation_id,
@@ -375,7 +375,7 @@ async def _review_and_post(
             head_sha=head_sha,
         )
     except Exception as exc:  # noqa: BLE001
-        # WHY: the expensive pipeline already SUCCEEDED — a failure here is in the
+        # The expensive pipeline already SUCCEEDED — a failure here is in the
         # post/persist phase (GitHub round-trips, retire-prior, persist).  Left to
         # propagate it reaches arq, which replays the ENTIRE 3-lens + synthesis
         # pipeline (the SHA is recorded only after a successful post), up to
@@ -415,8 +415,8 @@ async def _post_synthesized_review(
 
     The post/persist phase that runs once the pipeline has produced a real
     synthesis.  Extracted so the caller can wrap it in a single try/except: a raise
-    anywhere here (a GitHub round-trip, the post, or the persist) is caught by
-    _review_and_post and converted to a terse failure note rather than triggering a
+    anywhere here (a GitHub round-trip, the post, or the persist) is caught by the
+    caller and converted to a terse failure note rather than triggering a
     full-pipeline replay through arq.
     """
     # Across-push lifecycle: retire the prior Heimdall review (dismiss a
@@ -492,11 +492,14 @@ async def _best_effort_failure_note_and_record_sha(
             head_sha=head_sha,
         )
     except Exception as exc:  # noqa: BLE001
-        # WHY: GitHub is likely down/throttled (the same fault that brought us here).
-        # A missing failure note is acceptable; a full-pipeline replay because the SHA
-        # was never recorded is not — so swallow and still record the SHA below.
-        logger.warning(
-            "Could not post review-failed note for %s#%d @ %s: %s",
+        # GitHub is likely down/throttled (the same fault that brought us here).  A
+        # missing failure note is acceptable; a full-pipeline replay because the SHA was
+        # never recorded is not — so swallow and still record the SHA below.  Log at
+        # ERROR: this is the rare path where the commit is marked reviewed with NO posted
+        # output at all (it recovers only on a later push), so it must not be silent.
+        logger.error(
+            "Review for %s#%d @ %s dropped with no posted output — GitHub unreachable "
+            "(failure note could not be posted either): %s",
             repo_full_name,
             pr_number,
             head_sha,
