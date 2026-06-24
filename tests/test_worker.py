@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from arq import Retry
 
 from heimdall.lens import (
     Finding,
@@ -23,7 +24,12 @@ from heimdall.lens import (
     TaggedFinding,
 )
 from heimdall.repo_config import LensConfig, RepoConfig, ScopeFilters
-from heimdall.worker import WorkerSettings, _configure_logging, run_review
+from heimdall.worker import (
+    _CONCURRENCY_DEFER_SECONDS,
+    WorkerSettings,
+    _configure_logging,
+    run_review,
+)
 
 _REPO = "owner/repo"
 _PR = 3
@@ -1619,6 +1625,21 @@ def test_worker_settings_has_redis_settings() -> None:
     assert isinstance(WorkerSettings.redis_settings, RedisSettings)
 
 
+def test_worker_settings_max_tries_covers_concurrency_backoff() -> None:
+    """WorkerSettings.max_tries must outlast a realistic concurrency-cap backoff.
+
+    A cap miss raises ``Retry(defer=_CONCURRENCY_DEFER_SECONDS)``, which counts against
+    arq's per-job ``max_tries`` budget.  The default of 5 would give only ~4 deferrals
+    before the job fails permanently and the commit is dropped — too tight when several
+    reviews queue behind a shared installation cap.  The setting must allow enough
+    deferrals that the cap reliably clears (one review ~ a few minutes) before the cliff.
+    """
+    # >= ~13 min of patience at the configured backoff (tries - 1 deferrals).
+    assert WorkerSettings.max_tries >= 14
+    backoff_window = (WorkerSettings.max_tries - 1) * _CONCURRENCY_DEFER_SECONDS
+    assert backoff_window >= 780
+
+
 def test_main_resolves_redis_settings_from_config() -> None:
     """main() applies the configured Redis URL before arq builds the worker pool.
 
@@ -2327,7 +2348,14 @@ async def test_rate_budget_uses_real_db_window() -> None:
 
 @pytest.mark.asyncio
 async def test_concurrency_cap_defers_when_at_limit() -> None:
-    """Acceptance #3: when the installation is at its concurrency cap, the run defers."""
+    """Acceptance #3: at the concurrency cap, the run re-queues itself via arq.Retry.
+
+    A cap miss must NOT silently drop the commit (the old behaviour: ``return`` ends the
+    job cleanly, so arq never retries and the SHA goes unreviewed until a later event).
+    Instead it raises ``arq.Retry(defer=...)`` so the same job re-runs after a backoff,
+    by which time a slot has usually freed.  The cap check is BEFORE the slot is claimed,
+    so the raise leaks no slot.
+    """
     client = _gating_gh_client(config_yaml="caps:\n  max_concurrent_per_installation: 1\n")
     synth_mock = AsyncMock(return_value=_synthesis_from([]))
     release_mock = AsyncMock()
@@ -2347,9 +2375,12 @@ async def test_concurrency_cap_defers_when_at_limit() -> None:
     stack.enter_context(patch("heimdall.worker.run_synthesis", new=synth_mock))
     stack.enter_context(patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()))
     stack.enter_context(patch("heimdall.worker.GitHubClient", return_value=client))
-    with stack:
+    with stack, pytest.raises(Retry) as exc_info:
         await _drive(client)
 
+    # The deferral is signalled to arq with the configured backoff (arq stores
+    # defer_score in milliseconds).
+    assert exc_info.value.defer_score == _CONCURRENCY_DEFER_SECONDS * 1000
     synth_mock.assert_not_called()
     client.post_review.assert_not_called()
     # A slot was never claimed, so it must NOT be released (no leak the other way).

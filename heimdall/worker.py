@@ -72,6 +72,7 @@ import time
 from dataclasses import replace
 from typing import Any
 
+from arq import Retry
 from arq.connections import RedisSettings
 
 from heimdall.context import assemble_pr_context
@@ -134,6 +135,12 @@ _MAX_REVIEW_ATTEMPTS = 2
 # (assembly, posting, retiring the prior review, GitHub round-trips outside the
 # per-review wall-clock).
 _JOB_TIMEOUT_BUFFER_SECONDS = 300.0
+
+# Backoff before a review that hit its installation's concurrency cap re-runs.  The cap
+# miss re-queues the job via arq.Retry(defer=...) rather than dropping it; one in-flight
+# review takes a few minutes, so this spaces retries without busy-waiting.  Paired with
+# WorkerSettings.max_tries, which bounds how long the job keeps deferring.
+_CONCURRENCY_DEFER_SECONDS = 60
 
 # Posted as a COMMENT (never REQUEST_CHANGES) when both the initial run and the
 # single retry fail — a deliberately terse, metadata-free note.
@@ -231,22 +238,28 @@ async def run_review(
             )
             return
 
-        # Per-installation concurrency guardrail: claim an in-flight slot, and if
-        # the installation is already at its cap, defer this run (skip without
-        # recording the SHA so a later delivery/push reviews the same commit).
+        # Per-installation concurrency guardrail: claim an in-flight slot, and if the
+        # installation is already at its cap, re-queue this run via arq.Retry instead of
+        # dropping it.  A bare return would end the job cleanly — arq would never retry,
+        # so the SHA would go unreviewed until a later delivery/push.  Retry(defer=...)
+        # re-runs the same job after a backoff, by which time a slot has usually freed;
+        # WorkerSettings.max_tries bounds the deferrals.  The cap check is BEFORE the slot
+        # is claimed, so raising here leaks no slot (nothing to release).
         if not await try_acquire_inflight(
             db,
             installation_id=installation_id,
             cap=config.caps.max_concurrent_per_installation,
         ):
             logger.info(
-                "Deferring review for %s#%d: installation %d at concurrency cap %d",
+                "Deferring review for %s#%d: installation %d at concurrency cap %d; "
+                "retrying in %ds",
                 repo_full_name,
                 pr_number,
                 installation_id,
                 config.caps.max_concurrent_per_installation,
+                _CONCURRENCY_DEFER_SECONDS,
             )
-            return
+            raise Retry(defer=_CONCURRENCY_DEFER_SECONDS)
         # The slot is now held; release it on EVERY exit path (success, skip,
         # failure, exception) so the counter cannot leak.
         try:
@@ -945,6 +958,14 @@ class WorkerSettings:
     """
 
     functions = [run_review]
+    # Max attempts arq makes per job before giving up.  Raised from arq's default of 5
+    # because a concurrency-cap miss now re-queues via Retry(defer=_CONCURRENCY_DEFER_
+    # SECONDS) and each deferral spends one try; 15 gives ~14 min of patience for a slot
+    # to free before the job is dropped.  Safe to raise this high: genuine pipeline
+    # failures are caught and posted as a "review failed" note inside _review_and_post
+    # (which records the SHA and returns cleanly), so they do NOT consume retries — only
+    # cap deferrals and rare infra-level exceptions do.
+    max_tries: int = 15
     # Overridden from the configured REDIS_URL in main() at process start (arq reads
     # this attribute before on_startup runs); the localhost default keeps it a valid
     # RedisSettings instance for the ``arq heimdall.worker.WorkerSettings`` launch path.

@@ -129,7 +129,9 @@ and survive restarts.
 Over the size caps the PR is skipped **with a posted note** (`diff_cap_skip_note`) — unlike the
 silent scope skips — so the author learns why. Over the rate budget the review is skipped
 silently and the SHA is **not** recorded, so a later push still gets reviewed. At the concurrency
-cap the run defers (the slot is atomically claimed at start and released on every exit path).
+cap the run re-queues itself (arq `Retry`, ~60s backoff) and re-runs once a slot frees rather than
+being dropped; the slot is atomically claimed when one is available and released on every exit
+path. The deferrals are bounded by the worker's `max_tries`, after which the commit is dropped.
 
 **Comment incorporation (`comments`, `CommentIncorporation`)** — controls whether the PR's
 discussion (conversation comments, inline review threads, submitted-review summaries, and
