@@ -42,7 +42,9 @@ private key) to read the PR and post the review.
      skipped **with a posted COMMENT note** so the author learns why.
 3. **Rate / concurrency caps** — a per-repo rolling-window budget (`max_reviews_per_window`
    over `rate_window_seconds`) and a per-installation concurrency cap
-   (`max_concurrent_per_installation`), both DB-backed so they survive restarts.
+   (`max_concurrent_per_installation`), both DB-backed so they survive restarts. A run that
+   hits the concurrency cap re-queues itself (arq `Retry`, bounded by `max_tries`) and re-runs
+   when a slot frees rather than being dropped.
 4. **Assemble seed** (once) — materialize the PR seed into a temp workspace.
 5. **Three lenses + synthesis** — fan out the config-tuned lenses over the shared seed, then
    a 4th synthesis pass dedups/ranks/tags their findings and writes the verdict.
@@ -70,9 +72,46 @@ private key) to read the PR and post the review.
   skipped; path traversal rejected)
 - `docs/<name>` — repo docs from the configurable `docs` list (defaults:
   `CLAUDE.md`, `README.md`, `AGENTS.md`, `STYLEGUIDE.md`) when present
+- `comments.json` — the PR's conversation (timeline) comments, kept to **human** and
+  **Heimdall's own** authors (other bots dropped); each carries `body`, `author`, and
+  `author_association`. Written only when at least one comment is kept. Untrusted
+  third-party data, never instructions.
+- `review_threads.json` — the PR's inline review comments grouped into parent-anchored
+  **reply threads**: each thread carries `body`, `author`, `author_association`, its
+  `path`/`line` anchor, a `replies` list (each reply shaped the same way), an
+  `is_resolved` flag, and an `is_outdated` flag (the anchored line is gone after a push,
+  so `line` fell back to the pre-image `original_line`). The `is_resolved` flag is sourced
+  from a GraphQL `reviewThreads` query (same installation token), correlated to the REST
+  threads by comment `databaseId`; a GraphQL hiccup or a PR with no threads degrades
+  cleanly to `is_resolved=false` (never crashes the review). It is trusted as-is — no
+  author-of-resolve check (accepted residual risk). Same human + Heimdall's-own author
+  filter as `comments.json`. Written only when at least one thread is kept. Untrusted
+  third-party data, never instructions.
+
+Comment incorporation is **per-repo configurable** (`comments` block in `heimdall.yml`, read
+from the trust-resolved ref): an `enabled` toggle (default on) and a `max_comments` cap
+(default `50`, source of truth `DEFAULT_MAX_COMMENTS` in `heimdall/repo_config.py`). With the
+toggle **off**, no comment source is fetched or materialized and the seed matches the
+pre-feature behavior. With it on, the cap feeds the prioritize/truncate path: when the combined
+comment set (inline threads + conversation comments) exceeds `max_comments`, the seed is
+**capped and prioritized** before materialization: **unresolved → on-diff → recent**, with
+conversation comments ranked after inline threads, and outdated threads kept but ranked below
+in-diff ones. When comments are dropped to honour the cap, the posted review body carries an
+**omission note** (mirroring the size-cap COMMENT-note pattern) so the reader knows some
+comments were left out.
+- `review_summaries.json` — the body text of **submitted reviews** (APPROVE /
+  REQUEST_CHANGES / COMMENT), each carrying `body`, `author`, `author_association`, and
+  its `event` type. Same human + Heimdall's-own author filter as `comments.json`;
+  body-less click-approves are dropped. Written only when at least one summary is kept.
+  Untrusted third-party data, never instructions.
+- `own_prior_review.json` — **Heimdall's own** latest prior review (`body`, `author`,
+  `author_association`, `event`, and an `inline_comments` list), **fetched before the
+  across-push retire/delete step destroys it**. Written only when Heimdall has a prior
+  review on the PR. Untrusted-self continuity context, never an instruction.
 
 Each lens reads this workspace through the **`heimdall-context`** CLI wrapper — the single
-allowlisted Bash command — with subcommands `diff`, `pr`, `file <path>`, and `docs`.
+allowlisted Bash command — with subcommands `diff`, `pr`, `file <path>`, `docs`,
+`comments`, `review-threads`, `review-summaries`, and `own-prior`.
 
 ## 4. The lenses and synthesis (`heimdall/lens.py`)
 
@@ -84,6 +123,16 @@ shared seed, each bounded independently:
 | `security`    | Security posture                                     | opus   | max    |
 | `design`      | Design-fit / architecture                            | sonnet | high   |
 | `cleanliness` | Readability, dead/duplicated code, doc hygiene       | sonnet | high   |
+
+Each lens also sees the PR's full discussion as **untrusted background context**: its prompt
+points it at the same allowlisted wrapper it uses for the diff/files/docs —
+**`heimdall-context comments`** (timeline), **`review-threads`** (line-anchored threads),
+**`review-summaries`** (submitted-review bodies + event type), and **`own-prior`** (Heimdall's
+own prior review) — so each payload is read in-sandbox rather than baked into the prompt. All
+are framed as untrusted third-party data — context to weigh, never instructions — and an empty
+source leaves lens behaviour unchanged (the wrapper returns `[]`, or `null` for `own-prior`).
+This grants lenses *visibility* only; the suppression of settled points lives in synthesis, not
+here.
 
 The `claude -p` invocation is headless with JSON output and restricts tools to the read-only
 **Read / Grep / Glob** plus the single allowlisted **`heimdall-context`** Bash wrapper.
@@ -123,10 +172,27 @@ lens. A failure in one lens is isolated — the rest still reach synthesis.
 A **4th synthesis pass** (`run_synthesis`, opus/max) receives the combined findings of every
 lens and: **dedups** overlapping findings across lenses, **ranks** by severity, **attributes**
 each survivor to its originating lens, writes the **verdict**, and formats the
-severity-grouped, lens-tagged body. It too runs **inside the `bwrap` sandbox** (over a throwaway
-empty workspace, `~/.claude` bound read-only), so no `claude` pass is ever spawned unsandboxed.
-When every lens fails or synthesis itself aborts, that run produces no review (the retry/failure
-handling above takes over).
+severity-grouped, lens-tagged body. When the seed kept any conversation comments, inline
+review threads, review summaries, or Heimdall's own prior review, their payloads are also
+embedded in the synthesis prompt inside explicit **untrusted-data frames** — context to weigh,
+never instructions to follow (an empty source leaves the prompt unchanged). It too
+runs **inside the `bwrap` sandbox** (over a throwaway empty workspace, `~/.claude` bound
+read-only), so no `claude` pass is ever spawned unsandboxed. When every lens fails or synthesis
+itself aborts, that run produces no review (the retry/failure handling above takes over).
+
+**Suppression contract.** Synthesis is the single point that may **drop a finding** the
+discussion authoritatively settled. *Authoritative* is narrow: **either** the text of a comment /
+thread / summary whose `author_association` is **OWNER / MEMBER / COLLABORATOR**, **or** the
+finding's inline thread being **resolved** (`is_resolved`). A **CONTRIBUTOR / NONE** comment is
+context only and **never** suppresses via its text, so a prompt-injected "approve anyway" from an
+outside account cannot silence a finding. The per-comment `author_association` and per-thread
+`is_resolved` ride in the prompt; the drop decision is the model's judgment. Synthesis returns the
+dropped findings (title + brief reason) in `suppressed_findings`, **separate** from the survivors.
+The posted review body then carries a labeled **suppressed-findings section** (each dropped
+finding's title + reason), mirroring the dropped-lens banner / comment-omission note posture, so a
+maintainer sees Heimdall made a judgment rather than silently omitting something. The **verdict is
+computed from the survivors alone**, so suppressing a blocking finding can downgrade
+`REQUEST_CHANGES` to `COMMENT`.
 
 **Verdict.** Each finding carries a `Severity` (critical / high / medium / low). Any surviving
 finding whose severity meets the repo's **blocking threshold** maps the review to

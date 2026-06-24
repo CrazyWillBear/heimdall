@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 from contextlib import ExitStack
+from dataclasses import replace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
+from arq import Retry
 
 from heimdall.lens import (
     Finding,
@@ -17,11 +19,17 @@ from heimdall.lens import (
     LensTimeoutError,
     SandboxError,
     Severity,
+    SuppressedFinding,
     SynthesisResult,
     TaggedFinding,
 )
 from heimdall.repo_config import LensConfig, RepoConfig, ScopeFilters
-from heimdall.worker import WorkerSettings, _configure_logging, run_review
+from heimdall.worker import (
+    _CONCURRENCY_DEFER_SECONDS,
+    WorkerSettings,
+    _configure_logging,
+    run_review,
+)
 
 _REPO = "owner/repo"
 _PR = 3
@@ -231,6 +239,266 @@ async def test_run_review_fans_out_three_lenses_into_synthesis() -> None:
     passed: list[LensResult] = synth_mock.await_args.kwargs["lens_results"]
     names = {r.lens_name for r in passed}
     assert names == {"security", "design", "cleanliness"}
+
+
+@pytest.mark.asyncio
+async def test_run_review_passes_assembled_comments_into_synthesis() -> None:
+    """The seed's conversation comments reach run_synthesis (the end-to-end pipe)."""
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    comments = [
+        {"body": "ship it", "author": "alice", "author_association": "MEMBER"},
+    ]
+    seed = MagicMock()
+    seed.comments = comments
+
+    stack, synth_mock = _patch_review_pipeline(
+        synthesis_result=_synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")]),
+    )
+    with (
+        stack,
+        patch(
+            "heimdall.worker.assemble_pr_context",
+            new=AsyncMock(return_value=seed),
+        ),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    synth_mock.assert_awaited_once()
+    assert synth_mock.await_args is not None
+    assert synth_mock.await_args.kwargs["comments"] == comments
+
+
+@pytest.mark.asyncio
+async def test_run_review_wires_comment_config_into_assemble() -> None:
+    """The per-repo comment toggle + cap reach assemble_pr_context (the #68 wiring)."""
+    from heimdall.repo_config import CommentIncorporation
+
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    config = RepoConfig(comments=CommentIncorporation(enabled=False, max_comments=7))
+    stack, _ = _patch_review_pipeline(
+        config=config,
+        synthesis_result=_synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")]),
+    )
+    assemble_mock = AsyncMock(return_value=MagicMock())
+    with (
+        stack,
+        patch("heimdall.worker.assemble_pr_context", new=assemble_mock),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    assemble_mock.assert_awaited_once()
+    assert assemble_mock.await_args is not None
+    assert assemble_mock.await_args.kwargs["incorporate_comments"] is False
+    assert assemble_mock.await_args.kwargs["max_comments"] == 7
+
+
+@pytest.mark.asyncio
+async def test_run_review_passes_assembled_review_threads_into_synthesis() -> None:
+    """The seed's inline review threads reach run_synthesis (the end-to-end pipe)."""
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    review_threads = [
+        {
+            "body": "anchored note",
+            "author": "alice",
+            "author_association": "MEMBER",
+            "path": "foo.py",
+            "line": 4,
+            "replies": [],
+        },
+    ]
+    seed = MagicMock()
+    seed.review_threads = review_threads
+
+    stack, synth_mock = _patch_review_pipeline(
+        synthesis_result=_synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")]),
+    )
+    with (
+        stack,
+        patch(
+            "heimdall.worker.assemble_pr_context",
+            new=AsyncMock(return_value=seed),
+        ),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    synth_mock.assert_awaited_once()
+    assert synth_mock.await_args is not None
+    assert synth_mock.await_args.kwargs["review_threads"] == review_threads
+
+
+@pytest.mark.asyncio
+async def test_run_review_passes_assembled_review_summaries_into_synthesis() -> None:
+    """The seed's review summaries reach run_synthesis (the end-to-end pipe)."""
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    review_summaries = [
+        {
+            "body": "Approving overall.",
+            "author": "alice",
+            "author_association": "MEMBER",
+            "event": "APPROVE",
+        },
+    ]
+    seed = MagicMock()
+    seed.review_summaries = review_summaries
+
+    stack, synth_mock = _patch_review_pipeline(
+        synthesis_result=_synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")]),
+    )
+    with (
+        stack,
+        patch(
+            "heimdall.worker.assemble_pr_context",
+            new=AsyncMock(return_value=seed),
+        ),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    synth_mock.assert_awaited_once()
+    assert synth_mock.await_args is not None
+    assert synth_mock.await_args.kwargs["review_summaries"] == review_summaries
+
+
+@pytest.mark.asyncio
+async def test_run_review_passes_own_prior_review_into_synthesis() -> None:
+    """The seed's Heimdall-own prior review reaches run_synthesis (end-to-end pipe)."""
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    own_prior_review = {
+        "body": "Heimdall review: 1 finding.",
+        "author": "heimdall[bot]",
+        "author_association": "NONE",
+        "event": "REQUEST_CHANGES",
+        "inline_comments": [],
+    }
+    seed = MagicMock()
+    seed.own_prior_review = own_prior_review
+
+    stack, synth_mock = _patch_review_pipeline(
+        synthesis_result=_synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")]),
+    )
+    with (
+        stack,
+        patch(
+            "heimdall.worker.assemble_pr_context",
+            new=AsyncMock(return_value=seed),
+        ),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    synth_mock.assert_awaited_once()
+    assert synth_mock.await_args is not None
+    assert synth_mock.await_args.kwargs["own_prior_review"] == own_prior_review
+
+
+@pytest.mark.asyncio
+async def test_own_prior_review_fetched_before_prior_review_retire_delete() -> None:
+    """Regression: the seed (which fetches the own-prior review) is assembled BEFORE the
+    across-push retire/delete step destroys it.
+
+    The retire/delete step (``_refresh_prior_review`` → ``delete_review_comment`` /
+    ``dismiss_review``) runs only after ``_synthesize_review`` — which calls
+    ``assemble_pr_context`` to read Heimdall's own prior review.  Locking that order
+    guards against a future refactor that retires the prior review before its context is
+    captured, silently destroying the own-prior signal this slice adds.
+    """
+    order: list[str] = []
+
+    async def _assemble(*_args: object, **_kwargs: object) -> MagicMock:
+        order.append("assemble")
+        return MagicMock()
+
+    mock_gh_client = _gh_client(review_id=2, node_id="NODE2")
+    mock_gh_client.list_review_comments = AsyncMock(return_value=[{"id": 101}])
+
+    async def _delete(**_kwargs: object) -> None:
+        order.append("delete")
+
+    async def _dismiss(**_kwargs: object) -> None:
+        order.append("dismiss")
+
+    mock_gh_client.delete_review_comment = AsyncMock(side_effect=_delete)
+    mock_gh_client.dismiss_review = AsyncMock(side_effect=_dismiss)
+
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+    prior = {"review_id": 1, "node_id": "NODE1", "verdict": "REQUEST_CHANGES"}
+    stack, _ = _patch_review_pipeline(
+        synthesis_result=_synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")]),
+        prior_review=prior,
+    )
+    with (
+        stack,
+        patch("heimdall.worker.assemble_pr_context", new=_assemble),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    # Assembly (own-prior fetch) must happen before the prior review is deleted/dismissed.
+    assert "assemble" in order
+    assert "delete" in order
+    assert order.index("assemble") < order.index("delete")
+    assert order.index("assemble") < order.index("dismiss")
 
 
 @pytest.mark.asyncio
@@ -653,6 +921,107 @@ async def test_partial_lens_failure_surfaces_dropped_lens_in_body() -> None:
     assert "no concerns found across any lens" in body
 
 
+@pytest.mark.asyncio
+async def test_build_inline_split_notes_comment_truncation_in_body() -> None:
+    """A truncated comment set surfaces an omission note in the posted body."""
+    from heimdall.worker import _build_inline_split
+
+    mock_gh_client = _gh_client()
+    synthesis = _synthesis_from([])
+    synthesis = replace(synthesis, comments_truncated=True)
+
+    body, _ = await _build_inline_split(
+        mock_gh_client, synthesis, repo_full_name=_REPO, pr_number=_PR
+    )
+
+    assert "omitted" in body
+    # The original synthesis body is preserved below the note.
+    assert "no concerns found across any lens" in body
+
+
+@pytest.mark.asyncio
+async def test_build_inline_split_no_note_when_not_truncated() -> None:
+    """An untruncated comment set leaves no omission note in the body."""
+    from heimdall.worker import _build_inline_split
+
+    mock_gh_client = _gh_client()
+    synthesis = _synthesis_from([])
+
+    body, _ = await _build_inline_split(
+        mock_gh_client, synthesis, repo_full_name=_REPO, pr_number=_PR
+    )
+
+    assert "omitted" not in body
+
+
+@pytest.mark.asyncio
+async def test_build_inline_split_surfaces_suppressed_findings_in_body() -> None:
+    """Suppressed findings surface a labeled title+reason section in the posted body (#66)."""
+    from heimdall.worker import _build_inline_split
+
+    mock_gh_client = _gh_client()
+    synthesis = _synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")])
+    synthesis = replace(
+        synthesis,
+        suppressed_findings=(
+            SuppressedFinding(title="Auth bypass", reason="OWNER marked intentional"),
+        ),
+    )
+
+    body, _ = await _build_inline_split(
+        mock_gh_client, synthesis, repo_full_name=_REPO, pr_number=_PR
+    )
+
+    # The suppressed finding's title + reason are surfaced, clearly labeled.
+    assert "Auth bypass" in body
+    assert "OWNER marked intentional" in body
+    assert "suppressed" in body.lower()
+    # It coexists with the existing findings body without clobbering it.
+    assert "nit" in body
+
+
+@pytest.mark.asyncio
+async def test_build_inline_split_no_suppressed_section_when_none() -> None:
+    """Nothing suppressed leaves no suppressed-findings section in the body (#66)."""
+    from heimdall.worker import _build_inline_split
+
+    mock_gh_client = _gh_client()
+    synthesis = _synthesis_from([])
+
+    body, _ = await _build_inline_split(
+        mock_gh_client, synthesis, repo_full_name=_REPO, pr_number=_PR
+    )
+
+    assert "suppressed" not in body.lower()
+
+
+@pytest.mark.asyncio
+async def test_build_inline_split_suppressed_section_coexists_with_dropped_lens() -> None:
+    """The suppressed section and the dropped-lens banner both appear, neither clobbered."""
+    from heimdall.worker import _build_inline_split
+
+    mock_gh_client = _gh_client()
+    synthesis = _synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")])
+    synthesis = replace(
+        synthesis,
+        dropped_lenses=("security",),
+        suppressed_findings=(
+            SuppressedFinding(title="SQL injection", reason="resolved thread"),
+        ),
+    )
+
+    body, _ = await _build_inline_split(
+        mock_gh_client, synthesis, repo_full_name=_REPO, pr_number=_PR
+    )
+
+    # Dropped-lens banner, suppressed section, and findings body all survive together.
+    assert "security" in body
+    assert "skipped" in body.lower()
+    assert "SQL injection" in body
+    assert "resolved thread" in body
+    assert "nit" in body
+
+
 # ---------------------------------------------------------------------------
 # Retry-once + per-review timeout + terse failure note
 # ---------------------------------------------------------------------------
@@ -778,6 +1147,103 @@ async def test_run_review_pipeline_timeout_surfaced_as_failure() -> None:
     posted = mock_gh_client.post_review.await_args.kwargs
     assert posted["event"] == "COMMENT"
     assert "failed" in posted["body"].lower()
+
+
+@pytest.mark.asyncio
+async def test_post_phase_failure_posts_failure_note_and_records_sha() -> None:
+    """A post-phase failure must not trigger a full expensive pipeline replay.
+
+    Synthesis SUCCEEDS (the costly lens fanout + synthesis ran once), but the real
+    review post fails.  Rather than letting that propagate to arq — which would replay
+    the whole 3-lens + synthesis pipeline (the SHA is recorded only after a successful
+    post) — _review_and_post catches it, posts a terse failure note, and records the
+    SHA so the commit is not re-reviewed.  Here the failure-note post (the second
+    post_review call) succeeds.
+    """
+    mock_gh_client = _gh_client()
+    # First post_review (the real review) raises; the second (the failure note) is OK.
+    mock_gh_client.post_review = AsyncMock(
+        side_effect=[RuntimeError("post boom"), {"id": 1, "node_id": "NODE"}]
+    )
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    synthesis = _synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit", "style")])
+    synthesize_mock = AsyncMock(return_value=synthesis)
+    with (
+        patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig())),
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False)),
+        patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True)),
+        patch("heimdall.worker.try_record_review_event", new=AsyncMock()),
+        patch("heimdall.worker.release_inflight", new=AsyncMock()),
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
+        patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None)),
+        patch("heimdall.worker._synthesize_review", new=synthesize_mock),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()) as mock_set,
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        # 1. Returns WITHOUT raising — the post failure is caught, not propagated.
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    # 2. The LAST post is the terse failure note, posted as a COMMENT.
+    last_post = mock_gh_client.post_review.await_args_list[-1].kwargs
+    assert last_post["event"] == "COMMENT"
+    assert "failed" in last_post["body"].lower()
+    # 3. The SHA is recorded (with the right args) so the commit is not endlessly
+    #    re-reviewed (no replay).
+    mock_set.assert_awaited_once_with(ANY, repo_full_name=_REPO, pr_number=_PR, sha=_SHA)
+    # 4. The expensive pipeline ran EXACTLY once — no full replay on a post failure.
+    assert synthesize_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_post_phase_failure_swallows_failed_note_error_but_still_records_sha() -> None:
+    """Even if the failure note itself can't be posted, the SHA is still recorded.
+
+    GitHub is fully down: both the real review post AND the failure-note post raise.
+    The fallback must swallow the note error (a missing note is acceptable) and still
+    record the SHA, so a persistent post outage never causes a full-pipeline replay.
+    """
+    mock_gh_client = _gh_client()
+    # Both posts raise: the real review AND the failure note.
+    mock_gh_client.post_review = AsyncMock(
+        side_effect=[RuntimeError("post boom"), RuntimeError("note boom")]
+    )
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    synthesis = _synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit", "style")])
+    synthesize_mock = AsyncMock(return_value=synthesis)
+    with (
+        patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig())),
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False)),
+        patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True)),
+        patch("heimdall.worker.try_record_review_event", new=AsyncMock()),
+        patch("heimdall.worker.release_inflight", new=AsyncMock()),
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
+        patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None)),
+        patch("heimdall.worker._synthesize_review", new=synthesize_mock),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()) as mock_set,
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        # Returns WITHOUT raising even though both posts failed.
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    # The SHA is still recorded (with the right args) — no replay even when the note
+    # can't be posted.
+    mock_set.assert_awaited_once_with(ANY, repo_full_name=_REPO, pr_number=_PR, sha=_SHA)
 
 
 @pytest.mark.asyncio
@@ -1254,6 +1720,21 @@ def test_worker_settings_has_redis_settings() -> None:
     from arq.connections import RedisSettings
 
     assert isinstance(WorkerSettings.redis_settings, RedisSettings)
+
+
+def test_worker_settings_max_tries_covers_concurrency_backoff() -> None:
+    """WorkerSettings.max_tries must outlast a realistic concurrency-cap backoff.
+
+    A cap miss raises ``Retry(defer=_CONCURRENCY_DEFER_SECONDS)``, which counts against
+    arq's per-job ``max_tries`` budget.  The default of 5 would give only ~4 deferrals
+    before the job fails permanently and the commit is dropped — too tight when several
+    reviews queue behind a shared installation cap.  The setting must allow enough
+    deferrals that the cap reliably clears (one review ~ a few minutes) before the cliff.
+    """
+    # >= ~13 min of patience at the configured backoff (tries - 1 deferrals).
+    assert WorkerSettings.max_tries >= 14
+    backoff_window = (WorkerSettings.max_tries - 1) * _CONCURRENCY_DEFER_SECONDS
+    assert backoff_window >= 780
 
 
 def test_main_resolves_redis_settings_from_config() -> None:
@@ -1963,8 +2444,15 @@ async def test_rate_budget_uses_real_db_window() -> None:
 
 
 @pytest.mark.asyncio
-async def test_concurrency_cap_defers_when_at_limit() -> None:
-    """Acceptance #3: when the installation is at its concurrency cap, the run defers."""
+async def test_concurrency_cap_raises_retry_when_at_limit() -> None:
+    """Acceptance #3: at the concurrency cap, the run re-queues itself via arq.Retry.
+
+    A cap miss must NOT silently drop the commit (the old behaviour: ``return`` ends the
+    job cleanly, so arq never retries and the SHA goes unreviewed until a later event).
+    Instead it raises ``arq.Retry(defer=...)`` so the same job re-runs after a backoff,
+    by which time a slot has usually freed.  The cap check is BEFORE the slot is claimed,
+    so the raise leaks no slot.
+    """
     client = _gating_gh_client(config_yaml="caps:\n  max_concurrent_per_installation: 1\n")
     synth_mock = AsyncMock(return_value=_synthesis_from([]))
     release_mock = AsyncMock()
@@ -1984,9 +2472,12 @@ async def test_concurrency_cap_defers_when_at_limit() -> None:
     stack.enter_context(patch("heimdall.worker.run_synthesis", new=synth_mock))
     stack.enter_context(patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()))
     stack.enter_context(patch("heimdall.worker.GitHubClient", return_value=client))
-    with stack:
+    with stack, pytest.raises(Retry) as exc_info:
         await _drive(client)
 
+    # The deferral is signalled to arq with the configured backoff (arq stores
+    # defer_score in milliseconds).
+    assert exc_info.value.defer_score == _CONCURRENCY_DEFER_SECONDS * 1000
     synth_mock.assert_not_called()
     client.post_review.assert_not_called()
     # A slot was never claimed, so it must NOT be released (no leak the other way).

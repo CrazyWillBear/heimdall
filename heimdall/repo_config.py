@@ -59,6 +59,13 @@ _BUILTIN_LENSES: dict[str, LensSpec] = {
 # assemble_pr_context); setting ``docs`` in heimdall.yml fully replaces these.
 _DEFAULT_DOCS = ("CLAUDE.md", "README.md", "AGENTS.md", "STYLEGUIDE.md")
 
+# Safe, non-unbounded default ceiling on how many comments (inline threads +
+# conversation comments combined) enter the seed.  Mirrors the guardrail-caps
+# convention that every cap has a sensible default; lives here (consumed by
+# context.assemble_pr_context) as the single source of truth so the comment-
+# incorporation config block can reference it without a circular import.
+DEFAULT_MAX_COMMENTS = 50
+
 
 class LensConfig(BaseModel):
     """Per-lens override of the built-in :class:`~heimdall.lens.LensSpec` knobs.
@@ -204,6 +211,31 @@ def diff_cap_skip_note(
     return None
 
 
+class CommentIncorporation(BaseModel):
+    """Per-repo control over folding PR discussion into the review seed.
+
+    Both knobs read from the trust-resolved config ref (base for forks — see the
+    module docstring), so a fork PR can never flip the toggle on its own head config.
+
+    Attributes:
+        enabled: When True (the default) the PR's conversation comments, inline
+            review threads, submitted-review summaries, and Heimdall's own prior
+            review are fetched and folded into the seed.  When False the whole
+            comment plumbing is skipped — no comment source is fetched or
+            materialized — so the seed and the synthesis/lens prompts match the
+            pre-feature behavior.
+        max_comments: Combined ceiling on inline threads + conversation comments
+            that enter the seed; the value :func:`context.prioritize_comments`
+            caps/truncates against.  Has a SAFE non-unbounded default, matching the
+            guardrail-caps convention that an absent cap never means "unlimited".
+    """
+
+    model_config = {"extra": "forbid"}
+
+    enabled: bool = True
+    max_comments: int = Field(default=DEFAULT_MAX_COMMENTS, gt=0)
+
+
 class RepoConfig(BaseModel):
     """Parsed ``.github/heimdall.yml`` for one repository.
 
@@ -217,6 +249,10 @@ class RepoConfig(BaseModel):
         scope: Scope filters deciding whether the PR is reviewed at all.
         caps: Guardrail caps (diff size, per-repo rate/budget, per-installation
             concurrency) with safe defaults when the block is absent.
+        comments: Comment-incorporation control — an enable toggle (default on) and
+            the max-comments cap fed to the prioritize/truncate path.  When disabled
+            no comments enter the seed at all (the plumbing is skipped); safe defaults
+            apply when the block is absent.
         docs: Repo-relative paths fetched into every PR seed (no globbing); their
             contents come from the PR head, the list from this trusted config.
             Setting ``docs`` FULLY REPLACES the defaults; ``[]`` means no docs; an
@@ -230,6 +266,7 @@ class RepoConfig(BaseModel):
     severity_threshold: Severity = Severity.HIGH
     scope: ScopeFilters = Field(default_factory=ScopeFilters)
     caps: GuardrailCaps = Field(default_factory=GuardrailCaps)
+    comments: CommentIncorporation = Field(default_factory=CommentIncorporation)
     docs: list[str] = Field(default_factory=lambda: list(_DEFAULT_DOCS))
 
     @model_validator(mode="after")

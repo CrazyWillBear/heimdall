@@ -54,6 +54,13 @@ caps:                             # guardrail caps; every field has a SAFE, non-
   rate_window_seconds: 3600       # rolling window the per-repo budget is measured over (s).
                                   # Default: 3600
   max_concurrent_per_installation: 4  # max reviews running at once per installation. Default: 4
+
+comments:                         # fold PR discussion into the review seed
+  enabled: true                   # when false NO comments enter the seed (the whole comment
+                                  # plumbing is skipped). Default: true
+  max_comments: 50                # combined cap on inline threads + conversation comments
+                                  # kept in the seed; over it the set is prioritized and
+                                  # truncated (with an omission note). Default: 50
 ```
 
 ### Field-by-field
@@ -67,6 +74,7 @@ caps:                             # guardrail caps; every field has a SAFE, non-
 | `severity_threshold` | `critical`/`high`/`medium`/`low` | `high` | Lowest severity that blocks (REQUEST_CHANGES); below it comments. |
 | `scope`              | scope filters              | all defaults | Whether the PR is reviewed at all.                             |
 | `caps`               | guardrail caps             | all defaults | Resource ceilings on review work.                             |
+| `comments`           | comment-incorporation      | all defaults | Whether PR discussion is folded into the seed, and the cap on how much. |
 | `docs`               | list of repo-relative paths | `[CLAUDE.md, README.md, AGENTS.md, STYLEGUIDE.md]` | Docs fed into every PR seed; setting it **fully replaces** the defaults, `[]` means none. Contents come from the PR head; the list from the trusted config. No globbing; absolute/`..` entries rejected at load. |
 
 **Per-lens override (`lenses.<security|design|cleanliness>`, `LensConfig`)** — overrides a
@@ -121,7 +129,19 @@ and survive restarts.
 Over the size caps the PR is skipped **with a posted note** (`diff_cap_skip_note`) — unlike the
 silent scope skips — so the author learns why. Over the rate budget the review is skipped
 silently and the SHA is **not** recorded, so a later push still gets reviewed. At the concurrency
-cap the run defers (the slot is atomically claimed at start and released on every exit path).
+cap the run re-queues itself (arq `Retry`, ~60s backoff) and re-runs once a slot frees rather than
+being dropped; the slot is atomically claimed when one is available and released on every exit
+path. The deferrals are bounded by the worker's `max_tries`, after which the commit is dropped.
+
+**Comment incorporation (`comments`, `CommentIncorporation`)** — controls whether the PR's
+discussion (conversation comments, inline review threads, submitted-review summaries, and
+Heimdall's own prior review) is folded into the review seed. Read from the trusted config ref
+(base for forks), so a fork PR can never flip the toggle on its own head config.
+
+| Field          | Type | Default | Meaning                                                                        |
+| -------------- | ---- | ------- | ------------------------------------------------------------------------------ |
+| `enabled`      | bool | `true`  | When false, **no comments enter the seed** — the whole comment plumbing is skipped (nothing fetched/materialized) and the review matches pre-feature behavior. |
+| `max_comments` | int  | `50`    | Combined cap on inline threads + conversation comments kept in the seed; over it the set is prioritized and truncated (with an omission note in the posted body). |
 
 ## Service env reference
 

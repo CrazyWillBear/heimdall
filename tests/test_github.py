@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs
 
 import httpx
 import pytest
 
-from heimdall.github import GitHubClient, make_jwt, parse_linked_issues_from_body
+from heimdall.github import (
+    _MAX_PAGINATION_PAGES,
+    GitHubClient,
+    make_jwt,
+    parse_linked_issues_from_body,
+)
 
 
 def test_make_jwt_returns_string() -> None:
@@ -218,6 +224,1042 @@ async def test_delete_review_comment_hits_pulls_comments_endpoint() -> None:
 
     assert "pulls/comments/101" in mock_http.delete.call_args[0][0]
     mock_response.raise_for_status.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Conversation (timeline) comments: fetch + kept-author filter
+# ---------------------------------------------------------------------------
+
+
+def _comment(
+    *,
+    body: str,
+    login: str,
+    user_type: str = "User",
+    association: str = "CONTRIBUTOR",
+    app_id: int | None = None,
+) -> dict[str, object]:
+    """Build a raw issues-comments API object for the filter tests."""
+    raw: dict[str, object] = {
+        "body": body,
+        "user": {"login": login, "type": user_type},
+        "author_association": association,
+    }
+    if app_id is not None:
+        raw["performed_via_github_app"] = {"id": app_id}
+    return raw
+
+
+@pytest.mark.asyncio
+async def test_get_pr_conversation_comments_hits_issues_comments_endpoint() -> None:
+    """Conversation comments come from the issues comments endpoint (a PR is an issue)."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(
+        return_value=[_comment(body="hi", login="alice")]
+    )
+    mock_response.headers = {}
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=mock_response)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        rows = await client.get_pr_conversation_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert "issues/5/comments" in mock_http.get.call_args[0][0]
+    assert rows == [
+        {"body": "hi", "author": "alice", "author_association": "CONTRIBUTOR"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_pr_conversation_comments_keeps_humans_and_heimdall_drops_bots() -> None:
+    """Humans + Heimdall's own are kept; other bots are dropped."""
+    app_id = 4242
+    raw = [
+        _comment(body="from a human", login="alice", association="MEMBER"),
+        _comment(body="from CI bot", login="ci-bot", user_type="Bot"),
+        _comment(
+            body="from heimdall",
+            login="heimdall[bot]",
+            user_type="Bot",
+            app_id=app_id,
+        ),
+        _comment(
+            body="from another app bot",
+            login="dependabot[bot]",
+            user_type="Bot",
+            app_id=9999,
+        ),
+    ]
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value=raw)
+    mock_response.headers = {}
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=mock_response)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=app_id, private_key="key", installation_id=42, http_client=mock_http
+        )
+        rows = await client.get_pr_conversation_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    bodies = [r["body"] for r in rows]
+    assert bodies == ["from a human", "from heimdall"]
+    # Each kept comment carries body, author login, and author_association.
+    assert rows[0] == {
+        "body": "from a human",
+        "author": "alice",
+        "author_association": "MEMBER",
+    }
+    assert rows[1]["author"] == "heimdall[bot]"
+
+
+@pytest.mark.asyncio
+async def test_get_pr_conversation_comments_empty() -> None:
+    """No comments yields an empty list (clean empty-set handling)."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value=[])
+    mock_response.headers = {}
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=mock_response)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        rows = await client.get_pr_conversation_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# Inline review comments: fetch + group into reply threads + kept-author filter
+# ---------------------------------------------------------------------------
+
+
+def _review_comment(
+    *,
+    body: str,
+    login: str,
+    comment_id: int,
+    path: str = "foo.py",
+    line: int | None = 3,
+    original_line: int | None = None,
+    in_reply_to_id: int | None = None,
+    user_type: str = "User",
+    association: str = "CONTRIBUTOR",
+    app_id: int | None = None,
+) -> dict[str, object]:
+    """Build a raw pulls review-comments API object for the thread tests."""
+    raw: dict[str, object] = {
+        "id": comment_id,
+        "body": body,
+        "user": {"login": login, "type": user_type},
+        "author_association": association,
+        "path": path,
+        "line": line,
+    }
+    if original_line is not None:
+        raw["original_line"] = original_line
+    if in_reply_to_id is not None:
+        raw["in_reply_to_id"] = in_reply_to_id
+    if app_id is not None:
+        raw["performed_via_github_app"] = {"id": app_id}
+    return raw
+
+
+def _graphql_threads_response(
+    threads: list[dict[str, object]], *, errors: object | None = None
+) -> MagicMock:
+    """Build a mock httpx response for a reviewThreads GraphQL page.
+
+    ``threads`` is the list of node dicts (each ``{"isResolved": bool, "comments":
+    {"nodes": [{"databaseId": int}]}}``).  ``errors`` injects a GraphQL errors payload
+    so the degrade-clean path can be exercised.
+    """
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    if errors is not None:
+        resp.json = MagicMock(return_value={"errors": errors})
+    else:
+        resp.json = MagicMock(
+            return_value={
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "nodes": threads,
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            }
+                        }
+                    }
+                }
+            }
+        )
+    return resp
+
+
+def _single_page(
+    rows: list[dict[str, object]],
+    *,
+    resolutions: list[dict[str, object]] | None = None,
+) -> AsyncMock:
+    """Build a mock http client whose GET returns one page of ``rows``.
+
+    ``post`` (the reviewThreads GraphQL call) returns ``resolutions`` — a list of
+    thread node dicts, defaulting to none so unmatched threads degrade to unresolved.
+    """
+    mock_response = MagicMock()
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json = MagicMock(return_value=rows)
+    mock_response.headers = {}
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=mock_response)
+    mock_http.post = AsyncMock(
+        return_value=_graphql_threads_response(resolutions or [])
+    )
+    return mock_http
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_hits_pulls_comments_endpoint() -> None:
+    """Inline review comments come from the pulls comments endpoint (not issues)."""
+    mock_http = _single_page(
+        [_review_comment(body="anchored", login="alice", comment_id=1)]
+    )
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert "pulls/5/comments" in mock_http.get.call_args[0][0]
+    assert threads == [
+        {
+            "body": "anchored",
+            "author": "alice",
+            "author_association": "CONTRIBUTOR",
+            "path": "foo.py",
+            "line": 3,
+            "is_outdated": False,
+            "replies": [],
+            "is_resolved": False,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_groups_replies_under_parent() -> None:
+    """A reply (in_reply_to_id) is nested under its parent thread, anchor preserved."""
+    rows = [
+        _review_comment(body="root", login="alice", comment_id=1, path="a.py", line=7),
+        _review_comment(
+            body="reply", login="bob", comment_id=2, in_reply_to_id=1, line=7
+        ),
+    ]
+    mock_http = _single_page(rows)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert len(threads) == 1
+    thread = threads[0]
+    assert thread["body"] == "root"
+    assert thread["path"] == "a.py"
+    assert thread["line"] == 7
+    assert [r["body"] for r in thread["replies"]] == ["reply"]
+    assert thread["replies"][0]["author"] == "bob"
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_keeps_humans_and_heimdall_drops_bots() -> None:
+    """The conversation-path author filter applies to inline comments and replies."""
+    app_id = 4242
+    rows = [
+        _review_comment(body="from human", login="alice", comment_id=1),
+        _review_comment(
+            body="from CI bot", login="ci[bot]", comment_id=2, user_type="Bot"
+        ),
+        _review_comment(
+            body="heimdall reply",
+            login="heimdall[bot]",
+            comment_id=3,
+            in_reply_to_id=1,
+            user_type="Bot",
+            app_id=app_id,
+        ),
+        _review_comment(
+            body="other-bot reply",
+            login="dependabot[bot]",
+            comment_id=4,
+            in_reply_to_id=1,
+            user_type="Bot",
+            app_id=9999,
+        ),
+    ]
+    mock_http = _single_page(rows)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=app_id, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    # The CI-bot root and the other-app-bot reply are dropped; the Heimdall reply stays.
+    assert len(threads) == 1
+    assert threads[0]["body"] == "from human"
+    assert [r["body"] for r in threads[0]["replies"]] == ["heimdall reply"]
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_falls_back_to_original_line() -> None:
+    """An outdated comment with no current ``line`` anchors on ``original_line``."""
+    mock_http = _single_page(
+        [
+            _review_comment(
+                body="outdated", login="alice", comment_id=1, line=None, original_line=9
+            )
+        ]
+    )
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert threads[0]["line"] == 9
+    # The line fell back to original_line, so the thread is flagged outdated.
+    assert threads[0]["is_outdated"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_live_thread_not_outdated() -> None:
+    """A comment with a current ``line`` is not flagged outdated."""
+    mock_http = _single_page(
+        [_review_comment(body="live", login="alice", comment_id=1, line=4)]
+    )
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert threads[0]["line"] == 4
+    assert threads[0]["is_outdated"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_empty() -> None:
+    """No inline comments yields an empty thread list (clean empty handling)."""
+    mock_http = _single_page([])
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert threads == []
+
+
+def test_group_review_comments_promotes_orphan_reply_to_thread() -> None:
+    """A reply whose parent was filtered out becomes its own thread, not lost."""
+    from heimdall.github import group_review_comments_into_threads
+
+    # The root (id=1) is absent from the input (e.g. dropped by author filtering);
+    # only the reply remains, and it must still surface as a standalone thread.
+    threads = group_review_comments_into_threads(
+        [_review_comment(body="orphan reply", login="bob", comment_id=2, in_reply_to_id=1)]
+    )
+
+    assert len(threads) == 1
+    assert threads[0]["body"] == "orphan reply"
+    assert threads[0]["replies"] == []
+    assert threads[0]["is_resolved"] is False
+
+
+# ---------------------------------------------------------------------------
+# Inline-thread resolution state via GraphQL reviewThreads
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_tags_resolved_thread() -> None:
+    """A reviewThread reported isResolved tags its correlated REST thread resolved."""
+    rows = [
+        _review_comment(body="root", login="alice", comment_id=1, path="a.py", line=7),
+        _review_comment(
+            body="reply", login="bob", comment_id=2, in_reply_to_id=1, line=7
+        ),
+        _review_comment(body="open", login="carol", comment_id=9, path="b.py", line=2),
+    ]
+    # GraphQL: thread for comments 1/2 is resolved; the comment-9 thread is open.
+    resolutions = [
+        {
+            "isResolved": True,
+            "comments": {"nodes": [{"databaseId": 1}, {"databaseId": 2}]},
+        },
+        {"isResolved": False, "comments": {"nodes": [{"databaseId": 9}]}},
+    ]
+    mock_http = _single_page(rows, resolutions=resolutions)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    # The GraphQL query went to /graphql and named reviewThreads.
+    graphql_call = mock_http.post.call_args
+    assert graphql_call[0][0].endswith("/graphql")
+    assert "reviewThreads" in graphql_call[1]["json"]["query"]
+
+    by_body = {t["body"]: t for t in threads}
+    assert by_body["root"]["is_resolved"] is True
+    assert by_body["open"]["is_resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_defaults_unresolved_without_graphql_match() -> None:
+    """A thread with no matching reviewThread node defaults to unresolved, not crash."""
+    rows = [_review_comment(body="lonely", login="alice", comment_id=1)]
+    # GraphQL returns a thread for an unrelated comment id, so nothing correlates.
+    resolutions = [
+        {"isResolved": True, "comments": {"nodes": [{"databaseId": 999}]}}
+    ]
+    mock_http = _single_page(rows, resolutions=resolutions)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert threads[0]["is_resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_graphql_error_degrades_to_unresolved() -> None:
+    """A GraphQL errors payload degrades cleanly: threads default to unresolved."""
+    rows = [_review_comment(body="root", login="alice", comment_id=1)]
+    mock_http = _single_page(rows)
+    mock_http.post = AsyncMock(
+        return_value=_graphql_threads_response([], errors=[{"message": "boom"}])
+    )
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert len(threads) == 1
+    assert threads[0]["is_resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_graphql_raises_degrades_to_unresolved() -> None:
+    """A transport-level GraphQL failure never crashes the review path."""
+    rows = [_review_comment(body="root", login="alice", comment_id=1)]
+    mock_http = _single_page(rows)
+    mock_http.post = AsyncMock(side_effect=httpx.ConnectError("network down"))
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        threads = await client.get_pr_review_comments(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert threads[0]["is_resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_review_thread_resolutions_follows_graphql_pagination() -> None:
+    """reviewThreads pages are followed; every node's databaseId maps to isResolved."""
+    page1 = MagicMock()
+    page1.raise_for_status = MagicMock()
+    page1.json = MagicMock(
+        return_value={
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "isResolved": True,
+                                    "comments": {"nodes": [{"databaseId": 1}]},
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": True,
+                                "endCursor": "CURSOR1",
+                            },
+                        }
+                    }
+                }
+            }
+        }
+    )
+    page2 = _graphql_threads_response(
+        [{"isResolved": False, "comments": {"nodes": [{"databaseId": 2}]}}]
+    )
+    mock_http = AsyncMock()
+    mock_http.post = AsyncMock(side_effect=[page1, page2])
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        resolutions = await client.get_review_thread_resolutions(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert resolutions == {1: True, 2: False}
+    # The second page passed the endCursor from page one.
+    assert mock_http.post.call_args_list[1][1]["json"]["variables"]["after"] == "CURSOR1"
+
+
+# ---------------------------------------------------------------------------
+# Comment/review pagination page ceiling (_MAX_PAGINATION_PAGES): an attacker-
+# influenceable PR with a pathologically large discussion can't drive unbounded
+# pagination. Each loop stops at the ceiling and logs a truncation WARNING.
+# ---------------------------------------------------------------------------
+
+
+def _perpetual_next_get() -> tuple[AsyncMock, list[int]]:
+    """Build a GET mock that ALWAYS returns one row with a perpetual rel="next" link.
+
+    Returns the mock alongside a one-element call counter (``calls[0]``). The Link
+    header never terminates, so a loop with no ceiling would never stop — the ceiling
+    must cap the GET count at ``_MAX_PAGINATION_PAGES``.
+    """
+    calls = [0]
+
+    async def _get(url: str, **_kwargs: object) -> MagicMock:
+        calls[0] += 1
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value=[{"id": calls[0]}])
+        resp.headers = {
+            "link": '<https://api.github.com/next>; rel="next"'
+        }
+        return resp
+
+    mock_get = AsyncMock(side_effect=_get)
+    return mock_get, calls
+
+
+@pytest.mark.asyncio
+async def test_get_pr_conversation_comments_stops_at_page_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A never-ending next-link is bounded at _MAX_PAGINATION_PAGES with a WARNING."""
+    mock_get, calls = _perpetual_next_get()
+    mock_http = AsyncMock()
+    mock_http.get = mock_get
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        with caplog.at_level(logging.WARNING):
+            rows = await client.get_pr_conversation_comments(
+                repo_full_name="owner/repo", pr_number=5
+            )
+
+    assert calls[0] == _MAX_PAGINATION_PAGES
+    assert len(rows) == _MAX_PAGINATION_PAGES
+    assert any(
+        "ceiling" in r.message and "get_pr_conversation_comments" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_comments_stops_at_page_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The inline-comment fetch is bounded at the ceiling, then groups what it has."""
+    mock_get, calls = _perpetual_next_get()
+    mock_http = AsyncMock()
+    mock_http.get = mock_get
+    # The trailing resolutions GraphQL call must still succeed (empty threads).
+    mock_http.post = AsyncMock(return_value=_graphql_threads_response([]))
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        with caplog.at_level(logging.WARNING):
+            await client.get_pr_review_comments(
+                repo_full_name="owner/repo", pr_number=5
+            )
+
+    assert calls[0] == _MAX_PAGINATION_PAGES
+    assert any(
+        "ceiling" in r.message and "get_pr_review_comments" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_pr_reviews_stops_at_page_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The submitted-reviews fetch is bounded at the ceiling (via the public path)."""
+    mock_get, calls = _perpetual_next_get()
+    mock_http = AsyncMock()
+    mock_http.get = mock_get
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        with caplog.at_level(logging.WARNING):
+            await client.get_pr_review_summaries(
+                repo_full_name="owner/repo", pr_number=5
+            )
+
+    assert calls[0] == _MAX_PAGINATION_PAGES
+    assert any(
+        "ceiling" in r.message and "_list_pr_reviews" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_review_comments_stops_at_page_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The per-review inline-comment fetch is bounded at the ceiling with a WARNING."""
+    mock_get, calls = _perpetual_next_get()
+    mock_http = AsyncMock()
+    mock_http.get = mock_get
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        with caplog.at_level(logging.WARNING):
+            rows = await client.list_review_comments(
+                repo_full_name="owner/repo", pr_number=5, review_id=77
+            )
+
+    assert calls[0] == _MAX_PAGINATION_PAGES
+    assert len(rows) == _MAX_PAGINATION_PAGES
+    assert any(
+        "ceiling" in r.message and "list_review_comments" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_review_thread_resolutions_stops_at_page_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A never-ending GraphQL pageInfo is bounded at the ceiling with a WARNING."""
+    calls = [0]
+
+    async def _post(url: str, **_kwargs: object) -> MagicMock:
+        calls[0] += 1
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(
+            return_value={
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "nodes": [
+                                    {
+                                        "isResolved": True,
+                                        "comments": {
+                                            "nodes": [{"databaseId": calls[0]}]
+                                        },
+                                    }
+                                ],
+                                "pageInfo": {
+                                    "hasNextPage": True,
+                                    "endCursor": "CURSOR",
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        return resp
+
+    mock_http = AsyncMock()
+    mock_http.post = AsyncMock(side_effect=_post)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        with caplog.at_level(logging.WARNING):
+            resolutions = await client.get_review_thread_resolutions(
+                repo_full_name="owner/repo", pr_number=5
+            )
+
+    assert calls[0] == _MAX_PAGINATION_PAGES
+    assert resolutions
+    assert any(
+        "ceiling" in r.message and "get_review_thread_resolutions" in r.message
+        for r in caplog.records
+    )
+
+
+# ---------------------------------------------------------------------------
+# Review summaries: submitted-review bodies + their event type, kept-author only
+# ---------------------------------------------------------------------------
+
+
+def _review(
+    *,
+    body: str,
+    login: str,
+    review_id: int,
+    state: str = "COMMENTED",
+    user_type: str = "User",
+    association: str = "CONTRIBUTOR",
+    app_id: int | None = None,
+) -> dict[str, object]:
+    """Build a raw pulls-reviews API object for the review-summary tests."""
+    raw: dict[str, object] = {
+        "id": review_id,
+        "body": body,
+        "state": state,
+        "user": {"login": login, "type": user_type},
+        "author_association": association,
+    }
+    if app_id is not None:
+        raw["performed_via_github_app"] = {"id": app_id}
+    return raw
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_summaries_hits_pulls_reviews_endpoint() -> None:
+    """Review summaries come from the pulls reviews endpoint, with their event type."""
+    mock_http = _single_page(
+        [_review(body="LGTM overall", login="alice", review_id=1, state="APPROVED")]
+    )
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        rows = await client.get_pr_review_summaries(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert "pulls/5/reviews" in mock_http.get.call_args[0][0]
+    assert rows == [
+        {
+            "body": "LGTM overall",
+            "author": "alice",
+            "author_association": "CONTRIBUTOR",
+            "event": "APPROVE",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_summaries_maps_states_to_events() -> None:
+    """Each review state maps to its APPROVE/REQUEST_CHANGES/COMMENT event type."""
+    rows = [
+        _review(body="approve me", login="a", review_id=1, state="APPROVED"),
+        _review(body="needs work", login="b", review_id=2, state="CHANGES_REQUESTED"),
+        _review(body="just a note", login="c", review_id=3, state="COMMENTED"),
+    ]
+    mock_http = _single_page(rows)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        summaries = await client.get_pr_review_summaries(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert [s["event"] for s in summaries] == [
+        "APPROVE",
+        "REQUEST_CHANGES",
+        "COMMENT",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_summaries_drops_empty_body_reviews() -> None:
+    """A bare review with no body (e.g. a click-approve) carries no summary text."""
+    rows = [
+        _review(body="", login="a", review_id=1, state="APPROVED"),
+        _review(body="real feedback", login="b", review_id=2, state="COMMENTED"),
+    ]
+    mock_http = _single_page(rows)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=mock_http
+        )
+        summaries = await client.get_pr_review_summaries(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert [s["body"] for s in summaries] == ["real feedback"]
+
+
+@pytest.mark.asyncio
+async def test_get_pr_review_summaries_keeps_humans_and_heimdall_drops_bots() -> None:
+    """The shared author filter applies: humans + Heimdall kept, other bots dropped."""
+    app_id = 4242
+    rows = [
+        _review(body="from human", login="alice", review_id=1, state="COMMENTED"),
+        _review(
+            body="from CI bot",
+            login="ci[bot]",
+            review_id=2,
+            state="COMMENTED",
+            user_type="Bot",
+        ),
+        _review(
+            body="heimdall prior",
+            login="heimdall[bot]",
+            review_id=3,
+            state="CHANGES_REQUESTED",
+            user_type="Bot",
+            app_id=app_id,
+        ),
+        _review(
+            body="other-bot review",
+            login="dependabot[bot]",
+            review_id=4,
+            state="COMMENTED",
+            user_type="Bot",
+            app_id=9999,
+        ),
+    ]
+    mock_http = _single_page(rows)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=app_id, private_key="key", installation_id=42, http_client=mock_http
+        )
+        summaries = await client.get_pr_review_summaries(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert [s["body"] for s in summaries] == ["from human", "heimdall prior"]
+
+
+# ---------------------------------------------------------------------------
+# Heimdall's own prior review: body + its inline comments, before retire/delete
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_own_prior_review_returns_body_and_inline_comments() -> None:
+    """Heimdall's own latest review surfaces its body plus its shaped inline comments."""
+    app_id = 4242
+    reviews = [
+        _review(body="human review", login="alice", review_id=1, state="COMMENTED"),
+        _review(
+            body="Heimdall review: 1 finding",
+            login="heimdall[bot]",
+            review_id=7,
+            state="CHANGES_REQUESTED",
+            user_type="Bot",
+            app_id=app_id,
+        ),
+    ]
+
+    inline = [
+        _review_comment(body="inline nit", login="heimdall[bot]", comment_id=11),
+    ]
+
+    def _get(url: str, **_kwargs: object) -> MagicMock:
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.headers = {}
+        resp.json = MagicMock(return_value=inline if "reviews/7/comments" in url else reviews)
+        return resp
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(side_effect=_get)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=app_id, private_key="key", installation_id=42, http_client=mock_http
+        )
+        own = await client.get_own_prior_review(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert own is not None
+    assert own["body"] == "Heimdall review: 1 finding"
+    assert own["event"] == "REQUEST_CHANGES"
+    assert own["author"] == "heimdall[bot]"
+    assert [c["body"] for c in own["inline_comments"]] == ["inline nit"]
+    assert own["inline_comments"][0]["path"] == "foo.py"
+    assert own["inline_comments"][0]["line"] == 3
+
+
+@pytest.mark.asyncio
+async def test_get_own_prior_review_returns_latest_when_several() -> None:
+    """When Heimdall posted several reviews, the most recent one is returned."""
+    app_id = 4242
+    reviews = [
+        _review(
+            body="older heimdall",
+            login="heimdall[bot]",
+            review_id=3,
+            state="COMMENTED",
+            user_type="Bot",
+            app_id=app_id,
+        ),
+        _review(
+            body="newer heimdall",
+            login="heimdall[bot]",
+            review_id=9,
+            state="COMMENTED",
+            user_type="Bot",
+            app_id=app_id,
+        ),
+    ]
+
+    def _get(url: str, **_kwargs: object) -> MagicMock:
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.headers = {}
+        resp.json = MagicMock(return_value=[] if "comments" in url else reviews)
+        return resp
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(side_effect=_get)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=app_id, private_key="key", installation_id=42, http_client=mock_http
+        )
+        own = await client.get_own_prior_review(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert own is not None
+    assert own["body"] == "newer heimdall"
+    # The latest review's inline comments are listed by its id (9), not an older one.
+    listed = [c for c in mock_http.get.await_args_list if "reviews/9/comments" in str(c)]
+    assert listed
+
+
+@pytest.mark.asyncio
+async def test_get_own_prior_review_none_when_no_own_review() -> None:
+    """No Heimdall review on the PR yields None (nothing of our own to surface)."""
+    app_id = 4242
+    reviews = [_review(body="just humans", login="alice", review_id=1)]
+    mock_http = _single_page(reviews)
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ):
+        client = GitHubClient(
+            app_id=app_id, private_key="key", installation_id=42, http_client=mock_http
+        )
+        own = await client.get_own_prior_review(
+            repo_full_name="owner/repo", pr_number=5
+        )
+
+    assert own is None
 
 
 # ---------------------------------------------------------------------------
