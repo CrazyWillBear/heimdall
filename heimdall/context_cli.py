@@ -1,14 +1,14 @@
 """heimdall-context — CLI wrapper for reading materialized PR seed context.
 
 Provides subcommands:
-  heimdall-context diff     <workspace>         — print the unified diff
-  heimdall-context pr       <workspace>         — print PR metadata as JSON
-  heimdall-context file     <workspace> <path>  — print a materialized file's content
-  heimdall-context docs           <workspace>   — print all repo docs
-  heimdall-context comments       <workspace>   — print conversation comments as JSON
-  heimdall-context review-threads <workspace>   — print inline review threads as JSON
-  heimdall-context review-summaries <workspace> — print submitted-review summaries as JSON
-  heimdall-context own-prior      <workspace>   — print Heimdall's own prior review as JSON
+  heimdall-context diff             <workspace>         — print the unified diff
+  heimdall-context pr               <workspace>         — print PR metadata as JSON
+  heimdall-context file             <workspace> <path>  — print a materialized file's content
+  heimdall-context docs             <workspace>         — print all repo docs
+  heimdall-context comments         <workspace>         — print conversation comments as JSON
+  heimdall-context review-threads   <workspace>         — print inline review threads as JSON
+  heimdall-context review-summaries <workspace>         — print submitted-review summaries as JSON
+  heimdall-context own-prior        <workspace>         — print Heimdall's own prior review as JSON
 
 The workspace must be a directory previously produced by assemble_pr_context()
 (i.e. it contains diff.patch, pr_metadata.json, files/, and optionally docs/,
