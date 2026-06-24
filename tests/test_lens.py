@@ -278,9 +278,10 @@ def test_argv_scopes_session_to_workspace() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Lenses see comments as untrusted context via the heimdall-context wrapper.
-# The payload is NOT embedded in the prompt (unlike synthesis); each lens reads
-# it through the same allowlisted `heimdall-context comments` call in-sandbox.
+# Lenses see the full PR discussion as untrusted context via the heimdall-context
+# wrapper: comments, review-threads, review-summaries, and own-prior. The payload
+# is NOT embedded in the prompt (unlike synthesis); each lens reads each subcommand
+# through the same allowlisted `heimdall-context <sub>` call in-sandbox.
 # ---------------------------------------------------------------------------
 
 _ALL_LENSES = (SECURITY_LENS, DESIGN_LENS, CLEANLINESS_LENS)
