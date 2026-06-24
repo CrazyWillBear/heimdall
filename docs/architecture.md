@@ -42,7 +42,9 @@ private key) to read the PR and post the review.
      skipped **with a posted COMMENT note** so the author learns why.
 3. **Rate / concurrency caps** — a per-repo rolling-window budget (`max_reviews_per_window`
    over `rate_window_seconds`) and a per-installation concurrency cap
-   (`max_concurrent_per_installation`), both DB-backed so they survive restarts.
+   (`max_concurrent_per_installation`), both DB-backed so they survive restarts. A run that
+   hits the concurrency cap re-queues itself (arq `Retry`, bounded by `max_tries`) and re-runs
+   when a slot frees rather than being dropped.
 4. **Assemble seed** (once) — materialize the PR seed into a temp workspace.
 5. **Three lenses + synthesis** — fan out the config-tuned lenses over the shared seed, then
    a 4th synthesis pass dedups/ranks/tags their findings and writes the verdict.
