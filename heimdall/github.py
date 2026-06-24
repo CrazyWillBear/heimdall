@@ -17,6 +17,15 @@ import jwt
 
 logger = logging.getLogger(__name__)
 
+# Hard ceiling on pages any single pagination loop will fetch — comments,
+# submitted reviews, and GraphQL review threads alike. GitHub serves up to 100
+# items/page, so 50 pages == 5000 items — far beyond any realistic human PR
+# discussion, yet finite so an attacker-influenceable PR with a pathologically
+# large discussion can't drive unbounded API calls / memory / time per review
+# (resource-exhaustion hardening). Hitting it logs a WARNING so the resulting
+# truncation is never silent.
+_MAX_PAGINATION_PAGES = 50
+
 
 def parse_linked_issues_from_body(body: str) -> list[dict[str, Any]]:
     """Extract issues referenced by closing keywords in a PR body.
@@ -432,23 +441,15 @@ class GitHubClient:
         Returns:
             All inline-comment objects (each carrying an ``id``) for the review.
         """
-        url: str | None = (
+        url = (
             f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}"
             f"/reviews/{review_id}/comments"
         )
-        headers = await self._gh_headers()
-        all_comments: list[dict[str, Any]] = []
-        first_page = True
-        while url is not None:
-            kwargs: dict[str, Any] = {"headers": headers}
-            if first_page:
-                kwargs["params"] = {"per_page": 100}
-                first_page = False
-            response = await self._http.get(url, **kwargs)
-            response.raise_for_status()
-            all_comments.extend(response.json())
-            url = self._next_page_url(response.headers.get("link", ""))
-        return all_comments
+        return await self._paginate_get(
+            url,
+            label=f"list_review_comments for {repo_full_name}#{pr_number} "
+            f"review {review_id}",
+        )
 
     async def delete_review_comment(
         self,
@@ -540,6 +541,64 @@ class GitHubClient:
                     return url_part[1:-1]
         return None
 
+    async def _paginate_get(
+        self,
+        url: str,
+        *,
+        label: str,
+        max_pages: int | None = _MAX_PAGINATION_PAGES,
+    ) -> list[dict[str, Any]]:
+        """GET a paginated REST collection, following ``Link: rel="next"`` to the end.
+
+        Owns the shared REST pagination loop every list endpoint here repeats: it sends
+        ``per_page=100`` on the FIRST request only (GitHub's next-page URLs already carry
+        ``page=`` and ``per_page=`` in their query string; re-passing ``params=`` would
+        replace the whole query string under httpx, stripping ``page=`` and looping
+        forever), raises on a non-2xx, accumulates each page's ``response.json()`` rows
+        into one flat list, and advances via :meth:`_next_page_url`.
+
+        When ``max_pages`` is not None it enforces a hard page ceiling: after fetching a
+        page it stops — logging a WARNING tagged with ``label`` — only when a further page
+        actually exists, so an attacker-influenceable PR with a pathologically large
+        collection can't drive unbounded API calls / memory / time. ``max_pages=None``
+        opts out (deliberately unbounded; the caller justifies why).
+
+        The returned rows are the RAW item dicts across all pages; any per-page filtering
+        or shaping is the caller's job.
+
+        Args:
+            url: The first-page collection URL.
+            label: Human-readable caller tag (method + ``repo#pr``) for the ceiling
+                WARNING, so a truncation is traceable to its source.
+            max_pages: Page ceiling, or None for unbounded.
+
+        Returns:
+            The flat list of raw item dicts gathered across every fetched page.
+        """
+        headers = await self._gh_headers()
+        items: list[dict[str, Any]] = []
+        next_url: str | None = url
+        first_page = True
+        page_count = 0
+        while next_url is not None:
+            kwargs: dict[str, Any] = {"headers": headers}
+            if first_page:
+                kwargs["params"] = {"per_page": 100}
+                first_page = False
+            response = await self._http.get(next_url, **kwargs)
+            response.raise_for_status()
+            items.extend(response.json())
+            next_url = self._next_page_url(response.headers.get("link", ""))
+            page_count += 1
+            if next_url is not None and max_pages is not None and page_count >= max_pages:
+                logger.warning(
+                    "%s hit the %d-page ceiling; truncating remaining items",
+                    label,
+                    max_pages,
+                )
+                break
+        return items
+
     async def get_pr_files(
         self,
         *,
@@ -558,28 +617,13 @@ class GitHubClient:
         Returns:
             List of all file objects (filename, status, patch, …) from the GitHub API.
         """
-        url: str | None = (
-            f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/files"
+        url = f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/files"
+        # unbounded: GitHub caps a PR at ~3000 files, already under the ceiling.
+        return await self._paginate_get(
+            url,
+            label=f"get_pr_files for {repo_full_name}#{pr_number}",
+            max_pages=None,
         )
-        headers = await self._gh_headers()
-        all_files: list[dict[str, Any]] = []
-        first_page = True
-
-        while url is not None:
-            # Only attach params on the first request. GitHub's next-page URLs
-            # already carry page= and per_page= in their query string; passing
-            # params= again would replace the entire query string (httpx
-            # behaviour), stripping page= and causing an infinite loop.
-            kwargs: dict[str, Any] = {"headers": headers}
-            if first_page:
-                kwargs["params"] = {"per_page": 100}
-                first_page = False
-            response = await self._http.get(url, **kwargs)
-            response.raise_for_status()
-            all_files.extend(response.json())
-            url = self._next_page_url(response.headers.get("link", ""))
-
-        return all_files
 
     async def get_file_content(
         self,
@@ -652,24 +696,12 @@ class GitHubClient:
             One dict per kept comment with ``body``, ``author`` (login), and
             ``author_association`` keys, in API (chronological) order.
         """
-        url: str | None = (
-            f"{self._BASE}/repos/{repo_full_name}/issues/{pr_number}/comments"
+        url = f"{self._BASE}/repos/{repo_full_name}/issues/{pr_number}/comments"
+        raw = await self._paginate_get(
+            url,
+            label=f"get_pr_conversation_comments for {repo_full_name}#{pr_number}",
         )
-        headers = await self._gh_headers()
-        kept: list[dict[str, Any]] = []
-        first_page = True
-        while url is not None:
-            kwargs: dict[str, Any] = {"headers": headers}
-            if first_page:
-                kwargs["params"] = {"per_page": 100}
-                first_page = False
-            response = await self._http.get(url, **kwargs)
-            response.raise_for_status()
-            for raw in response.json():
-                if self._keep_comment_author(raw):
-                    kept.append(_shape_comment(raw))
-            url = self._next_page_url(response.headers.get("link", ""))
-        return kept
+        return [_shape_comment(c) for c in raw if self._keep_comment_author(c)]
 
     def _keep_comment_author(self, raw: dict[str, Any]) -> bool:
         """Return True for a human author or Heimdall's own comment, else False.
@@ -717,23 +749,12 @@ class GitHubClient:
             ``path``, ``line``, ``is_outdated``, and a ``replies`` list (each reply shaped
             the same way), in API (chronological) order.
         """
-        url: str | None = (
-            f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/comments"
+        url = f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/comments"
+        raw = await self._paginate_get(
+            url,
+            label=f"get_pr_review_comments for {repo_full_name}#{pr_number}",
         )
-        headers = await self._gh_headers()
-        kept: list[dict[str, Any]] = []
-        first_page = True
-        while url is not None:
-            kwargs: dict[str, Any] = {"headers": headers}
-            if first_page:
-                kwargs["params"] = {"per_page": 100}
-                first_page = False
-            response = await self._http.get(url, **kwargs)
-            response.raise_for_status()
-            for raw in response.json():
-                if self._keep_comment_author(raw):
-                    kept.append(raw)
-            url = self._next_page_url(response.headers.get("link", ""))
+        kept = [c for c in raw if self._keep_comment_author(c)]
         resolution = await self.get_review_thread_resolutions(
             repo_full_name=repo_full_name, pr_number=pr_number
         )
@@ -781,6 +802,7 @@ class GitHubClient:
         )
         resolution: dict[int, bool] = {}
         after: str | None = None
+        page_count = 0
         try:
             while True:
                 response = await self._http.post(
@@ -825,6 +847,14 @@ class GitHubClient:
                 after = page_info.get("endCursor")
                 if after is None:
                     break
+                page_count += 1
+                if page_count >= _MAX_PAGINATION_PAGES:
+                    logger.warning(
+                        "get_review_thread_resolutions hit the %d-page ceiling "
+                        "for %s#%s; treating remaining threads as unresolved",
+                        _MAX_PAGINATION_PAGES, repo_full_name, pr_number,
+                    )
+                    break
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
             logger.warning(
                 "GraphQL reviewThreads fetch failed for %s#%s: %s; "
@@ -854,22 +884,11 @@ class GitHubClient:
         Returns:
             All submitted-review objects for the PR, in API (chronological) order.
         """
-        url: str | None = (
-            f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/reviews"
+        url = f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/reviews"
+        return await self._paginate_get(
+            url,
+            label=f"_list_pr_reviews for {repo_full_name}#{pr_number}",
         )
-        headers = await self._gh_headers()
-        all_reviews: list[dict[str, Any]] = []
-        first_page = True
-        while url is not None:
-            kwargs: dict[str, Any] = {"headers": headers}
-            if first_page:
-                kwargs["params"] = {"per_page": 100}
-                first_page = False
-            response = await self._http.get(url, **kwargs)
-            response.raise_for_status()
-            all_reviews.extend(response.json())
-            url = self._next_page_url(response.headers.get("link", ""))
-        return all_reviews
 
     async def get_pr_review_summaries(
         self,
