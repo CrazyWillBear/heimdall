@@ -278,28 +278,55 @@ def test_argv_scopes_session_to_workspace() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Lenses see comments as untrusted context via the heimdall-context wrapper.
-# The payload is NOT embedded in the prompt (unlike synthesis); each lens reads
-# it through the same allowlisted `heimdall-context comments` call in-sandbox.
+# Lenses see the full PR discussion as untrusted context via the heimdall-context
+# wrapper: comments, review-threads, review-summaries, and own-prior. The payload
+# is NOT embedded in the prompt (unlike synthesis); each lens reads each subcommand
+# through the same allowlisted `heimdall-context <sub>` call in-sandbox.
 # ---------------------------------------------------------------------------
 
 _ALL_LENSES = (SECURITY_LENS, DESIGN_LENS, CLEANLINESS_LENS)
 
 
 @pytest.mark.parametrize("lens", _ALL_LENSES, ids=lambda lens: lens.name)
-def test_lens_default_prompt_directs_reading_comments_as_untrusted(
+def test_lens_default_prompt_directs_reading_full_discussion_as_untrusted(
     lens: LensSpec,
 ) -> None:
-    """The default lens prompt tells the lens to consult the PR comments as context."""
+    """The default lens prompt directs all four discussion reads as untrusted context."""
     argv = build_claude_argv(
         claude_binary="claude",
         workspace_dir=_WORKSPACE,
         lens=lens,
     )
     prompt = argv[argv.index("-p") + 1]
-    # The lens is pointed at the conversation comments via the wrapper subcommand...
-    assert "heimdall-context comments" in prompt
+    # The lens is pointed at the full PR discussion via the four wrapper subcommands...
+    assert "heimdall-context comments /workspace" in prompt
+    assert "heimdall-context review-threads /workspace" in prompt
+    assert "heimdall-context review-summaries /workspace" in prompt
+    assert "heimdall-context own-prior /workspace" in prompt
     # ...and they are framed as untrusted background context, not instructions.
+    assert "UNTRUSTED" in prompt
+    assert "never" in prompt and "instructions" in prompt
+
+
+@pytest.mark.parametrize("lens", _ALL_LENSES, ids=lambda lens: lens.name)
+def test_lens_default_prompt_references_all_four_discussion_subcommands(
+    lens: LensSpec,
+) -> None:
+    """The default prompt names every discussion subcommand against /workspace.
+
+    Each of the four reads (comments, review-threads, review-summaries, own-prior)
+    must be directed explicitly so the lens consults the full PR discussion, all
+    framed as untrusted background context rather than instructions.
+    """
+    argv = build_claude_argv(
+        claude_binary="claude",
+        workspace_dir=_WORKSPACE,
+        lens=lens,
+    )
+    prompt = argv[argv.index("-p") + 1]
+    for sub in ("comments", "review-threads", "review-summaries", "own-prior"):
+        assert f"heimdall-context {sub} /workspace" in prompt
+    # Untrusted-frame tokens are present so directives in any read stay data.
     assert "UNTRUSTED" in prompt
     assert "never" in prompt and "instructions" in prompt
 
