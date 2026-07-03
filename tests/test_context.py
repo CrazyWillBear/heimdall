@@ -11,12 +11,26 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from heimdall.context import PRContext, assemble_pr_context
-from heimdall.context_cli import cmd_diff, cmd_docs, cmd_file, cmd_pr, main
+from heimdall.context import PRContext, assemble_pr_context, prioritize_comments
+from heimdall.context_cli import (
+    cmd_comments,
+    cmd_diff,
+    cmd_docs,
+    cmd_file,
+    cmd_own_prior_review,
+    cmd_pr,
+    cmd_review_summaries,
+    cmd_review_threads,
+    main,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+# Distinguishes "caller did not pass own_prior_review" (use the default fixture) from an
+# explicit own_prior_review=None (simulate a PR with no prior Heimdall review).
+_SENTINEL = object()
 
 _REPO = "owner/repo"
 _PR_NUMBER = 7
@@ -29,6 +43,62 @@ _BASE_REF = "main"
 _HEAD_REF = "feature/awesome"
 
 _LINKED_ISSUES = [{"number": 42, "title": "Feature request"}]
+
+_COMMENTS = [
+    {"body": "Looks good to me!", "author": "reviewer", "author_association": "MEMBER"},
+    {"body": "One nit here.", "author": "octocat", "author_association": "OWNER"},
+]
+
+_REVIEW_THREADS = [
+    {
+        "body": "This line looks off.",
+        "author": "reviewer",
+        "author_association": "MEMBER",
+        "path": "foo.py",
+        "line": 2,
+        "replies": [
+            {
+                "body": "Good catch, fixed.",
+                "author": "octocat",
+                "author_association": "OWNER",
+                "path": "foo.py",
+                "line": 2,
+            }
+        ],
+        "is_resolved": True,
+    }
+]
+
+_REVIEW_SUMMARIES = [
+    {
+        "body": "Approving, looks solid.",
+        "author": "reviewer",
+        "author_association": "MEMBER",
+        "event": "APPROVE",
+    },
+    {
+        "body": "Needs a tweak before merge.",
+        "author": "maintainer",
+        "author_association": "OWNER",
+        "event": "REQUEST_CHANGES",
+    },
+]
+
+_OWN_PRIOR_REVIEW = {
+    "body": "Heimdall review: 1 finding.",
+    "author": "heimdall[bot]",
+    "author_association": "NONE",
+    "event": "REQUEST_CHANGES",
+    "inline_comments": [
+        {
+            "body": "Prior inline note from Heimdall.",
+            "author": "heimdall[bot]",
+            "author_association": "NONE",
+            "path": "foo.py",
+            "line": 2,
+        }
+    ],
+}
 
 _DIFF = """\
 diff --git a/foo.py b/foo.py
@@ -67,6 +137,10 @@ def _make_mock_github_client(
     pr_metadata: dict[str, Any] | None = None,
     file_content: str = _FILE_CONTENT,
     linked_issues: list[dict[str, Any]] | None = None,
+    comments: list[dict[str, Any]] | None = None,
+    review_threads: list[dict[str, Any]] | None = None,
+    review_summaries: list[dict[str, Any]] | None = None,
+    own_prior_review: dict[str, Any] | None | object = _SENTINEL,
 ) -> AsyncMock:
     """Build a mocked GitHubClient that returns canned API data."""
     client = AsyncMock()
@@ -76,6 +150,20 @@ def _make_mock_github_client(
     client.get_file_content = AsyncMock(return_value=file_content)
     client.get_linked_issues = AsyncMock(
         return_value=linked_issues if linked_issues is not None else _LINKED_ISSUES
+    )
+    client.get_pr_conversation_comments = AsyncMock(
+        return_value=comments if comments is not None else _COMMENTS
+    )
+    client.get_pr_review_comments = AsyncMock(
+        return_value=review_threads if review_threads is not None else _REVIEW_THREADS
+    )
+    client.get_pr_review_summaries = AsyncMock(
+        return_value=review_summaries if review_summaries is not None else _REVIEW_SUMMARIES
+    )
+    client.get_own_prior_review = AsyncMock(
+        return_value=_OWN_PRIOR_REVIEW
+        if own_prior_review is _SENTINEL
+        else own_prior_review
     )
     return client
 
@@ -102,6 +190,10 @@ def test_pr_context_fields() -> None:
         changed_files=_FILES,
         file_contents={"foo.py": _FILE_CONTENT},
         docs={},
+        comments=_COMMENTS,
+        review_threads=_REVIEW_THREADS,
+        review_summaries=_REVIEW_SUMMARIES,
+        own_prior_review=_OWN_PRIOR_REVIEW,
     )
     assert ctx.repo_full_name == _REPO
     assert ctx.pr_number == _PR_NUMBER
@@ -286,6 +378,18 @@ def _write_workspace(tmp_path: Path, ctx: PRContext) -> Path:
         file_path = files_dir / filename.replace("/", os.sep)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content)
+    if ctx.comments:
+        (tmp_path / "comments.json").write_text(json.dumps(ctx.comments))
+    if ctx.review_threads:
+        (tmp_path / "review_threads.json").write_text(json.dumps(ctx.review_threads))
+    if ctx.review_summaries:
+        (tmp_path / "review_summaries.json").write_text(
+            json.dumps(ctx.review_summaries)
+        )
+    if ctx.own_prior_review:
+        (tmp_path / "own_prior_review.json").write_text(
+            json.dumps(ctx.own_prior_review)
+        )
     return tmp_path
 
 
@@ -305,6 +409,10 @@ def _make_context() -> PRContext:
         changed_files=_FILES,
         file_contents={"foo.py": _FILE_CONTENT},
         docs={},
+        comments=_COMMENTS,
+        review_threads=_REVIEW_THREADS,
+        review_summaries=_REVIEW_SUMMARIES,
+        own_prior_review=_OWN_PRIOR_REVIEW,
     )
 
 
@@ -423,6 +531,619 @@ async def test_assemble_pr_context_materializes_file_contents() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Conversation comments: assemble, materialize, and the CLI subcommand
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_seed_contains_comments() -> None:
+    """Assembled seed carries the kept conversation comments verbatim."""
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    assert ctx.comments == _COMMENTS
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_materializes_comments_file() -> None:
+    """assemble_pr_context writes comments.json when comments were kept."""
+    mock_client = _make_mock_github_client()
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        comments_path = Path(tmp_dir) / "comments.json"
+        assert comments_path.exists()
+        materialized = json.loads(comments_path.read_text())
+        assert materialized == _COMMENTS
+        # Each comment carries its body, author login, and author_association.
+        assert materialized[0]["body"] == "Looks good to me!"
+        assert materialized[0]["author"] == "reviewer"
+        assert materialized[0]["author_association"] == "MEMBER"
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_no_comments_writes_no_file() -> None:
+    """An empty comment set leaves no comments.json (clean empty handling)."""
+    mock_client = _make_mock_github_client(comments=[])
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        assert ctx.comments == []
+        assert not (Path(tmp_dir) / "comments.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# prioritize_comments: cap + prioritization of the comment payload
+# ---------------------------------------------------------------------------
+
+
+def _thread(
+    body: str, *, is_resolved: bool = False, is_outdated: bool = False
+) -> dict[str, Any]:
+    """Build a minimal inline-thread dict for prioritization tests."""
+    return {
+        "body": body,
+        "author": "reviewer",
+        "author_association": "MEMBER",
+        "path": "foo.py",
+        "line": 2,
+        "replies": [],
+        "is_resolved": is_resolved,
+        "is_outdated": is_outdated,
+    }
+
+
+def _conv(body: str) -> dict[str, Any]:
+    """Build a minimal conversation-comment dict for prioritization tests."""
+    return {"body": body, "author": "octocat", "author_association": "OWNER"}
+
+
+def test_prioritize_comments_under_cap_keeps_all_no_truncation() -> None:
+    """Under the cap everything survives and nothing is reported truncated."""
+    threads = [_thread("t1"), _thread("t2")]
+    comments = [_conv("c1")]
+    kept_threads, kept_comments, truncated = prioritize_comments(
+        review_threads=threads, comments=comments, max_comments=10
+    )
+    assert kept_threads == threads
+    assert kept_comments == comments
+    assert truncated is False
+
+
+def test_prioritize_comments_over_cap_truncates_and_flags() -> None:
+    """Over the cap only the top-priority items survive and truncation is flagged."""
+    threads = [_thread(f"t{i}") for i in range(5)]
+    comments = [_conv("c1")]
+    kept_threads, kept_comments, truncated = prioritize_comments(
+        review_threads=threads, comments=comments, max_comments=2
+    )
+    assert len(kept_threads) + len(kept_comments) == 2
+    assert truncated is True
+
+
+def test_prioritize_comments_ranks_inline_threads_before_conversation() -> None:
+    """When capping, inline threads are kept before conversation comments."""
+    threads = [_thread("inline")]
+    comments = [_conv("conv")]
+    kept_threads, kept_comments, _ = prioritize_comments(
+        review_threads=threads, comments=comments, max_comments=1
+    )
+    assert kept_threads == [_thread("inline")]
+    assert kept_comments == []
+
+
+def test_prioritize_comments_unresolved_before_resolved() -> None:
+    """Unresolved threads outrank resolved ones when the cap forces a choice."""
+    resolved = _thread("resolved", is_resolved=True)
+    unresolved = _thread("unresolved", is_resolved=False)
+    kept_threads, _, truncated = prioritize_comments(
+        review_threads=[resolved, unresolved], comments=[], max_comments=1
+    )
+    assert kept_threads == [unresolved]
+    assert truncated is True
+
+
+def test_prioritize_comments_outdated_ranked_below_in_diff() -> None:
+    """Outdated inline threads are included but rank below in-diff ones."""
+    in_diff = _thread("in_diff", is_outdated=False)
+    outdated = _thread("outdated", is_outdated=True)
+    kept_threads, _, truncated = prioritize_comments(
+        review_threads=[outdated, in_diff], comments=[], max_comments=1
+    )
+    assert kept_threads == [in_diff]
+    assert truncated is True
+
+
+def test_prioritize_comments_recent_before_older_within_tier() -> None:
+    """Within the same priority tier, more recent (later in API order) ranks higher."""
+    older = _thread("older")
+    newer = _thread("newer")
+    kept_threads, _, _ = prioritize_comments(
+        review_threads=[older, newer], comments=[], max_comments=1
+    )
+    assert kept_threads == [newer]
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_caps_comments_and_flags_truncation() -> None:
+    """assemble_pr_context caps the payload and records truncation on the context."""
+    threads = [_thread(f"t{i}") for i in range(4)]
+    comments = [_conv(f"c{i}") for i in range(4)]
+    mock_client = _make_mock_github_client(
+        review_threads=threads, comments=comments
+    )
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            max_comments=3,
+        )
+    assert len(ctx.review_threads) + len(ctx.comments) == 3
+    assert ctx.comments_truncated is True
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_under_cap_no_truncation_flag() -> None:
+    """Under the cap the full payload survives and truncation is not flagged."""
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            max_comments=100,
+        )
+    assert ctx.comments == _COMMENTS
+    assert ctx.review_threads == _REVIEW_THREADS
+    assert ctx.comments_truncated is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #68 — comment-incorporation toggle: when off, no comments enter the seed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_toggle_off_fetches_no_comments() -> None:
+    """With incorporate_comments=False, no comment source is fetched at all.
+
+    The whole comment plumbing (conversation comments, inline threads, review
+    summaries, own prior review) is skipped, so the seed matches pre-feature
+    behavior and the synthesis/lens prompts see no comment context.
+    """
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            incorporate_comments=False,
+        )
+    mock_client.get_pr_conversation_comments.assert_not_called()
+    mock_client.get_pr_review_comments.assert_not_called()
+    mock_client.get_pr_review_summaries.assert_not_called()
+    mock_client.get_own_prior_review.assert_not_called()
+    assert ctx.comments == []
+    assert ctx.review_threads == []
+    assert ctx.review_summaries == []
+    assert ctx.own_prior_review is None
+    assert ctx.comments_truncated is False
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_toggle_off_materializes_no_comment_files() -> None:
+    """With the toggle off, none of the comment JSON files are written to disk."""
+    mock_client = _make_mock_github_client()
+    with tempfile.TemporaryDirectory() as workspace:
+        with patch("heimdall.context.GitHubClient", return_value=mock_client):
+            await assemble_pr_context(
+                app_id=1,
+                private_key="key",
+                installation_id=42,
+                repo_full_name=_REPO,
+                pr_number=_PR_NUMBER,
+                workspace_dir=workspace,
+                incorporate_comments=False,
+            )
+        root = Path(workspace)
+        assert not (root / "comments.json").exists()
+        assert not (root / "review_threads.json").exists()
+        assert not (root / "review_summaries.json").exists()
+        assert not (root / "own_prior_review.json").exists()
+        # The rest of the seed is unaffected.
+        assert (root / "diff.patch").exists()
+        assert (root / "pr_metadata.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_toggle_on_still_fetches_comments() -> None:
+    """The default (toggle on) keeps the full comment plumbing intact."""
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    mock_client.get_pr_conversation_comments.assert_called_once()
+    assert ctx.comments == _COMMENTS
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_incorporating_fetches_all_eight_sources() -> None:
+    """The incorporating path fetches each of the eight client sources exactly once."""
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    # The four core PR-data sources.
+    mock_client.get_pr.assert_called_once()
+    mock_client.get_pr_diff.assert_called_once()
+    mock_client.get_pr_files.assert_called_once()
+    mock_client.get_linked_issues.assert_called_once()
+    # The four comment sources.
+    mock_client.get_pr_conversation_comments.assert_called_once()
+    mock_client.get_pr_review_comments.assert_called_once()
+    mock_client.get_pr_review_summaries.assert_called_once()
+    mock_client.get_own_prior_review.assert_called_once()
+
+
+def test_cmd_comments_prints_materialized_comments(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """heimdall-context comments prints the materialized comments verbatim."""
+    ctx = _make_context()
+    workspace = _write_workspace(tmp_path, ctx)
+    cmd_comments(str(workspace))
+    captured = capsys.readouterr()
+    printed = json.loads(captured.out)
+    assert printed == _COMMENTS
+
+
+def test_main_comments_subcommand(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """main() dispatches the 'comments' subcommand."""
+    ctx = _make_context()
+    workspace = _write_workspace(tmp_path, ctx)
+    main(["comments", str(workspace)])
+    captured = capsys.readouterr()
+    assert "Looks good to me!" in captured.out
+
+
+def test_cmd_comments_empty_when_no_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no comments.json, the comments subcommand prints an empty JSON array."""
+    cmd_comments(str(tmp_path))
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == []
+
+
+# ---------------------------------------------------------------------------
+# Inline review threads: assemble, materialize, and the CLI subcommand
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_seed_contains_review_threads() -> None:
+    """Assembled seed carries the kept inline review threads verbatim."""
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    assert ctx.review_threads == _REVIEW_THREADS
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_materializes_review_threads_file() -> None:
+    """assemble_pr_context writes review_threads.json when inline threads were kept."""
+    mock_client = _make_mock_github_client()
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        threads_path = Path(tmp_dir) / "review_threads.json"
+        assert threads_path.exists()
+        materialized = json.loads(threads_path.read_text())
+        assert materialized == _REVIEW_THREADS
+        # The thread keeps its file/line anchor and its nested reply.
+        assert materialized[0]["path"] == "foo.py"
+        assert materialized[0]["line"] == 2
+        assert materialized[0]["replies"][0]["body"] == "Good catch, fixed."
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_no_review_threads_writes_no_file() -> None:
+    """An empty inline-thread set leaves no review_threads.json (clean empty handling)."""
+    mock_client = _make_mock_github_client(review_threads=[])
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        assert ctx.review_threads == []
+        assert not (Path(tmp_dir) / "review_threads.json").exists()
+
+
+def test_cmd_review_threads_prints_materialized_threads(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """heimdall-context review-threads prints the materialized threads verbatim."""
+    ctx = _make_context()
+    workspace = _write_workspace(tmp_path, ctx)
+    cmd_review_threads(str(workspace))
+    captured = capsys.readouterr()
+    printed = json.loads(captured.out)
+    assert printed == _REVIEW_THREADS
+    # Each thread's resolution state round-trips through review_threads.json and the CLI.
+    assert printed[0]["is_resolved"] is True
+
+
+def test_main_review_threads_subcommand(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """main() dispatches the 'review-threads' subcommand, distinct from comments."""
+    ctx = _make_context()
+    workspace = _write_workspace(tmp_path, ctx)
+    main(["review-threads", str(workspace)])
+    captured = capsys.readouterr()
+    # The inline-thread body appears, not the conversation-comment body.
+    assert "This line looks off." in captured.out
+    assert "Looks good to me!" not in captured.out
+
+
+def test_cmd_review_threads_empty_when_no_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no review_threads.json, the subcommand prints an empty JSON array."""
+    cmd_review_threads(str(tmp_path))
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == []
+
+
+# ---------------------------------------------------------------------------
+# Review summaries + Heimdall's own prior review: assemble, materialize, CLI
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_seed_contains_review_summaries() -> None:
+    """Assembled seed carries the kept review summaries (with event type) verbatim."""
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    assert ctx.review_summaries == _REVIEW_SUMMARIES
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_seed_contains_own_prior_review() -> None:
+    """Assembled seed carries Heimdall's own prior review (body + inline comments)."""
+    mock_client = _make_mock_github_client()
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+    assert ctx.own_prior_review == _OWN_PRIOR_REVIEW
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_materializes_review_summaries_file() -> None:
+    """assemble_pr_context writes review_summaries.json when summaries were kept."""
+    mock_client = _make_mock_github_client()
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        summaries_path = Path(tmp_dir) / "review_summaries.json"
+        assert summaries_path.exists()
+        materialized = json.loads(summaries_path.read_text())
+        assert materialized == _REVIEW_SUMMARIES
+        assert materialized[0]["event"] == "APPROVE"
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_materializes_own_prior_review_file() -> None:
+    """assemble_pr_context writes own_prior_review.json when a prior review exists."""
+    mock_client = _make_mock_github_client()
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        own_path = Path(tmp_dir) / "own_prior_review.json"
+        assert own_path.exists()
+        materialized = json.loads(own_path.read_text())
+        assert materialized == _OWN_PRIOR_REVIEW
+        assert materialized["inline_comments"][0]["path"] == "foo.py"
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_no_review_summaries_writes_no_file() -> None:
+    """An empty summary set leaves no review_summaries.json (clean empty handling)."""
+    mock_client = _make_mock_github_client(review_summaries=[])
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        assert ctx.review_summaries == []
+        assert not (Path(tmp_dir) / "review_summaries.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_no_own_prior_review_writes_no_file() -> None:
+    """No prior Heimdall review leaves no own_prior_review.json (clean empty handling)."""
+    mock_client = _make_mock_github_client(own_prior_review=None)
+    with (
+        patch("heimdall.context.GitHubClient", return_value=mock_client),
+        tempfile.TemporaryDirectory() as tmp_dir,
+    ):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+            workspace_dir=tmp_dir,
+        )
+        assert ctx.own_prior_review is None
+        assert not (Path(tmp_dir) / "own_prior_review.json").exists()
+
+
+def test_cmd_review_summaries_prints_materialized_summaries(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """heimdall-context review-summaries prints the materialized summaries verbatim."""
+    ctx = _make_context()
+    workspace = _write_workspace(tmp_path, ctx)
+    cmd_review_summaries(str(workspace))
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == _REVIEW_SUMMARIES
+
+
+def test_cmd_own_prior_review_prints_materialized_review(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """heimdall-context own-prior prints Heimdall's materialized prior review verbatim."""
+    ctx = _make_context()
+    workspace = _write_workspace(tmp_path, ctx)
+    cmd_own_prior_review(str(workspace))
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == _OWN_PRIOR_REVIEW
+
+
+def test_main_review_summaries_and_own_prior_distinguishable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The summary and own-prior subcommands surface content distinct from other kinds."""
+    ctx = _make_context()
+    workspace = _write_workspace(tmp_path, ctx)
+
+    main(["review-summaries", str(workspace)])
+    summaries_out = capsys.readouterr().out
+    # The review-summary body + its event type appear, not a conversation comment.
+    assert "Approving, looks solid." in summaries_out
+    assert "APPROVE" in summaries_out
+    assert "Looks good to me!" not in summaries_out
+
+    main(["own-prior", str(workspace)])
+    own_out = capsys.readouterr().out
+    # Heimdall's own prior body + inline note appear, distinct from the summaries.
+    assert "Heimdall review: 1 finding." in own_out
+    assert "Prior inline note from Heimdall." in own_out
+    assert "Approving, looks solid." not in own_out
+
+
+def test_cmd_review_summaries_empty_when_no_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no review_summaries.json, the subcommand prints an empty JSON array."""
+    cmd_review_summaries(str(tmp_path))
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == []
+
+
+def test_cmd_own_prior_review_empty_when_no_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no own_prior_review.json, the own-prior subcommand prints null."""
+    cmd_own_prior_review(str(tmp_path))
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) is None
+
+
+# ---------------------------------------------------------------------------
 # subprocess import guard: verify subprocess is never imported by context module
 # ---------------------------------------------------------------------------
 
@@ -458,6 +1179,10 @@ def _make_context_with_files(file_contents: dict[str, str]) -> PRContext:
         changed_files=[],
         file_contents=file_contents,
         docs={},
+        comments=[],
+        review_threads=[],
+        review_summaries=[],
+        own_prior_review=None,
     )
 
 
@@ -536,6 +1261,10 @@ def test_materialize_rejects_traversal_doc_name(tmp_path: Path) -> None:
         changed_files=[],
         file_contents={},
         docs={"../../evil-conv.txt": "evil content"},
+        comments=[],
+        review_threads=[],
+        review_summaries=[],
+        own_prior_review=None,
     )
     _materialize(ctx, str(workspace))
 
@@ -727,6 +1456,10 @@ def _make_mock_github_client_with_docs(
     client.get_pr = AsyncMock(return_value=_PR_METADATA)
     client.get_file_content = _get_file_content
     client.get_linked_issues = AsyncMock(return_value=_LINKED_ISSUES)
+    client.get_pr_conversation_comments = AsyncMock(return_value=_COMMENTS)
+    client.get_pr_review_comments = AsyncMock(return_value=_REVIEW_THREADS)
+    client.get_pr_review_summaries = AsyncMock(return_value=_REVIEW_SUMMARIES)
+    client.get_own_prior_review = AsyncMock(return_value=_OWN_PRIOR_REVIEW)
     return client
 
 
@@ -879,6 +1612,10 @@ def _make_context_with_docs() -> PRContext:
         changed_files=_FILES,
         file_contents={"foo.py": _FILE_CONTENT},
         docs=_DOCS,
+        comments=_COMMENTS,
+        review_threads=_REVIEW_THREADS,
+        review_summaries=_REVIEW_SUMMARIES,
+        own_prior_review=_OWN_PRIOR_REVIEW,
     )
 
 

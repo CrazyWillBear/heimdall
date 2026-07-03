@@ -7,12 +7,24 @@ fetching PR metadata, diffs, file lists, and file contents for seed-context asse
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from typing import Any
 
 import httpx
 import jwt
+
+logger = logging.getLogger(__name__)
+
+# Hard ceiling on pages any single pagination loop will fetch — comments,
+# submitted reviews, and GraphQL review threads alike. GitHub serves up to 100
+# items/page, so 50 pages == 5000 items — far beyond any realistic human PR
+# discussion, yet finite so an attacker-influenceable PR with a pathologically
+# large discussion can't drive unbounded API calls / memory / time per review
+# (resource-exhaustion hardening). Hitting it logs a WARNING so the resulting
+# truncation is never silent.
+_MAX_PAGINATION_PAGES = 50
 
 
 def parse_linked_issues_from_body(body: str) -> list[dict[str, Any]]:
@@ -41,6 +53,161 @@ def parse_linked_issues_from_body(body: str) -> list[dict[str, Any]]:
             seen.add(number)
             results.append({"number": number})
     return results
+
+
+def _shape_comment(raw: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a raw GitHub comment object to the fields the seed records.
+
+    Keeps only the ``body``, author ``login``, and ``author_association`` — the
+    minimum a downstream lens needs to weigh a conversation comment — and drops
+    every other (potentially large or sensitive) field from the API payload.
+
+    Args:
+        raw: A single comment object from the issues-comments REST endpoint.
+
+    Returns:
+        A dict with ``body``, ``author``, and ``author_association`` keys.
+    """
+    return {
+        "body": raw.get("body") or "",
+        "author": str((raw.get("user") or {}).get("login", "")),
+        "author_association": str(raw.get("author_association", "")),
+    }
+
+
+def _shape_inline_comment(raw: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a raw GitHub review (inline) comment to the fields a thread records.
+
+    Builds on :func:`_shape_comment` (``body``/``author``/``author_association``) and
+    adds the line anchor a thread needs: the ``path`` the comment is attached to and the
+    ``line`` it points at — ``line`` is the comment's current line, falling back to the
+    pre-image ``original_line`` for comments on an outdated diff hunk.  An ``is_outdated``
+    flag records that fallback: a comment whose current ``line`` is gone (a push moved or
+    removed the hunk) is outdated, so downstream prioritization can keep it but rank it
+    below comments still anchored on the live diff.  Like :func:`_shape_comment`, every
+    other (potentially large or sensitive) API field is dropped.
+
+    Args:
+        raw: A single comment object from the pulls review-comments REST endpoint.
+
+    Returns:
+        A dict with ``body``, ``author``, ``author_association``, ``path``, ``line``, and
+        ``is_outdated``.
+    """
+    shaped = _shape_comment(raw)
+    line = raw.get("line")
+    is_outdated = line is None
+    if is_outdated:
+        line = raw.get("original_line")
+    shaped["path"] = str(raw.get("path") or "")
+    shaped["line"] = line
+    shaped["is_outdated"] = is_outdated
+    return shaped
+
+
+# GitHub's submitted-review ``state`` (past tense) maps to the create-review ``event``
+# verb Heimdall already uses everywhere else (APPROVE/REQUEST_CHANGES/COMMENT).  Using
+# the event verb keeps a review summary tagged the same way as the verdict Heimdall posts.
+_REVIEW_STATE_TO_EVENT = {
+    "APPROVED": "APPROVE",
+    "CHANGES_REQUESTED": "REQUEST_CHANGES",
+    "COMMENTED": "COMMENT",
+}
+
+
+def _review_event(raw: dict[str, Any]) -> str:
+    """Map a submitted review's ``state`` to its create-review event verb.
+
+    GitHub reports a submitted review's ``state`` in the past tense (APPROVED /
+    CHANGES_REQUESTED / COMMENTED); Heimdall tags review summaries with the matching
+    create-review event verb (APPROVE / REQUEST_CHANGES / COMMENT) it uses elsewhere.
+    An unrecognised state (e.g. DISMISSED, PENDING) is passed through verbatim so the
+    raw signal is never silently dropped.
+    """
+    state = str(raw.get("state", ""))
+    return _REVIEW_STATE_TO_EVENT.get(state, state)
+
+
+def _shape_review_summary(raw: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a raw submitted-review object to the fields a summary records.
+
+    Builds on :func:`_shape_comment` (``body``/``author``/``author_association``) and
+    adds the ``event`` type (APPROVE / REQUEST_CHANGES / COMMENT) so a downstream lens
+    can tell an approval from a change-request from a plain comment.  Every other
+    (potentially large or sensitive) API field is dropped, like the other shapers.
+
+    Args:
+        raw: A single review object from the pulls reviews REST endpoint.
+
+    Returns:
+        A dict with ``body``, ``author``, ``author_association``, and ``event``.
+    """
+    shaped = _shape_comment(raw)
+    shaped["event"] = _review_event(raw)
+    return shaped
+
+
+def group_review_comments_into_threads(
+    comments: list[dict[str, Any]],
+    resolution_by_comment_id: dict[int, bool] | None = None,
+) -> list[dict[str, Any]]:
+    """Group flat inline review comments into parent-anchored reply threads.
+
+    A PR's review-comments endpoint returns a flat list where a reply carries an
+    ``in_reply_to_id`` pointing at the comment it answers; a top-level comment has none.
+    This rebuilds the tree: each top-level comment becomes a thread carrying its file/line
+    anchor and a ``replies`` list, and every reply is appended (in API order) under the
+    thread whose root id it answers.  A reply whose parent was dropped by author filtering
+    is promoted to its own thread so its content is never silently lost.
+
+    Each thread also carries an ``is_resolved`` flag sourced from the GraphQL
+    ``reviewThreads`` resolution map (see :meth:`GitHubClient.get_review_thread_resolutions`):
+    a thread is resolved when ANY of its comment ids (root or reply) maps to ``True`` in
+    ``resolution_by_comment_id``.  A thread whose ids are absent from the map — an empty
+    map, a GraphQL hiccup, or a comment GraphQL did not return — defaults to ``False``
+    (unresolved), so resolution degrades cleanly and never crashes grouping.  The flag is
+    trusted as-is (no author-of-resolve check — accepted residual risk).
+
+    Args:
+        comments: Raw review-comment objects (already author-filtered), in API order.
+        resolution_by_comment_id: Optional map of REST comment id -> ``isResolved`` from
+            the GraphQL ``reviewThreads`` query.  ``None`` or empty leaves every thread
+            unresolved.
+
+    Returns:
+        One dict per thread: the shaped root fields (``body``/``author``/
+        ``author_association``/``path``/``line``/``is_outdated``) plus a ``replies`` list
+        of shaped replies and an ``is_resolved`` bool, in API (chronological) order.
+    """
+    resolution = resolution_by_comment_id or {}
+    threads_by_id: dict[int, dict[str, Any]] = {}
+    # Track the comment ids backing each thread so a reply's resolution can promote the
+    # whole thread to resolved even when the root comment id is absent from the map.
+    ids_by_thread: dict[int, set[int]] = {}
+    ordered: list[dict[str, Any]] = []
+    for raw in comments:
+        parent_id = raw.get("in_reply_to_id")
+        shaped = _shape_inline_comment(raw)
+        comment_id = raw.get("id")
+        parent = threads_by_id.get(parent_id) if parent_id is not None else None
+        if parent is not None:
+            parent["replies"].append(shaped)
+            if isinstance(comment_id, int):
+                ids_by_thread[id(parent)].add(comment_id)
+            continue
+        # A root comment, or a reply whose parent was filtered out: start a new thread.
+        thread = {**shaped, "replies": [], "is_resolved": False}
+        ordered.append(thread)
+        thread_ids: set[int] = set()
+        ids_by_thread[id(thread)] = thread_ids
+        if isinstance(comment_id, int):
+            threads_by_id[comment_id] = thread
+            thread_ids.add(comment_id)
+
+    for thread in ordered:
+        thread_ids = ids_by_thread[id(thread)]
+        thread["is_resolved"] = any(resolution.get(cid, False) for cid in thread_ids)
+    return ordered
 
 
 def _raise_with_body(response: httpx.Response) -> None:
@@ -274,23 +441,15 @@ class GitHubClient:
         Returns:
             All inline-comment objects (each carrying an ``id``) for the review.
         """
-        url: str | None = (
+        url = (
             f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}"
             f"/reviews/{review_id}/comments"
         )
-        headers = await self._gh_headers()
-        all_comments: list[dict[str, Any]] = []
-        first_page = True
-        while url is not None:
-            kwargs: dict[str, Any] = {"headers": headers}
-            if first_page:
-                kwargs["params"] = {"per_page": 100}
-                first_page = False
-            response = await self._http.get(url, **kwargs)
-            response.raise_for_status()
-            all_comments.extend(response.json())
-            url = self._next_page_url(response.headers.get("link", ""))
-        return all_comments
+        return await self._paginate_get(
+            url,
+            label=f"list_review_comments for {repo_full_name}#{pr_number} "
+            f"review {review_id}",
+        )
 
     async def delete_review_comment(
         self,
@@ -382,6 +541,64 @@ class GitHubClient:
                     return url_part[1:-1]
         return None
 
+    async def _paginate_get(
+        self,
+        url: str,
+        *,
+        label: str,
+        max_pages: int | None = _MAX_PAGINATION_PAGES,
+    ) -> list[dict[str, Any]]:
+        """GET a paginated REST collection, following ``Link: rel="next"`` to the end.
+
+        Owns the shared REST pagination loop every list endpoint here repeats: it sends
+        ``per_page=100`` on the FIRST request only (GitHub's next-page URLs already carry
+        ``page=`` and ``per_page=`` in their query string; re-passing ``params=`` would
+        replace the whole query string under httpx, stripping ``page=`` and looping
+        forever), raises on a non-2xx, accumulates each page's ``response.json()`` rows
+        into one flat list, and advances via :meth:`_next_page_url`.
+
+        When ``max_pages`` is not None it enforces a hard page ceiling: after fetching a
+        page it stops — logging a WARNING tagged with ``label`` — only when a further page
+        actually exists, so an attacker-influenceable PR with a pathologically large
+        collection can't drive unbounded API calls / memory / time. ``max_pages=None``
+        opts out (deliberately unbounded; the caller justifies why).
+
+        The returned rows are the RAW item dicts across all pages; any per-page filtering
+        or shaping is the caller's job.
+
+        Args:
+            url: The first-page collection URL.
+            label: Human-readable caller tag (method + ``repo#pr``) for the ceiling
+                WARNING, so a truncation is traceable to its source.
+            max_pages: Page ceiling, or None for unbounded.
+
+        Returns:
+            The flat list of raw item dicts gathered across every fetched page.
+        """
+        headers = await self._gh_headers()
+        items: list[dict[str, Any]] = []
+        next_url: str | None = url
+        first_page = True
+        page_count = 0
+        while next_url is not None:
+            kwargs: dict[str, Any] = {"headers": headers}
+            if first_page:
+                kwargs["params"] = {"per_page": 100}
+                first_page = False
+            response = await self._http.get(next_url, **kwargs)
+            response.raise_for_status()
+            items.extend(response.json())
+            next_url = self._next_page_url(response.headers.get("link", ""))
+            page_count += 1
+            if next_url is not None and max_pages is not None and page_count >= max_pages:
+                logger.warning(
+                    "%s hit the %d-page ceiling; truncating remaining items",
+                    label,
+                    max_pages,
+                )
+                break
+        return items
+
     async def get_pr_files(
         self,
         *,
@@ -400,28 +617,13 @@ class GitHubClient:
         Returns:
             List of all file objects (filename, status, patch, …) from the GitHub API.
         """
-        url: str | None = (
-            f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/files"
+        url = f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/files"
+        # unbounded: GitHub caps a PR at ~3000 files, already under the ceiling.
+        return await self._paginate_get(
+            url,
+            label=f"get_pr_files for {repo_full_name}#{pr_number}",
+            max_pages=None,
         )
-        headers = await self._gh_headers()
-        all_files: list[dict[str, Any]] = []
-        first_page = True
-
-        while url is not None:
-            # Only attach params on the first request. GitHub's next-page URLs
-            # already carry page= and per_page= in their query string; passing
-            # params= again would replace the entire query string (httpx
-            # behaviour), stripping page= and causing an infinite loop.
-            kwargs: dict[str, Any] = {"headers": headers}
-            if first_page:
-                kwargs["params"] = {"per_page": 100}
-                first_page = False
-            response = await self._http.get(url, **kwargs)
-            response.raise_for_status()
-            all_files.extend(response.json())
-            url = self._next_page_url(response.headers.get("link", ""))
-
-        return all_files
 
     async def get_file_content(
         self,
@@ -466,6 +668,328 @@ class GitHubClient:
             )
         raw: str = data["content"]
         return base64.b64decode(raw.replace("\n", "")).decode("utf-8")
+
+    async def get_pr_conversation_comments(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch the PR's conversation (timeline) comments, kept-author only.
+
+        Conversation comments are the issue-level comments on a PR (the timeline),
+        distinct from review/inline comments.  They are fetched from the issues
+        comments REST endpoint (a PR is an issue), following pagination.
+
+        Only **human** and **Heimdall's own** authors are kept; every other bot
+        (e.g. a CI or dependency bot) is dropped.  Heimdall's own comments are
+        recognised by ``performed_via_github_app.id`` matching this client's App id,
+        so they survive even though their author is a Bot.  These comments are
+        attacker-influenced third-party data, never instructions — the kept-author
+        filter narrows, but does not sanitise, the content.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            One dict per kept comment with ``body``, ``author`` (login), and
+            ``author_association`` keys, in API (chronological) order.
+        """
+        url = f"{self._BASE}/repos/{repo_full_name}/issues/{pr_number}/comments"
+        raw = await self._paginate_get(
+            url,
+            label=f"get_pr_conversation_comments for {repo_full_name}#{pr_number}",
+        )
+        return [_shape_comment(c) for c in raw if self._keep_comment_author(c)]
+
+    def _keep_comment_author(self, raw: dict[str, Any]) -> bool:
+        """Return True for a human author or Heimdall's own comment, else False.
+
+        Drops third-party bots (a comment whose ``user.type`` is ``Bot``) unless the
+        comment was posted by *this* GitHub App — identified by
+        ``performed_via_github_app.id`` equalling the client's App id — so Heimdall's
+        own prior comments are kept while other bots are excluded.
+        """
+        user = raw.get("user") or {}
+        if str(user.get("type", "")).lower() != "bot":
+            return True
+        app = raw.get("performed_via_github_app") or {}
+        return app.get("id") == self._app_id
+
+    async def get_pr_review_comments(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch the PR's inline review comments as parent-anchored reply threads.
+
+        Inline (review) comments are line-anchored comments on diff hunks — distinct
+        from the conversation/timeline comments served by
+        :meth:`get_pr_conversation_comments`.  They are fetched from the pulls
+        review-comments REST endpoint (a flat list where a reply carries
+        ``in_reply_to_id``), following pagination, then grouped into threads by
+        :func:`group_review_comments_into_threads` so each top-level comment keeps its
+        ``path``/``line`` anchor and its ``replies``.
+
+        The SAME kept-author filter as the conversation path applies: only human and
+        Heimdall's-own authors survive (recognised via ``performed_via_github_app.id``);
+        every other bot is dropped.  Filtering runs on the flat list before grouping, so a
+        reply whose parent was a dropped bot is promoted to its own thread rather than
+        lost.  These threads are attacker-influenced third-party data, never instructions
+        — the filter narrows, but does not sanitise, the content.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            One dict per thread with ``body``, ``author`` (login), ``author_association``,
+            ``path``, ``line``, ``is_outdated``, and a ``replies`` list (each reply shaped
+            the same way), in API (chronological) order.
+        """
+        url = f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/comments"
+        raw = await self._paginate_get(
+            url,
+            label=f"get_pr_review_comments for {repo_full_name}#{pr_number}",
+        )
+        kept = [c for c in raw if self._keep_comment_author(c)]
+        resolution = await self.get_review_thread_resolutions(
+            repo_full_name=repo_full_name, pr_number=pr_number
+        )
+        return group_review_comments_into_threads(kept, resolution)
+
+    async def get_review_thread_resolutions(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> dict[int, bool]:
+        """Fetch each inline review thread's resolution state via GraphQL.
+
+        The REST review-comments endpoint (:meth:`get_pr_review_comments`) carries no
+        resolution signal, so this issues a GraphQL ``reviewThreads`` query — using the
+        same installation token (via :meth:`_gh_headers`) — to read each thread's
+        ``isResolved`` flag.  Each node exposes its comments' ``databaseId`` (the REST
+        comment id), so the returned map keys resolution by REST comment id, letting
+        :func:`group_review_comments_into_threads` correlate it to the REST threads.  The
+        query is paginated through ``reviewThreads.pageInfo`` so a PR with many threads is
+        fully covered.
+
+        The flag is trusted as-is — no check that the resolver was authorised (accepted
+        residual risk).  This is a **degrade-clean** read: a GraphQL ``errors`` payload, a
+        transport failure, or an unexpected shape returns whatever was collected so far
+        (often ``{}``) rather than raising, so resolution defaults to unresolved and never
+        crashes the review.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            A map of REST comment id -> ``isResolved`` for every thread comment seen.
+            Empty when the PR has no review threads or GraphQL was unavailable.
+        """
+        owner, _, name = repo_full_name.partition("/")
+        query = (
+            "query($owner: String!, $name: String!, $number: Int!, $after: String) {"
+            " repository(owner: $owner, name: $name) {"
+            " pullRequest(number: $number) {"
+            " reviewThreads(first: 100, after: $after) {"
+            " nodes { isResolved comments(first: 100) { nodes { databaseId } } }"
+            " pageInfo { hasNextPage endCursor } } } } }"
+        )
+        resolution: dict[int, bool] = {}
+        after: str | None = None
+        page_count = 0
+        try:
+            while True:
+                response = await self._http.post(
+                    f"{self._BASE}/graphql",
+                    headers=await self._gh_headers(),
+                    json={
+                        "query": query,
+                        "variables": {
+                            "owner": owner,
+                            "name": name,
+                            "number": pr_number,
+                            "after": after,
+                        },
+                    },
+                )
+                response.raise_for_status()
+                payload: dict[str, Any] = response.json()
+                if payload.get("errors"):
+                    logger.warning(
+                        "GraphQL reviewThreads returned errors for %s#%s: %s; "
+                        "defaulting threads to unresolved",
+                        repo_full_name,
+                        pr_number,
+                        payload["errors"],
+                    )
+                    return resolution
+                threads = (
+                    payload.get("data", {})
+                    .get("repository", {})
+                    .get("pullRequest", {})
+                    .get("reviewThreads", {})
+                )
+                for node in threads.get("nodes", []):
+                    is_resolved = bool(node.get("isResolved", False))
+                    for comment in node.get("comments", {}).get("nodes", []):
+                        database_id = comment.get("databaseId")
+                        if isinstance(database_id, int):
+                            resolution[database_id] = is_resolved
+                page_info = threads.get("pageInfo", {})
+                if not page_info.get("hasNextPage"):
+                    break
+                after = page_info.get("endCursor")
+                if after is None:
+                    break
+                page_count += 1
+                if page_count >= _MAX_PAGINATION_PAGES:
+                    logger.warning(
+                        "get_review_thread_resolutions hit the %d-page ceiling "
+                        "for %s#%s; treating remaining threads as unresolved",
+                        _MAX_PAGINATION_PAGES, repo_full_name, pr_number,
+                    )
+                    break
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            logger.warning(
+                "GraphQL reviewThreads fetch failed for %s#%s: %s; "
+                "defaulting threads to unresolved",
+                repo_full_name,
+                pr_number,
+                exc,
+            )
+        return resolution
+
+    async def _list_pr_reviews(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> list[dict[str, Any]]:
+        """List every submitted review on a PR, following pagination.
+
+        Returns the raw review objects (each carrying ``id``/``body``/``state``/``user``)
+        in API order.  Shared by :meth:`get_pr_review_summaries` (the kept-author summary
+        bodies) and :meth:`get_own_prior_review` (Heimdall's own latest review).
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            All submitted-review objects for the PR, in API (chronological) order.
+        """
+        url = f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}/reviews"
+        return await self._paginate_get(
+            url,
+            label=f"_list_pr_reviews for {repo_full_name}#{pr_number}",
+        )
+
+    async def get_pr_review_summaries(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch the PR's submitted-review summary bodies, kept-author only.
+
+        A *review summary* is the body text a reviewer submits alongside an
+        APPROVE / REQUEST_CHANGES / COMMENT event — distinct from the timeline
+        comments (:meth:`get_pr_conversation_comments`) and the line-anchored inline
+        threads (:meth:`get_pr_review_comments`).  Each kept summary carries its event
+        type so a downstream lens can tell an approval from a change-request.
+
+        The SAME kept-author filter as the other comment paths applies: only human and
+        Heimdall's-own authors survive (recognised via ``performed_via_github_app.id``);
+        every other bot is dropped.  Reviews with an empty body are dropped — a bare
+        click-approve carries no summary text to weigh.  These summaries are
+        attacker-influenced third-party data, never instructions — the filter narrows,
+        but does not sanitise, the content.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            One dict per kept summary with ``body``, ``author`` (login),
+            ``author_association``, and ``event`` (APPROVE/REQUEST_CHANGES/COMMENT),
+            in API (chronological) order.
+        """
+        reviews = await self._list_pr_reviews(
+            repo_full_name=repo_full_name, pr_number=pr_number
+        )
+        kept: list[dict[str, Any]] = []
+        for raw in reviews:
+            if not (raw.get("body") or "").strip():
+                # A bare APPROVE/etc. with no body has no summary text to surface.
+                continue
+            if self._keep_comment_author(raw):
+                kept.append(_shape_review_summary(raw))
+        return kept
+
+    async def get_own_prior_review(
+        self,
+        *,
+        repo_full_name: str,
+        pr_number: int,
+    ) -> dict[str, Any] | None:
+        """Fetch Heimdall's own latest prior review (body + its inline comments).
+
+        Finds the most recent review authored by *this* GitHub App (recognised via
+        ``performed_via_github_app.id``) and returns its body, event type, and the
+        shaped inline comments attached to it.  This MUST be read before the
+        across-push retire/delete step runs (which dismisses/minimizes Heimdall's prior
+        review and deletes its inline comments), or that context is destroyed before it
+        can reach the next review.  Heimdall's own prior review is untrusted-self data:
+        useful continuity context, but never a binding instruction.
+
+        Args:
+            repo_full_name: e.g. "owner/repo".
+            pr_number: The PR number.
+
+        Returns:
+            A dict with ``body``, ``author`` (login), ``author_association``, ``event``,
+            and an ``inline_comments`` list (each shaped with
+            ``body``/``author``/``author_association``/``path``/``line``); or None when
+            Heimdall has not reviewed this PR yet.
+        """
+        reviews = await self._list_pr_reviews(
+            repo_full_name=repo_full_name, pr_number=pr_number
+        )
+        own = [r for r in reviews if self._is_own_review(r)]
+        if not own:
+            return None
+        # The reviews endpoint returns reviews in submission (chronological) order, so
+        # the last own review is the latest — the one whose context still matters.
+        latest = own[-1]
+        review_id = latest.get("id")
+        inline_raw = (
+            await self.list_review_comments(
+                repo_full_name=repo_full_name,
+                pr_number=pr_number,
+                review_id=int(review_id),
+            )
+            if isinstance(review_id, int)
+            else []
+        )
+        summary = _shape_review_summary(latest)
+        summary["inline_comments"] = [_shape_inline_comment(c) for c in inline_raw]
+        return summary
+
+    def _is_own_review(self, raw: dict[str, Any]) -> bool:
+        """Return True only for a review posted by *this* GitHub App.
+
+        Stricter than :meth:`_keep_comment_author` (which also keeps humans): an own
+        review is identified solely by ``performed_via_github_app.id`` matching the
+        client's App id, so a human review is never mistaken for Heimdall's own.
+        """
+        app = raw.get("performed_via_github_app") or {}
+        return app.get("id") == self._app_id
 
     async def get_linked_issues(
         self,

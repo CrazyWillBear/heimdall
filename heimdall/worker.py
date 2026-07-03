@@ -19,14 +19,23 @@ has not opted in, so nothing is reviewed — then applies scope filters (base-br
 allowlist, path globs, skip drafts/bot authors, opt-out label) and the guardrail caps:
 a PR over the diff-size/file-count cap is skipped WITH a posted note, a repo over its
 per-window review budget is skipped silently, and a review that would exceed the
-per-installation concurrency cap defers (a DB-backed in-flight slot, released on every
-exit path).  If it proceeds, it
-assembles the PR seed context into a temporary workspace once, fans out the
+per-installation concurrency cap re-queues itself via ``arq.Retry`` (bounded by
+``WorkerSettings.max_tries``) and re-runs when a slot frees rather than being dropped;
+the in-flight slot is claimed only when available and released on every exit path.  If
+it proceeds, it
+assembles the PR seed context into a temporary workspace once (including the PR's kept
+conversation comments — human and Heimdall's own — exposed via ``heimdall-context
+comments``, its kept inline review threads via ``heimdall-context review-threads``, its
+kept submitted-review summaries via ``heimdall-context review-summaries``, and Heimdall's
+own prior review — read before the retire/delete step destroys it — via
+``heimdall-context own-prior``), fans out the
 config-tuned lenses (built-ins Security opus/max, Design-fit sonnet/high, Cleanliness
 sonnet/high, each with per-lens model/effort/enable overrides plus optional appended
 instructions, alongside any custom lenses defined in the config) over that shared seed —
 each bounded by its own token cap and timeout — then runs a 4th synthesis ``claude -p``
-pass that dedups overlapping findings across lenses, ranks by severity, writes the
+pass that dedups overlapping findings across lenses, ranks by severity, embeds the
+conversation comments, inline review threads, review summaries, and Heimdall's own prior
+review as untrusted context, writes the
 verdict, and formats the review (findings grouped by severity, each tagged with the
 originating lens).  Exactly one PR review is posted: findings on a changed diff line
 ride as inline comments in that same submission, while off-diff (or unparseable-
@@ -65,6 +74,7 @@ import time
 from dataclasses import replace
 from typing import Any
 
+from arq import Retry
 from arq.connections import RedisSettings
 
 from heimdall.context import assemble_pr_context
@@ -95,7 +105,9 @@ from heimdall.lens import (
     LensResult,
     SandboxError,
     SynthesisResult,
+    render_comments_truncated_note,
     render_dropped_lenses_warning,
+    render_suppressed_findings_section,
     run_lens,
     run_synthesis,
     sandbox_exec_probe,
@@ -125,6 +137,14 @@ _MAX_REVIEW_ATTEMPTS = 2
 # (assembly, posting, retiring the prior review, GitHub round-trips outside the
 # per-review wall-clock).
 _JOB_TIMEOUT_BUFFER_SECONDS = 300.0
+
+# Backoff before a review that hit its installation's concurrency cap re-runs.  At the cap
+# the job re-queues itself via arq.Retry(defer=...) instead of returning: a bare return ends
+# the job cleanly, so arq would never retry and the SHA would go unreviewed until a later
+# delivery/push.  One in-flight review takes a few minutes, so this spaces retries without
+# busy-waiting; WorkerSettings.max_tries bounds how long the job keeps deferring (total
+# patience = (max_tries - 1) * this).
+_CONCURRENCY_DEFER_SECONDS = 60
 
 # Posted as a COMMENT (never REQUEST_CHANGES) when both the initial run and the
 # single retry fail — a deliberately terse, metadata-free note.
@@ -222,22 +242,29 @@ async def run_review(
             )
             return
 
-        # Per-installation concurrency guardrail: claim an in-flight slot, and if
-        # the installation is already at its cap, defer this run (skip without
-        # recording the SHA so a later delivery/push reviews the same commit).
+        # Per-installation concurrency guardrail: claim an in-flight slot, and if the
+        # installation is already at its cap, re-queue this run via arq.Retry instead of
+        # returning (see _CONCURRENCY_DEFER_SECONDS for why a bare return drops the SHA).
+        # The cap check is BEFORE the slot is claimed, so raising here leaks no slot
+        # (nothing to release).
         if not await try_acquire_inflight(
             db,
             installation_id=installation_id,
             cap=config.caps.max_concurrent_per_installation,
         ):
             logger.info(
-                "Deferring review for %s#%d: installation %d at concurrency cap %d",
+                "Deferring review for %s#%d: installation %d at concurrency cap %d; "
+                "retrying in %ds",
                 repo_full_name,
                 pr_number,
                 installation_id,
                 config.caps.max_concurrent_per_installation,
+                _CONCURRENCY_DEFER_SECONDS,
             )
-            return
+            # Each deferral re-runs the whole job from the top, re-paying _gate_review's
+            # GitHub reads (get_pr / heimdall.yml / get_pr_files) before reaching here
+            # again — cheap relative to the lens fanout, and bounded by max_tries.
+            raise Retry(defer=_CONCURRENCY_DEFER_SECONDS)
         # The slot is now held; release it on EVERY exit path (success, skip,
         # failure, exception) so the counter cannot leak.
         try:
@@ -310,10 +337,12 @@ async def _review_and_post(
     """Run the retried pipeline and post exactly one review (or a failure note).
 
     The core of run_review, extracted so the per-installation concurrency
-    acquire/release can wrap it in a clean try/finally.  Mirrors the prior inline
-    body: on a None synthesis it posts a terse failure note and records the SHA;
-    on success it retires the prior review, splits inline/body, posts once, and
-    records both the posted-review and last-reviewed SHA.
+    acquire/release can wrap it in a clean try/finally.  On a None synthesis it
+    posts a terse failure note and records the SHA; on success it retires the prior
+    review, splits inline/body, posts once, and records both the posted-review and
+    last-reviewed SHA.  A failure in that post/persist phase is caught here (not
+    propagated to arq): it is converted to a terse failure note + recorded SHA, so a
+    transient GitHub outage can't trigger a full, expensive 3-lens + synthesis replay.
     """
     synthesis = await _run_pipeline_with_retry(
         ctx,
@@ -327,17 +356,69 @@ async def _review_and_post(
         # Every lens failed, synthesis aborted, or the retry timed out/failed.
         # Post a terse failure note and record the SHA so the failed commit is
         # not endlessly re-reviewed.
-        await _post_review_failed_note(
+        await _best_effort_failure_note_and_record_sha(
             github_client,
+            db,
             repo_full_name=repo_full_name,
             pr_number=pr_number,
             head_sha=head_sha,
         )
-        await set_last_reviewed_sha(
-            db, repo_full_name=repo_full_name, pr_number=pr_number, sha=head_sha
+        return
+
+    try:
+        await _post_synthesized_review(
+            github_client,
+            db,
+            synthesis=synthesis,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            head_sha=head_sha,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # The expensive pipeline already SUCCEEDED — a failure here is in the
+        # post/persist phase (GitHub round-trips, retire-prior, persist).  Left to
+        # propagate it reaches arq, which replays the ENTIRE 3-lens + synthesis
+        # pipeline (the SHA is recorded only after a successful post), up to
+        # max_tries times — burning expensive LLM passes on what is really a GitHub
+        # outage.  Instead: log, post a terse failure note, record the SHA, and
+        # return cleanly so the commit is not re-reviewed.  A duplicate terse note is
+        # tolerated over a full replay.  asyncio.CancelledError is a BaseException
+        # (not Exception), so job_timeout/cancellation is intentionally NOT caught
+        # and still propagates.
+        logger.warning(
+            "Post phase failed for %s#%d @ %s: %s; posting failure note instead",
+            repo_full_name,
+            pr_number,
+            head_sha,
+            type(exc).__name__,
+        )
+        await _best_effort_failure_note_and_record_sha(
+            github_client,
+            db,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            head_sha=head_sha,
         )
         return
 
+
+async def _post_synthesized_review(
+    github_client: GitHubClient,
+    db: Database,
+    *,
+    synthesis: SynthesisResult,
+    repo_full_name: str,
+    pr_number: int,
+    head_sha: str,
+) -> None:
+    """Retire the prior review, post the synthesized review, and persist the SHA.
+
+    The post/persist phase that runs once the pipeline has produced a real
+    synthesis.  Extracted so the caller can wrap it in a single try/except: a raise
+    anywhere here (a GitHub round-trip, the post, or the persist) is caught by the
+    caller and converted to a terse failure note rather than triggering a
+    full-pipeline replay through arq.
+    """
     # Across-push lifecycle: retire the prior Heimdall review (dismiss a
     # REQUEST_CHANGES, minimize a COMMENT) and delete its now-stale inline
     # comments before posting, so only the latest review stays active.
@@ -385,6 +466,47 @@ async def _review_and_post(
     )
     logger.info(
         "Review posted for %s#%d @ %s", repo_full_name, pr_number, head_sha
+    )
+
+
+async def _best_effort_failure_note_and_record_sha(
+    github_client: GitHubClient,
+    db: Database,
+    *,
+    repo_full_name: str,
+    pr_number: int,
+    head_sha: str,
+) -> None:
+    """Post the terse failure note (best-effort) and ALWAYS record the SHA.
+
+    Shared by both failure paths — a None synthesis and a post-phase failure — so
+    they don't duplicate the note+record-SHA pair.  The note post is best-effort: it
+    may itself fail (GitHub down/throttled), but the SHA is recorded regardless so
+    the failed commit is not endlessly re-reviewed.
+    """
+    try:
+        await _post_review_failed_note(
+            github_client,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            head_sha=head_sha,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # GitHub is likely down/throttled (the same fault that brought us here).  A
+        # missing failure note is acceptable; a full-pipeline replay because the SHA was
+        # never recorded is not — so swallow and still record the SHA below.  Log at
+        # ERROR: this is the rare path where the commit is marked reviewed with NO posted
+        # output at all (it recovers only on a later push), so it must not be silent.
+        logger.error(
+            "Review for %s#%d @ %s dropped with no posted output — GitHub unreachable "
+            "(failure note could not be posted either): %s",
+            repo_full_name,
+            pr_number,
+            head_sha,
+            type(exc).__name__,
+        )
+    await set_last_reviewed_sha(
+        db, repo_full_name=repo_full_name, pr_number=pr_number, sha=head_sha
     )
 
 
@@ -555,9 +677,16 @@ async def _build_inline_split(
     commentable = commentable_lines(diff)
     inline, body_findings = split_findings(synthesis.tagged_findings, commentable)
     body = render_body_for_offdiff(body_findings)
-    warning = render_dropped_lenses_warning(synthesis.dropped_lenses)
-    if warning:
-        body = f"{warning}\n\n{body}"
+    # Mirror the dropped-lenses banner: prepend any guardrail notes (and the
+    # suppressed-findings section) so the reader sees what this review did NOT cover —
+    # and which findings Heimdall judged settled — before the findings themselves.
+    for note in (
+        render_dropped_lenses_warning(synthesis.dropped_lenses),
+        render_comments_truncated_note(synthesis.comments_truncated),
+        render_suppressed_findings_section(synthesis.suppressed_findings),
+    ):
+        if note:
+            body = f"{note}\n\n{body}"
     return body, build_inline_comments(inline)
 
 
@@ -678,7 +807,7 @@ async def _synthesize_review(
     """
     workspace = tempfile.mkdtemp(prefix="heimdall-lens-")
     try:
-        await assemble_pr_context(
+        pr_context = await assemble_pr_context(
             app_id=ctx["app_id"],
             private_key=ctx["private_key"],
             installation_id=installation_id,
@@ -686,6 +815,11 @@ async def _synthesize_review(
             pr_number=pr_number,
             workspace_dir=workspace,
             docs=config.docs,
+            # Per-repo comment-incorporation control (#68): the toggle gates whether
+            # any comment plumbing runs; the cap feeds the prioritize/truncate path.
+            # Both come from the trust-resolved config, so a fork can't flip them.
+            incorporate_comments=config.comments.enabled,
+            max_comments=config.comments.max_comments,
         )
 
         lens_results, dropped_lenses = await _run_lenses(
@@ -703,6 +837,11 @@ async def _synthesize_review(
 
         synthesis = await run_synthesis(
             lens_results=lens_results,
+            comments=pr_context.comments,
+            review_threads=pr_context.review_threads,
+            review_summaries=pr_context.review_summaries,
+            own_prior_review=pr_context.own_prior_review,
+            comments_truncated=pr_context.comments_truncated,
             claude_binary=ctx.get("claude_binary", "claude"),
             token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
             timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
@@ -919,6 +1058,15 @@ class WorkerSettings:
     """
 
     functions = [run_review]
+    # Max attempts arq makes per job before giving up.  Raised from arq's default of 5
+    # because a concurrency-cap miss now re-queues via Retry(defer=_CONCURRENCY_DEFER_SECONDS)
+    # and each deferral spends one try; 15 gives ~14 min of patience — total patience is
+    # (max_tries - 1) * _CONCURRENCY_DEFER_SECONDS — for a slot to free before the job is
+    # dropped.  Safe to raise this high: BOTH genuine pipeline failures AND post-phase
+    # failures are caught and posted as a "review failed" note inside _review_and_post
+    # (which records the SHA and returns cleanly), so neither consumes retries — only cap
+    # deferrals and cheap pre-pipeline infra errors (before the expensive fanout) do.
+    max_tries: int = 15
     # Overridden from the configured REDIS_URL in main() at process start (arq reads
     # this attribute before on_startup runs); the localhost default keeps it a valid
     # RedisSettings instance for the ``arq heimdall.worker.WorkerSettings`` launch path.

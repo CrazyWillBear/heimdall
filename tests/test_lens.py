@@ -13,20 +13,26 @@ from typing import Any
 import pytest
 
 from heimdall.lens import (
+    CLEANLINESS_LENS,
+    DESIGN_LENS,
     SECURITY_LENS,
     ClaudeResult,
     Finding,
     LensOutputError,
     LensResult,
+    LensSpec,
     LensTimeoutError,
     LensTokenCapError,
     Severity,
+    SuppressedFinding,
     SynthesisResult,
     _build_subprocess_env,
     build_claude_argv,
     format_review_body,
     parse_findings,
+    render_comments_truncated_note,
     render_dropped_lenses_warning,
+    render_suppressed_findings_section,
     run_lens,
     run_synthesis,
     verdict_for,
@@ -269,6 +275,108 @@ def test_argv_scopes_session_to_workspace() -> None:
     )
     assert "--add-dir" in argv
     assert _WORKSPACE in argv
+
+
+# ---------------------------------------------------------------------------
+# Lenses see the full PR discussion as untrusted context via the heimdall-context
+# wrapper: comments, review-threads, review-summaries, and own-prior. The payload
+# is NOT embedded in the prompt (unlike synthesis); each lens reads each subcommand
+# through the same allowlisted `heimdall-context <sub>` call in-sandbox.
+# ---------------------------------------------------------------------------
+
+_ALL_LENSES = (SECURITY_LENS, DESIGN_LENS, CLEANLINESS_LENS)
+
+
+@pytest.mark.parametrize("lens", _ALL_LENSES, ids=lambda lens: lens.name)
+def test_lens_default_prompt_directs_reading_full_discussion_as_untrusted(
+    lens: LensSpec,
+) -> None:
+    """The default lens prompt directs all four discussion reads as untrusted context."""
+    argv = build_claude_argv(
+        claude_binary="claude",
+        workspace_dir=_WORKSPACE,
+        lens=lens,
+    )
+    prompt = argv[argv.index("-p") + 1]
+    # The lens is pointed at the full PR discussion via the four wrapper subcommands...
+    assert "heimdall-context comments /workspace" in prompt
+    assert "heimdall-context review-threads /workspace" in prompt
+    assert "heimdall-context review-summaries /workspace" in prompt
+    assert "heimdall-context own-prior /workspace" in prompt
+    # ...and they are framed as untrusted background context, not instructions.
+    assert "UNTRUSTED" in prompt
+    assert "never" in prompt and "instructions" in prompt
+
+
+@pytest.mark.parametrize("lens", _ALL_LENSES, ids=lambda lens: lens.name)
+def test_lens_default_prompt_references_all_four_discussion_subcommands(
+    lens: LensSpec,
+) -> None:
+    """The default prompt names every discussion subcommand against /workspace.
+
+    Each of the four reads (comments, review-threads, review-summaries, own-prior)
+    must be directed explicitly so the lens consults the full PR discussion, all
+    framed as untrusted background context rather than instructions.
+    """
+    argv = build_claude_argv(
+        claude_binary="claude",
+        workspace_dir=_WORKSPACE,
+        lens=lens,
+    )
+    prompt = argv[argv.index("-p") + 1]
+    for sub in ("comments", "review-threads", "review-summaries", "own-prior"):
+        assert f"heimdall-context {sub} /workspace" in prompt
+    # Untrusted-frame tokens are present so directives in any read stay data.
+    assert "UNTRUSTED" in prompt
+    assert "never" in prompt and "instructions" in prompt
+
+
+@pytest.mark.parametrize("lens", _ALL_LENSES, ids=lambda lens: lens.name)
+def test_lens_system_prompt_lists_comments_subcommand_as_untrusted(
+    lens: LensSpec,
+) -> None:
+    """Every lens system prompt exposes the comments subcommand, flagged untrusted.
+
+    Comments must be framed consistently with the existing diff/file/docs context,
+    so the wrapper subcommand list includes `comments` and the prompt marks it
+    UNTRUSTED third-party data.
+    """
+    system_prompt = lens.system_prompt
+    assert "diff|pr|file|docs|comments" in system_prompt
+    assert "UNTRUSTED" in system_prompt
+
+
+def test_lens_comments_payload_not_embedded_in_argv() -> None:
+    """Lenses read comments via the wrapper, so no payload is baked into the argv.
+
+    Unlike synthesis (which is tool-less and must embed the payload), a lens has the
+    allowlisted wrapper and reads `heimdall-context comments` in-sandbox; baking the
+    payload into the prompt would defeat the central mechanism and is not done.
+    """
+    argv = build_claude_argv(
+        claude_binary="claude",
+        workspace_dir=_WORKSPACE,
+        lens=SECURITY_LENS,
+    )
+    prompt = argv[argv.index("-p") + 1]
+    # The prompt points AT the wrapper but carries no serialized comments JSON.
+    assert '"comments":' not in prompt
+
+
+def test_lens_comments_visibility_grants_no_new_tool() -> None:
+    """Surfacing comments to the lenses leaves the tool allowlist unchanged.
+
+    The sandbox posture is fixed: read-only Read/Grep/Glob plus the single
+    `heimdall-context` Bash wrapper — comments ride that existing wrapper, so no
+    new tool appears on the allow list.
+    """
+    argv = build_claude_argv(
+        claude_binary="claude",
+        workspace_dir=_WORKSPACE,
+        lens=SECURITY_LENS,
+    )
+    allowed = argv[argv.index("--allowedTools") + 1]
+    assert allowed == "Read Grep Glob Bash(heimdall-context *)"
 
 
 # ---------------------------------------------------------------------------
@@ -581,3 +689,41 @@ def test_render_dropped_lenses_warning_names_multiple_lenses() -> None:
     assert "design" in banner
     assert "2 review lenses" in banner
     assert "were skipped" in banner
+
+
+def test_render_comments_truncated_note_empty_when_not_truncated() -> None:
+    assert render_comments_truncated_note(False) == ""
+
+
+def test_render_comments_truncated_note_present_when_truncated() -> None:
+    note = render_comments_truncated_note(True)
+    assert note != ""
+    assert "omitted" in note
+
+
+# ---------------------------------------------------------------------------
+# Suppressed-findings section (synthesis-judgment surfacing, #66)
+# ---------------------------------------------------------------------------
+
+
+def test_render_suppressed_findings_section_empty_when_none() -> None:
+    assert render_suppressed_findings_section(()) == ""
+
+
+def test_render_suppressed_findings_section_lists_title_and_reason() -> None:
+    section = render_suppressed_findings_section(
+        (
+            SuppressedFinding(title="SQL injection", reason="resolved thread"),
+            SuppressedFinding(
+                title="XSS", reason="maintainer marked intentional"
+            ),
+        )
+    )
+    assert section != ""
+    # Each suppressed finding's title and reason is surfaced.
+    assert "SQL injection" in section
+    assert "resolved thread" in section
+    assert "XSS" in section
+    assert "maintainer marked intentional" in section
+    # Clearly labeled so a maintainer sees Heimdall made a judgment.
+    assert "suppressed" in section.lower()

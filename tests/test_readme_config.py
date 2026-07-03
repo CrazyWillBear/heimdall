@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from heimdall.config import Settings
 from heimdall.repo_config import (
+    CommentIncorporation,
     CustomLensConfig,
     GuardrailCaps,
     LensConfig,
@@ -42,6 +43,7 @@ _CONFIG_MODELS = (
     CustomLensConfig,
     ScopeFilters,
     GuardrailCaps,
+    CommentIncorporation,
 )
 
 
