@@ -216,6 +216,29 @@ async def test_fork_pr_loads_config_from_base_ref() -> None:
 
 
 # ---------------------------------------------------------------------------
+# on_signal trigger — scope.trigger knob (default auto)
+# ---------------------------------------------------------------------------
+
+
+def test_trigger_defaults_to_auto() -> None:
+    """The default trigger is auto — today's review-every-in-scope-PR behavior."""
+    assert RepoConfig().scope.trigger == "auto"
+    assert parse_repo_config("").scope.trigger == "auto"
+
+
+def test_trigger_accepts_on_signal() -> None:
+    """scope.trigger may be set to on_signal."""
+    config = parse_repo_config("scope:\n  trigger: on_signal\n")
+    assert config.scope.trigger == "on_signal"
+
+
+def test_trigger_rejects_unknown_value() -> None:
+    """A trigger outside {auto, on_signal} is rejected with RepoConfigError."""
+    with pytest.raises(RepoConfigError):
+        parse_repo_config("scope:\n  trigger: on_push\n")
+
+
+# ---------------------------------------------------------------------------
 # Acceptance #3 — disable a lens, change threshold, base/path filters
 # ---------------------------------------------------------------------------
 

@@ -16,7 +16,11 @@ and the per-job installation_id argument.  Before any review work it gates the P
 (see heimdall.repo_config): it loads ``.github/heimdall.yml`` from the trust-resolved
 ref (base for forks, head for trusted same-repo PRs) — a missing file means the repo
 has not opted in, so nothing is reviewed — then applies scope filters (base-branch
-allowlist, path globs, skip drafts/bot authors, opt-out label) and the guardrail caps:
+allowlist, path globs, skip drafts/bot authors, opt-out label).  Under
+``scope.trigger: on_signal`` a non-signal event (opened/reopened/synchronize) is skipped
+until the PR is activated by a ``ready_for_review``/``review_requested`` signal (sticky,
+DB-persisted); ``trigger: auto`` (the default) reviews every in-scope event as before.
+It then applies the guardrail caps:
 a PR over the diff-size/file-count cap is skipped WITH a posted note, a repo over its
 per-window review budget is skipped silently, and a review that would exceed the
 per-installation concurrency cap re-queues itself via ``arq.Retry`` (bounded by
@@ -83,10 +87,12 @@ from heimdall.db import (
     count_recent_reviews,
     get_last_reviewed_sha,
     get_posted_review,
+    is_pr_activated,
     prune_review_events,
     release_inflight,
     set_last_reviewed_sha,
     set_posted_review,
+    set_pr_activated,
     try_acquire_inflight,
     try_record_review_event,
 )
@@ -133,6 +139,11 @@ DEFAULT_REVIEW_TIMEOUT_SECONDS = 2_400.0
 # One initial attempt + exactly one retry of the whole review pipeline.
 _MAX_REVIEW_ATTEMPTS = 2
 
+# Webhook actions that count as an explicit review signal under scope.trigger: on_signal.
+# Any review_requested counts (even one not naming Heimdall) because a GitHub App bot
+# cannot be picked as a PR reviewer — the request is the human's intent to be reviewed.
+_SIGNAL_ACTIONS = frozenset({"ready_for_review", "review_requested"})
+
 # Headroom added on top of the worst-case pipeline budget when sizing arq's job_timeout
 # (assembly, posting, retiring the prior review, GitHub round-trips outside the
 # per-review wall-clock).
@@ -175,6 +186,7 @@ async def run_review(
     repo_full_name: str,
     pr_number: int,
     head_sha: str,
+    action: str = "synchronize",
 ) -> None:
     """Arq task: fan out three lenses, synthesize, and post one review.
 
@@ -203,6 +215,10 @@ async def run_review(
         repo_full_name: e.g. "owner/repo".
         pr_number: The pull-request number.
         head_sha: The commit SHA to review.
+        action: The ``pull_request`` webhook action that produced this job, driving the
+            ``scope.trigger: on_signal`` gate.  Jobs enqueued before this deploy carry
+            no ``action`` kwarg; defaulting to ``synchronize`` is conservative — under
+            on_signal such a job reviews only if the PR is already activated.
     """
     db = ctx["db"]
     github_client = GitHubClient(
@@ -230,6 +246,30 @@ async def run_review(
             # Opt-in absent, scope filters excluded the PR, or the diff-size cap
             # fired (which already posted its own note) — skip cleanly, recording
             # no SHA (a later in-scope push still gets reviewed).
+            return
+
+        if action in _SIGNAL_ACTIONS:
+            # Record activation in BOTH trigger modes (cheap, sticky): a repo that later
+            # flips auto -> on_signal keeps reviewing PRs that were already signaled.
+            await set_pr_activated(db, repo_full_name=repo_full_name, pr_number=pr_number)
+        # Short-circuit order matters: is_pr_activated is consulted ONLY under on_signal
+        # for a non-signal action, so auto mode never touches the activation table.
+        if (
+            config.scope.trigger == "on_signal"
+            and action not in _SIGNAL_ACTIONS
+            and not await is_pr_activated(
+                db, repo_full_name=repo_full_name, pr_number=pr_number
+            )
+        ):
+            logger.info(
+                "Skipping review for %s#%d: trigger=on_signal and no signal yet "
+                "(action=%s)",
+                repo_full_name,
+                pr_number,
+                action,
+            )
+            # No SHA recorded — like the scope skips, so a post-activation delivery
+            # for this same sha still reviews.
             return
 
         # Per-repo budget/rate guardrail: too many reviews in the rolling window

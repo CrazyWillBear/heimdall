@@ -140,7 +140,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--action",
         default="opened",
-        help="pull_request action (opened/reopened/synchronize/ready_for_review)",
+        help=(
+            "pull_request action "
+            "(opened/reopened/synchronize/ready_for_review/review_requested)"
+        ),
     )
     parser.add_argument("--draft", action="store_true", help="Mark the PR as a draft")
     parser.add_argument(

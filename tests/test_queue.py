@@ -16,6 +16,7 @@ def job() -> ReviewJob:
         repo_full_name="owner/repo",
         pr_number=7,
         head_sha="deadbeef",
+        action="synchronize",
     )
 
 
@@ -36,6 +37,34 @@ async def test_enqueue_review_calls_arq(job: ReviewJob) -> None:
     assert call_args[1]["repo_full_name"] == job.repo_full_name
     assert call_args[1]["pr_number"] == job.pr_number
     assert call_args[1]["head_sha"] == job.head_sha
+    # The action is threaded through as a kwarg and baked into the job id.
+    assert call_args[1]["action"] == job.action
+    assert call_args[1]["_job_id"] == (
+        f"review:{job.repo_full_name}:{job.pr_number}:{job.head_sha}:{job.action}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_action_distinguishes_job_id(job: ReviewJob) -> None:
+    """Two jobs identical but for their action produce distinct arq job ids.
+
+    Without this a skipped pre-activation ``synchronize`` would dedup-block a later
+    ``review_requested`` for the same sha (arq keeps a finished job's result under its
+    id and refuses re-enqueue).
+    """
+    from dataclasses import replace
+
+    mock_pool = AsyncMock()
+    mock_pool.enqueue_job = AsyncMock(return_value=MagicMock(job_id="jid-1"))
+    mock_pool.zrem = AsyncMock()
+
+    job_signal = replace(job, action="review_requested")
+    with patch("heimdall.queue.find_pending_jobs", new=AsyncMock(return_value=[])):
+        await enqueue_review(mock_pool, job)
+        await enqueue_review(mock_pool, job_signal)
+
+    job_ids = [call.kwargs["_job_id"] for call in mock_pool.enqueue_job.await_args_list]
+    assert job_ids[0] != job_ids[1]
 
 
 @pytest.mark.asyncio
