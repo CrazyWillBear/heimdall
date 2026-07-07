@@ -118,6 +118,7 @@ from heimdall.lens import (
     run_synthesis,
     sandbox_exec_probe,
 )
+from heimdall.queue import _SIGNAL_ACTIONS
 from heimdall.repo_config import (
     GuardrailCaps,
     RepoConfig,
@@ -139,11 +140,9 @@ DEFAULT_REVIEW_TIMEOUT_SECONDS = 2_400.0
 # One initial attempt + exactly one retry of the whole review pipeline.
 _MAX_REVIEW_ATTEMPTS = 2
 
-# Webhook actions that count as an explicit review signal under scope.trigger: on_signal.
-# Any review_requested counts (even one not naming Heimdall) because a GitHub App bot
-# cannot be picked as a PR reviewer — the request is the human's intent to be reviewed.
-# Mirrored in queue.py's _SIGNAL_ACTIONS (kept in sync; not shared to avoid an import cycle).
-_SIGNAL_ACTIONS = frozenset({"ready_for_review", "review_requested"})
+# The set of signal actions that gate scope.trigger: on_signal is defined once in
+# heimdall.queue (imported above): enqueue_review uses it to fold a pending signal
+# forward onto a superseding push, and this worker uses it to gate the on_signal review.
 
 # Headroom added on top of the worst-case pipeline budget when sizing arq's job_timeout
 # (assembly, posting, retiring the prior review, GitHub round-trips outside the

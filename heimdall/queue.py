@@ -12,11 +12,11 @@ from arq import ArqRedis
 from arq.constants import default_queue_name
 from arq.jobs import Job
 
-# Actions that mark a job as an explicit review signal. A queued signal job must
-# survive a later push's cancel_stale_jobs, or the signal is silently lost and the
-# PR never gets activated. Kept in sync with worker.py's _SIGNAL_ACTIONS (same concept);
-# duplicated rather than imported to avoid a queue->worker import cycle (queue is
-# imported by both webhook.py and worker.py).
+# Webhook actions that count as an explicit review signal under scope.trigger: on_signal.
+# Any review_requested counts (even one not naming Heimdall) because a GitHub App bot
+# cannot be picked as a PR reviewer — the request is the human's intent to be reviewed.
+# Single source of truth: worker.py imports this for its on_signal gate, and enqueue_review
+# uses it to fold a pending signal's intent forward onto a superseding push (promotion).
 _SIGNAL_ACTIONS = frozenset({"ready_for_review", "review_requested"})
 
 
@@ -48,11 +48,11 @@ async def find_pending_jobs(
 ) -> list[Job]:
     """Return Job handles for any queued (not-yet-running) jobs for this PR.
 
-    Scans the Arq queue and matches by the kwargs embedded at enqueue time. Signal-action
-    jobs (see ``_SIGNAL_ACTIONS``) are excluded: they carry the user's explicit intent to
-    review and must survive to run and activate the PR, so they are never reported as stale.
-    A missing/None ``action`` (legacy jobs enqueued before the kwarg existed) counts as
-    non-signal and stays cancellable — legacy jobs are synchronize-like.
+    Scans the Arq queue and matches by the repo+PR kwargs embedded at enqueue time —
+    every queued job for the PR, signal or not, so ``cancel_stale_jobs`` can supersede
+    them all and leave exactly one to run.  A queued signal's intent is not lost to this:
+    ``enqueue_review`` folds it forward onto the superseding push (promotion) BEFORE
+    cancelling, so the single surviving job still activates the PR.
     """
     queued = await pool.queued_jobs()
     jobs: list[Job] = []
@@ -61,11 +61,36 @@ async def find_pending_jobs(
         if (
             kw.get("repo_full_name") == repo_full_name
             and kw.get("pr_number") == pr_number
-            and kw.get("action") not in _SIGNAL_ACTIONS
             and job_def.job_id is not None
         ):
             jobs.append(Job(job_def.job_id, pool))
     return jobs
+
+
+async def _pending_signal_action(
+    pool: ArqRedis,
+    *,
+    repo_full_name: str,
+    pr_number: int,
+) -> str | None:
+    """Return the action of a queued signal job for this PR, if one is pending.
+
+    Scans the Arq queue for a not-yet-running job matching this repo+PR whose ``action``
+    is a review signal (see ``_SIGNAL_ACTIONS``).  ``enqueue_review`` uses this to fold a
+    pending signal's intent forward onto a superseding non-signal push, so the single
+    surviving job still activates the PR when it runs.  Returns the first signal action
+    found, or None when no signal job is queued.
+    """
+    queued = await pool.queued_jobs()
+    for job_def in queued:
+        kw = job_def.kwargs
+        if (
+            kw.get("repo_full_name") == repo_full_name
+            and kw.get("pr_number") == pr_number
+            and kw.get("action") in _SIGNAL_ACTIONS
+        ):
+            return str(kw["action"])
+    return None
 
 
 async def cancel_stale_jobs(
@@ -85,10 +110,19 @@ async def cancel_stale_jobs(
 
 
 async def enqueue_review(pool: ArqRedis, job: ReviewJob) -> str:
-    """Cancel any stale jobs then enqueue a new review job.
+    """Fold any pending signal forward, cancel stale jobs, then enqueue the job.
 
     Passes the ReviewJob fields as keyword arguments so the worker can receive
     them and Arq's queue-scanning can match on them.
+
+    Promotion (fold-the-intent-forward): if a signal job (``ready_for_review`` /
+    ``review_requested``) is still queued for this PR and the incoming ``job`` is a plain
+    non-signal push (e.g. ``synchronize``), the incoming job is enqueued as if its action
+    were that pending signal.  Every stale queued job for the PR is then cancelled, so
+    exactly ONE job survives — and it carries the signal intent, so it both activates the
+    PR and reviews the newest sha (avoiding the double-review + stale-anchor hazard of
+    letting an older signal job and a superseding push both run).  An incoming signal job
+    is never demoted; a plain push with no pending signal is unaffected.
 
     Args:
         pool: The connected Arq Redis pool.
@@ -97,6 +131,13 @@ async def enqueue_review(pool: ArqRedis, job: ReviewJob) -> str:
     Returns:
         The Arq job ID of the newly enqueued job (empty string if deduplicated).
     """
+    action = job.action
+    if action not in _SIGNAL_ACTIONS:
+        pending_signal = await _pending_signal_action(
+            pool, repo_full_name=job.repo_full_name, pr_number=job.pr_number
+        )
+        if pending_signal is not None:
+            action = pending_signal
     await cancel_stale_jobs(
         pool, repo_full_name=job.repo_full_name, pr_number=job.pr_number
     )
@@ -106,12 +147,12 @@ async def enqueue_review(pool: ArqRedis, job: ReviewJob) -> str:
     # same sha, and that signal would never reach the worker.
     arq_job = await pool.enqueue_job(
         "run_review",
-        _job_id=f"review:{job.repo_full_name}:{job.pr_number}:{job.head_sha}:{job.action}",
+        _job_id=f"review:{job.repo_full_name}:{job.pr_number}:{job.head_sha}:{action}",
         installation_id=job.installation_id,
         repo_full_name=job.repo_full_name,
         pr_number=job.pr_number,
         head_sha=job.head_sha,
-        action=job.action,
+        action=action,
     )
     # arq_job is None when the job_id already exists (idempotent re-submission)
     return arq_job.job_id if arq_job is not None else ""

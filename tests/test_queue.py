@@ -46,6 +46,7 @@ async def test_enqueue_review_calls_arq(job: ReviewJob) -> None:
     mock_pool = AsyncMock()
     mock_pool.enqueue_job = AsyncMock(return_value=MagicMock(job_id="jid-1"))
     mock_pool.zrem = AsyncMock()
+    mock_pool.queued_jobs = AsyncMock(return_value=[])
 
     with patch("heimdall.queue.find_pending_jobs", new=AsyncMock(return_value=[])):
         await enqueue_review(mock_pool, job)
@@ -77,6 +78,7 @@ async def test_action_distinguishes_job_id(job: ReviewJob) -> None:
     mock_pool = AsyncMock()
     mock_pool.enqueue_job = AsyncMock(return_value=MagicMock(job_id="jid-1"))
     mock_pool.zrem = AsyncMock()
+    mock_pool.queued_jobs = AsyncMock(return_value=[])
 
     job_signal = replace(job, action="review_requested")
     with patch("heimdall.queue.find_pending_jobs", new=AsyncMock(return_value=[])):
@@ -105,12 +107,13 @@ async def test_cancel_stale_jobs_removes_from_queue(job: ReviewJob) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("signal_action", ["ready_for_review", "review_requested"])
-async def test_signal_job_not_returned_as_stale(signal_action: str) -> None:
-    """A queued signal-action job is never treated as stale for cancellation.
+async def test_signal_job_is_returned_as_stale(signal_action: str) -> None:
+    """find_pending_jobs matches by repo+PR alone — a queued signal job is now cancellable.
 
-    Regression: a push's ``synchronize`` enqueue must not cancel an explicit,
-    still-queued signal job — otherwise the signal is silently lost and the PR is
-    never activated.
+    Sparing is gone: enqueue_review folds a pending signal's intent forward onto the
+    superseding push (promotion) BEFORE cancelling, so cancel_stale_jobs itself is
+    action-agnostic and supersedes every queued job for the PR, signal or not, leaving
+    exactly one to run.
     """
     mock_pool = AsyncMock()
     mock_pool.queued_jobs = AsyncMock(
@@ -119,22 +122,78 @@ async def test_signal_job_not_returned_as_stale(signal_action: str) -> None:
 
     found = await find_pending_jobs(mock_pool, repo_full_name="owner/repo", pr_number=7)
 
-    assert found == []
+    assert [job.job_id for job in found] == ["signal-jid"]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("signal_action", ["ready_for_review", "review_requested"])
-async def test_cancel_stale_jobs_spares_signal_job(signal_action: str) -> None:
-    """cancel_stale_jobs (as invoked by a later synchronize enqueue) spares a signal job."""
+async def test_pending_signal_promotes_incoming_sync(
+    job: ReviewJob, signal_action: str
+) -> None:
+    """A queued signal job promotes a superseding synchronize enqueue to the signal action.
+
+    Fold-forward: signal(A) queued, then push->sync(B) arrives ⇒ B is enqueued carrying
+    the signal action (so the single surviving job still activates the PR and reviews the
+    newest sha), and the stale signal job A is cancelled.
+    """
     mock_pool = AsyncMock()
+    mock_pool.enqueue_job = AsyncMock(return_value=MagicMock(job_id="jid-1"))
     mock_pool.zrem = AsyncMock()
     mock_pool.queued_jobs = AsyncMock(
         return_value=[_queued_job("signal-jid", action=signal_action)]
     )
 
-    await cancel_stale_jobs(mock_pool, repo_full_name="owner/repo", pr_number=7)
+    await enqueue_review(mock_pool, job)  # job.action == "synchronize"
 
-    mock_pool.zrem.assert_not_awaited()
+    call = mock_pool.enqueue_job.call_args
+    assert call.kwargs["action"] == signal_action
+    assert call.kwargs["_job_id"].endswith(f":{signal_action}")
+    # The stale signal job is superseded (cancelled) — exactly one job survives.
+    mock_pool.zrem.assert_awaited_once()
+    assert "signal-jid" in mock_pool.zrem.call_args[0]
+
+
+@pytest.mark.asyncio
+async def test_plain_sync_not_promoted_without_signal(job: ReviewJob) -> None:
+    """A synchronize enqueue with no queued signal keeps its action (no false promotion)."""
+    mock_pool = AsyncMock()
+    mock_pool.enqueue_job = AsyncMock(return_value=MagicMock(job_id="jid-1"))
+    mock_pool.zrem = AsyncMock()
+    mock_pool.queued_jobs = AsyncMock(
+        return_value=[_queued_job("sync-jid", action="synchronize")]
+    )
+
+    await enqueue_review(mock_pool, job)  # job.action == "synchronize"
+
+    call = mock_pool.enqueue_job.call_args
+    assert call.kwargs["action"] == "synchronize"
+    assert call.kwargs["_job_id"].endswith(":synchronize")
+    # The stale synchronize job is still superseded-by-push.
+    mock_pool.zrem.assert_awaited_once()
+    assert "sync-jid" in mock_pool.zrem.call_args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal_action", ["ready_for_review", "review_requested"])
+async def test_incoming_signal_not_demoted(job: ReviewJob, signal_action: str) -> None:
+    """An incoming signal job stays the signal even when a stale sync is queued."""
+    from dataclasses import replace
+
+    signal_job = replace(job, action=signal_action)
+    mock_pool = AsyncMock()
+    mock_pool.enqueue_job = AsyncMock(return_value=MagicMock(job_id="jid-1"))
+    mock_pool.zrem = AsyncMock()
+    mock_pool.queued_jobs = AsyncMock(
+        return_value=[_queued_job("sync-jid", action="synchronize")]
+    )
+
+    await enqueue_review(mock_pool, signal_job)
+
+    call = mock_pool.enqueue_job.call_args
+    assert call.kwargs["action"] == signal_action
+    # The stale sync is cancelled as usual.
+    mock_pool.zrem.assert_awaited_once()
+    assert "sync-jid" in mock_pool.zrem.call_args[0]
 
 
 @pytest.mark.asyncio
