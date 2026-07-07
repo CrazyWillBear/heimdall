@@ -89,6 +89,17 @@ CREATE TABLE IF NOT EXISTS inflight_reviews (
     installation_id INTEGER NOT NULL PRIMARY KEY,
     in_flight       INTEGER NOT NULL DEFAULT 0
 );
+
+-- on_signal trigger: PRs a repo has explicitly signaled for review.  Activation is
+-- sticky (a removed review request never deactivates it) and drives the
+-- scope.trigger: on_signal gate so every later push re-reviews an activated PR.  A
+-- plain additive CREATE TABLE IF NOT EXISTS — no migration needed.
+CREATE TABLE IF NOT EXISTS activated_prs (
+    repo_full_name TEXT NOT NULL,
+    pr_number      INTEGER NOT NULL,
+    activated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (repo_full_name, pr_number)
+);
 """
 
 
@@ -163,6 +174,44 @@ async def get_last_reviewed_sha(
     ) as cursor:
         row = await cursor.fetchone()
         return str(row["sha"]) if row is not None else None
+
+
+async def set_pr_activated(
+    db: Database,
+    *,
+    repo_full_name: str,
+    pr_number: int,
+) -> None:
+    """Mark a PR as activated for review under the on_signal trigger.
+
+    Idempotent and sticky: a repeat call is a no-op (the ``activated_at`` timestamp is
+    NOT refreshed) and activation is never cleared here, so a later removed review
+    request cannot deactivate the PR.  Every subsequent push then re-reviews it.
+    """
+    await db.conn.execute(
+        """
+        INSERT INTO activated_prs (repo_full_name, pr_number)
+        VALUES (?, ?)
+        ON CONFLICT(repo_full_name, pr_number) DO NOTHING
+        """,
+        (repo_full_name, pr_number),
+    )
+    await db.conn.commit()
+
+
+async def is_pr_activated(
+    db: Database,
+    *,
+    repo_full_name: str,
+    pr_number: int,
+) -> bool:
+    """Return True when the PR has been activated for review, else False."""
+    async with db.conn.execute(
+        "SELECT 1 FROM activated_prs WHERE repo_full_name = ? AND pr_number = ?",
+        (repo_full_name, pr_number),
+    ) as cursor:
+        row = await cursor.fetchone()
+        return row is not None
 
 
 async def set_posted_review(

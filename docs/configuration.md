@@ -45,6 +45,9 @@ scope:                            # filters that skip the PR entirely
   skip_drafts: true               # skip draft PRs. Default: true
   skip_bot_authors: true          # skip PRs authored by a bot account. Default: true
   opt_out_label: null             # skip a PR carrying this label. Default: null (unset)
+  trigger: auto                   # auto = review every in-scope PR event; on_signal =
+                                  # review only after a ready_for_review/review_requested
+                                  # signal activates the PR. Default: auto
 
 caps:                             # guardrail caps; every field has a SAFE, non-unbounded default
   max_files: 75                   # skip (with a posted note) a PR over this many files. Default: 75
@@ -113,6 +116,7 @@ the PR (silently).
 | `skip_drafts`      | bool          | `true`  | Skip draft PRs.                                                |
 | `skip_bot_authors` | bool          | `true`  | Skip PRs authored by a bot account.                           |
 | `opt_out_label`    | string        | unset   | When set and present on the PR, skip the PR.                  |
+| `trigger`          | `auto`/`on_signal` | `auto` | `auto` reviews every in-scope PR event. `on_signal` reviews only after a `ready_for_review`/`review_requested` signal activates the PR; activation is per-PR, persisted, and sticky (a removed review request never deactivates it). Until signaled, a non-draft `opened` PR sits unreviewed; once activated, every push re-reviews. |
 
 **Guardrail caps (`caps`, `GuardrailCaps`)** — every cap has a safe default, so an absent `caps`
 block still has ceilings (a missing cap never means "unlimited"). All counters are SQLite-backed

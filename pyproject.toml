@@ -1,6 +1,6 @@
 [project]
 name = "heimdall"
-version = "0.3.0"
+version = "0.4.0"
 description = "GitHub App that auto-reviews pull requests with a 3-lens Claude engine."
 readme = "README.md"
 requires-python = ">=3.12"

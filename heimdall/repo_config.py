@@ -24,7 +24,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, model_validator
@@ -128,6 +128,11 @@ class ScopeFilters(BaseModel):
         skip_drafts: Skip draft PRs when True.
         skip_bot_authors: Skip PRs authored by a bot account when True.
         opt_out_label: When set and present on the PR, the PR is skipped.
+        trigger: When ``auto`` (the default) every in-scope PR event is reviewed —
+            today's behavior.  When ``on_signal`` a PR is reviewed only after it has
+            been activated by a ``ready_for_review``/``review_requested`` signal; the
+            gate lives in the worker (deliberately NOT in :func:`skip_reason`, which
+            stays a pure scope filter).
     """
 
     model_config = {"extra": "forbid"}
@@ -137,6 +142,7 @@ class ScopeFilters(BaseModel):
     skip_drafts: bool = True
     skip_bot_authors: bool = True
     opt_out_label: str | None = None
+    trigger: Literal["auto", "on_signal"] = "auto"
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,8 @@ A FastAPI app receives GitHub `pull_request` webhooks. For every request it:
 1. **Verifies the HMAC-SHA256 signature** (`X-Hub-Signature-256`) against the configured
    webhook secret — an unsigned or mismatched request gets a 401.
 2. Acts only on the relevant actions — `opened`, `reopened`, `synchronize`,
-   `ready_for_review` — and ignores everything else (and skips draft PRs) with a 204.
+   `ready_for_review`, `review_requested` — and ignores everything else (and skips draft
+   PRs) with a 204.
 3. **Enqueues** a `ReviewJob` onto the Redis/Arq queue and **acks 202 immediately**, so the
    review runs asynchronously in the worker. On a new push to a PR, any earlier *queued*
    (not-yet-running) job for the same PR is cancelled first (`cancel_stale_jobs`), so only

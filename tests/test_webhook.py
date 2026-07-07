@@ -189,7 +189,8 @@ def test_draft_pr_ignored(app_client: tuple[TestClient, MagicMock]) -> None:
 
 
 def test_irrelevant_action_ignored(app_client: tuple[TestClient, MagicMock]) -> None:
-    """PR actions other than opened/reopened/synchronize/ready_for_review are ignored."""
+    """PR actions other than opened/reopened/synchronize/ready_for_review/review_requested
+    are ignored."""
     client, mock_enqueue = app_client
     payload = json.dumps(_pr_payload(action="closed")).encode()
     headers = {
@@ -200,6 +201,61 @@ def test_irrelevant_action_ignored(app_client: tuple[TestClient, MagicMock]) -> 
     response = client.post("/webhook", content=payload, headers=headers)
     assert response.status_code == 204
     mock_enqueue.assert_not_called()
+
+
+def test_review_requested_enqueues(app_client: tuple[TestClient, MagicMock]) -> None:
+    """A review_requested event enqueues a review job carrying that action."""
+    client, mock_enqueue = app_client
+    payload = json.dumps(_pr_payload(action="review_requested")).encode()
+    headers = {
+        "X-GitHub-Event": "pull_request",
+        "X-Hub-Signature-256": _sign(payload, _SECRET),
+        "Content-Type": "application/json",
+    }
+    response = client.post("/webhook", content=payload, headers=headers)
+    assert response.status_code == 202
+    mock_enqueue.assert_called_once()
+    job: ReviewJob = mock_enqueue.call_args.args[1]
+    assert job.action == "review_requested"
+
+
+def test_review_requested_on_draft_ignored(
+    app_client: tuple[TestClient, MagicMock],
+) -> None:
+    """A review_requested on a draft PR is ignored (204), nothing enqueued."""
+    client, mock_enqueue = app_client
+    data = _pr_payload(action="review_requested")
+    data["pull_request"]["draft"] = True
+    payload = json.dumps(data).encode()
+    headers = {
+        "X-GitHub-Event": "pull_request",
+        "X-Hub-Signature-256": _sign(payload, _SECRET),
+        "Content-Type": "application/json",
+    }
+    response = client.post("/webhook", content=payload, headers=headers)
+    assert response.status_code == 204
+    mock_enqueue.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["opened", "reopened", "synchronize", "ready_for_review", "review_requested"],
+)
+def test_job_carries_action(
+    app_client: tuple[TestClient, MagicMock], action: str
+) -> None:
+    """The enqueued ReviewJob's action matches the payload for every relevant action."""
+    client, mock_enqueue = app_client
+    payload = json.dumps(_pr_payload(action=action)).encode()
+    headers = {
+        "X-GitHub-Event": "pull_request",
+        "X-Hub-Signature-256": _sign(payload, _SECRET),
+        "Content-Type": "application/json",
+    }
+    response = client.post("/webhook", content=payload, headers=headers)
+    assert response.status_code == 202
+    job: ReviewJob = mock_enqueue.call_args.args[1]
+    assert job.action == action
 
 
 # ---------------------------------------------------------------------------
