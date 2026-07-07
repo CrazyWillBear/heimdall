@@ -154,6 +154,60 @@ async def test_pending_signal_promotes_incoming_sync(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("signal_action", ["ready_for_review", "review_requested"])
+async def test_same_sha_promotion_leaves_queued_signal_in_place(
+    job: ReviewJob, signal_action: str
+) -> None:
+    """Same-sha promotion keeps the already-queued signal job: no ZREM, no re-enqueue.
+
+    Regression: signal(sha X) queued, then a synchronize(sha X) for the SAME sha arrives.
+    Promotion would reproduce the signal job's exact id. Cancelling + re-enqueuing that
+    id is self-defeating — ``cancel_stale_jobs`` ZREMs it from the queue but arq's
+    ``arq:job:{id}`` dedup marker (~24h TTL) survives, so the re-enqueue is dedup-dropped
+    and zero jobs would remain, silently losing the signal. The queued signal already
+    covers this sha, so leave it in place and return the dedup sentinel.
+    """
+    signal_id = f"review:owner/repo:7:{job.head_sha}:{signal_action}"
+    mock_pool = AsyncMock()
+    mock_pool.enqueue_job = AsyncMock(return_value=MagicMock(job_id="jid-1"))
+    mock_pool.zrem = AsyncMock()
+    mock_pool.queued_jobs = AsyncMock(
+        return_value=[_queued_job(signal_id, action=signal_action)]
+    )
+
+    result = await enqueue_review(mock_pool, job)  # job.action == "synchronize", same sha
+
+    # The already-queued signal job survives: not cancelled, not re-enqueued.
+    mock_pool.zrem.assert_not_awaited()
+    mock_pool.enqueue_job.assert_not_awaited()
+    assert result == ""
+
+
+@pytest.mark.asyncio
+async def test_same_sha_collision_still_cancels_other_stale_jobs(job: ReviewJob) -> None:
+    """On a same-sha collision the matching signal job is kept, but other stale jobs die."""
+    signal_id = f"review:owner/repo:7:{job.head_sha}:ready_for_review"
+    mock_pool = AsyncMock()
+    mock_pool.enqueue_job = AsyncMock(return_value=MagicMock(job_id="jid-1"))
+    mock_pool.zrem = AsyncMock()
+    mock_pool.queued_jobs = AsyncMock(
+        return_value=[
+            _queued_job(signal_id, action="ready_for_review"),
+            _queued_job("other-stale-jid", action="synchronize"),
+        ]
+    )
+
+    result = await enqueue_review(mock_pool, job)  # same sha as the queued signal
+
+    # The colliding signal job survives; the other stale job is superseded; no re-enqueue.
+    mock_pool.enqueue_job.assert_not_awaited()
+    assert result == ""
+    zrem_ids = [call.args[1] for call in mock_pool.zrem.await_args_list]
+    assert signal_id not in zrem_ids
+    assert "other-stale-jid" in zrem_ids
+
+
+@pytest.mark.asyncio
 async def test_plain_sync_not_promoted_without_signal(job: ReviewJob) -> None:
     """A synchronize enqueue with no queued signal keeps its action (no false promotion)."""
     mock_pool = AsyncMock()
