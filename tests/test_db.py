@@ -14,11 +14,13 @@ from heimdall.db import (
     get_job,
     get_last_reviewed_sha,
     get_posted_review,
+    is_pr_activated,
     prune_review_events,
     record_review_event,
     release_inflight,
     set_last_reviewed_sha,
     set_posted_review,
+    set_pr_activated,
     try_acquire_inflight,
     try_record_review_event,
     upsert_job,
@@ -140,6 +142,57 @@ async def test_posted_review_survives_reopen(tmp_path: Path) -> None:
     assert review["review_id"] == 555
     assert review["node_id"] == "NODE7"
     assert review["verdict"] == "COMMENT"
+
+
+# ---------------------------------------------------------------------------
+# on_signal trigger: per-PR activation via activated_prs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pr_not_activated_by_default(db: Database) -> None:
+    """A PR that was never signaled reads back as not activated."""
+    assert await is_pr_activated(db, repo_full_name="owner/repo", pr_number=1) is False
+
+
+@pytest.mark.asyncio
+async def test_set_and_check_pr_activated(db: Database) -> None:
+    """After set_pr_activated the PR reads back as activated."""
+    await set_pr_activated(db, repo_full_name="owner/repo", pr_number=1)
+    assert await is_pr_activated(db, repo_full_name="owner/repo", pr_number=1) is True
+
+
+@pytest.mark.asyncio
+async def test_set_pr_activated_is_idempotent(db: Database) -> None:
+    """Activating twice raises nothing and leaves the PR activated (sticky)."""
+    await set_pr_activated(db, repo_full_name="owner/repo", pr_number=1)
+    await set_pr_activated(db, repo_full_name="owner/repo", pr_number=1)
+    assert await is_pr_activated(db, repo_full_name="owner/repo", pr_number=1) is True
+
+
+@pytest.mark.asyncio
+async def test_activation_is_per_pr(db: Database) -> None:
+    """Activation is keyed per (repo, PR): it never leaks to a sibling PR or repo."""
+    await set_pr_activated(db, repo_full_name="owner/repo", pr_number=1)
+    assert await is_pr_activated(db, repo_full_name="owner/repo", pr_number=2) is False
+    assert await is_pr_activated(db, repo_full_name="other/repo", pr_number=1) is False
+
+
+@pytest.mark.asyncio
+async def test_activation_survives_reopen(tmp_path: Path) -> None:
+    """A PR activation survives a service restart (DB reopened from disk)."""
+    db_file = str(tmp_path / "activation.db")
+    first = Database(db_file)
+    await first.initialize()
+    await set_pr_activated(first, repo_full_name="owner/repo", pr_number=1)
+    await first.close()
+
+    reopened = Database(db_file)
+    await reopened.initialize()
+    activated = await is_pr_activated(reopened, repo_full_name="owner/repo", pr_number=1)
+    await reopened.close()
+
+    assert activated is True
 
 
 # ---------------------------------------------------------------------------

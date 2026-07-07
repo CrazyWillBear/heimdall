@@ -42,6 +42,9 @@ _PRIVATE_KEY = "key"
 # explicit config=None (simulate an opt-out / no-config skip).
 _SENTINEL = object()
 
+# A config that opts the repo into the on_signal trigger (review only after a signal).
+_on_signal_config = RepoConfig(scope=ScopeFilters(trigger="on_signal"))
+
 
 def _lens_result(findings: list[Finding], *, name: str = "security") -> LensResult:
     return LensResult(lens_name=name, findings=findings)
@@ -2555,6 +2558,172 @@ async def test_concurrency_records_event_and_releases_on_success() -> None:
 
     record_mock.assert_awaited_once()
     release_mock.assert_awaited_once()
+    client.post_review.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# on_signal trigger gate through run_review
+#   auto (default) reviews every in-scope event; on_signal reviews only after a
+#   ready_for_review/review_requested signal activates the PR (sticky).
+# ---------------------------------------------------------------------------
+
+
+def _gate_matrix_stack(
+    *,
+    config: RepoConfig,
+    activated: bool,
+) -> tuple[ExitStack, dict[str, AsyncMock]]:
+    """Patch run_review's deps for a trigger-gate test.
+
+    Returns the ExitStack plus handles to the activation + budget mocks so a test can
+    assert what was (and was not) called.  The activation helpers are patched at
+    ``heimdall.worker.<name>`` (the gate calls the names imported into the worker).
+    """
+    mocks: dict[str, AsyncMock] = {
+        "set_pr_activated": AsyncMock(),
+        "is_pr_activated": AsyncMock(return_value=activated),
+        "try_acquire_inflight": AsyncMock(return_value=True),
+        "try_record_review_event": AsyncMock(),
+        "release_inflight": AsyncMock(),
+        "set_last_reviewed_sha": AsyncMock(),
+        "run_synthesis": AsyncMock(return_value=_synthesis_from([])),
+    }
+    stack = ExitStack()
+    stack.enter_context(
+        patch("heimdall.worker._gate_review", new=AsyncMock(return_value=config))
+    )
+    stack.enter_context(
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False))
+    )
+    for name, mock in mocks.items():
+        stack.enter_context(patch(f"heimdall.worker.{name}", new=mock))
+    stack.enter_context(
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock()))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.run_lens", new=AsyncMock(return_value=_lens_result([])))
+    )
+    stack.enter_context(patch("heimdall.worker.set_posted_review", new=AsyncMock()))
+    return stack, mocks
+
+
+async def _drive_gate(client: AsyncMock, *, action: str | None = None) -> None:
+    """Drive run_review with the given action (omitted entirely when None)."""
+    extra = {} if action is None else {"action": action}
+    await run_review(
+        {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY},
+        installation_id=_INSTALL_ID,
+        repo_full_name=_REPO,
+        pr_number=_PR,
+        head_sha=_SHA,
+        **extra,
+    )
+
+
+@pytest.mark.asyncio
+async def test_gate_auto_default_no_action_kwarg_posts_review() -> None:
+    """1. auto default with NO action kwarg reviews (the action kwarg is optional)."""
+    client = _gh_client()
+    stack, mocks = _gate_matrix_stack(config=RepoConfig(), activated=False)
+    with stack, patch("heimdall.worker.GitHubClient", return_value=client):
+        await _drive_gate(client)  # no action kwarg
+
+    client.post_review.assert_awaited_once()
+    # Auto mode never consults activation.
+    mocks["is_pr_activated"].assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["opened", "reopened", "synchronize"])
+@pytest.mark.asyncio
+async def test_gate_on_signal_not_activated_skips(action: str) -> None:
+    """2. on_signal + non-signal action + not activated -> skip, no budget consumed."""
+    client = _gh_client()
+    stack, mocks = _gate_matrix_stack(config=_on_signal_config, activated=False)
+    with stack, patch("heimdall.worker.GitHubClient", return_value=client):
+        await _drive_gate(client, action=action)
+
+    mocks["run_synthesis"].assert_not_called()
+    client.post_review.assert_not_called()
+    # No SHA recorded (a post-activation delivery for this sha still reviews)...
+    mocks["set_last_reviewed_sha"].assert_not_called()
+    # ...and no rate/concurrency budget consumed (the gate returns before them).
+    mocks["try_acquire_inflight"].assert_not_called()
+    mocks["try_record_review_event"].assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gate_on_signal_no_action_kwarg_skips() -> None:
+    """3. on_signal + NO action kwarg (defaults to synchronize) + not activated -> skip."""
+    client = _gh_client()
+    stack, mocks = _gate_matrix_stack(config=_on_signal_config, activated=False)
+    with stack, patch("heimdall.worker.GitHubClient", return_value=client):
+        await _drive_gate(client)  # no action kwarg -> defaults to synchronize
+
+    mocks["run_synthesis"].assert_not_called()
+    client.post_review.assert_not_called()
+    mocks["set_last_reviewed_sha"].assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["ready_for_review", "review_requested"])
+@pytest.mark.asyncio
+async def test_gate_on_signal_signal_action_activates_and_reviews(action: str) -> None:
+    """4. on_signal + a signal action -> activation recorded AND the review posts."""
+    client = _gh_client()
+    # Not yet activated: the signal action itself activates the PR and proceeds.
+    stack, mocks = _gate_matrix_stack(config=_on_signal_config, activated=False)
+    with stack, patch("heimdall.worker.GitHubClient", return_value=client):
+        await _drive_gate(client, action=action)
+
+    mocks["set_pr_activated"].assert_awaited_once_with(
+        ANY, repo_full_name=_REPO, pr_number=_PR
+    )
+    client.post_review.assert_awaited_once()
+    mocks["set_last_reviewed_sha"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_gate_on_signal_activated_reviews_on_push() -> None:
+    """5. on_signal + synchronize + already activated -> the push re-reviews."""
+    client = _gh_client()
+    stack, mocks = _gate_matrix_stack(config=_on_signal_config, activated=True)
+    with stack, patch("heimdall.worker.GitHubClient", return_value=client):
+        await _drive_gate(client, action="synchronize")
+
+    mocks["is_pr_activated"].assert_awaited_once()
+    client.post_review.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_gate_auto_signal_action_records_activation_and_reviews() -> None:
+    """6. auto + a signal action -> activation recorded (cheap, sticky) AND reviews."""
+    client = _gh_client()
+    stack, mocks = _gate_matrix_stack(config=RepoConfig(), activated=False)
+    with stack, patch("heimdall.worker.GitHubClient", return_value=client):
+        await _drive_gate(client, action="review_requested")
+
+    mocks["set_pr_activated"].assert_awaited_once_with(
+        ANY, repo_full_name=_REPO, pr_number=_PR
+    )
+    client.post_review.assert_awaited_once()
+    # Auto mode records activation but never gates on it.
+    mocks["is_pr_activated"].assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gate_auto_does_not_consult_activation() -> None:
+    """7. auto + opened -> is_pr_activated is never awaited (auto is byte-for-byte today)."""
+    client = _gh_client()
+    stack, mocks = _gate_matrix_stack(config=RepoConfig(), activated=False)
+    with stack, patch("heimdall.worker.GitHubClient", return_value=client):
+        await _drive_gate(client, action="opened")
+
+    mocks["is_pr_activated"].assert_not_called()
     client.post_review.assert_awaited_once()
 
 

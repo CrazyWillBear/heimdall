@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_RELEVANT_ACTIONS = frozenset({"opened", "reopened", "synchronize", "ready_for_review"})
+_RELEVANT_ACTIONS = frozenset(
+    {"opened", "reopened", "synchronize", "ready_for_review", "review_requested"}
+)
 
 
 def compute_signature(payload: bytes, secret: str) -> str:
@@ -69,6 +71,7 @@ def _build_job(body: dict[str, Any]) -> ReviewJob:
         repo_full_name=body["repository"]["full_name"],
         pr_number=pr["number"],
         head_sha=pr["head"]["sha"],
+        action=body["action"],
     )
 
 
