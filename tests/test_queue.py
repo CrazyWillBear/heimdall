@@ -6,7 +6,27 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from heimdall.queue import ReviewJob, cancel_stale_jobs, enqueue_review
+from heimdall.queue import (
+    ReviewJob,
+    cancel_stale_jobs,
+    enqueue_review,
+    find_pending_jobs,
+)
+
+
+def _queued_job(job_id: str, *, action: str | None = "synchronize") -> MagicMock:
+    """Build a fake arq JobDef for owner/repo PR 7 with the given action kwarg.
+
+    Passing ``action=None`` omits the kwarg entirely, mimicking a legacy job
+    enqueued before the action kwarg existed.
+    """
+    kwargs: dict[str, object] = {"repo_full_name": "owner/repo", "pr_number": 7}
+    if action is not None:
+        kwargs["action"] = action
+    job_def = MagicMock()
+    job_def.job_id = job_id
+    job_def.kwargs = kwargs
+    return job_def
 
 
 @pytest.fixture()
@@ -81,3 +101,67 @@ async def test_cancel_stale_jobs_removes_from_queue(job: ReviewJob) -> None:
 
     mock_pool.zrem.assert_awaited_once()
     assert "stale-jid" in mock_pool.zrem.call_args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal_action", ["ready_for_review", "review_requested"])
+async def test_signal_job_not_returned_as_stale(signal_action: str) -> None:
+    """A queued signal-action job is never treated as stale for cancellation.
+
+    Regression: a push's ``synchronize`` enqueue must not cancel an explicit,
+    still-queued signal job — otherwise the signal is silently lost and the PR is
+    never activated.
+    """
+    mock_pool = AsyncMock()
+    mock_pool.queued_jobs = AsyncMock(
+        return_value=[_queued_job("signal-jid", action=signal_action)]
+    )
+
+    found = await find_pending_jobs(mock_pool, repo_full_name="owner/repo", pr_number=7)
+
+    assert found == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal_action", ["ready_for_review", "review_requested"])
+async def test_cancel_stale_jobs_spares_signal_job(signal_action: str) -> None:
+    """cancel_stale_jobs (as invoked by a later synchronize enqueue) spares a signal job."""
+    mock_pool = AsyncMock()
+    mock_pool.zrem = AsyncMock()
+    mock_pool.queued_jobs = AsyncMock(
+        return_value=[_queued_job("signal-jid", action=signal_action)]
+    )
+
+    await cancel_stale_jobs(mock_pool, repo_full_name="owner/repo", pr_number=7)
+
+    mock_pool.zrem.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_synchronize_job_still_cancelled() -> None:
+    """Non-signal (synchronize) jobs for the same PR are still cancelled (supersede-by-push)."""
+    mock_pool = AsyncMock()
+    mock_pool.zrem = AsyncMock()
+    mock_pool.queued_jobs = AsyncMock(
+        return_value=[_queued_job("sync-jid", action="synchronize")]
+    )
+
+    await cancel_stale_jobs(mock_pool, repo_full_name="owner/repo", pr_number=7)
+
+    mock_pool.zrem.assert_awaited_once()
+    assert "sync-jid" in mock_pool.zrem.call_args[0]
+
+
+@pytest.mark.asyncio
+async def test_legacy_job_without_action_still_cancelled() -> None:
+    """A job enqueued before the action kwarg (missing/None) is treated as cancellable."""
+    mock_pool = AsyncMock()
+    mock_pool.zrem = AsyncMock()
+    mock_pool.queued_jobs = AsyncMock(
+        return_value=[_queued_job("legacy-jid", action=None)]
+    )
+
+    await cancel_stale_jobs(mock_pool, repo_full_name="owner/repo", pr_number=7)
+
+    mock_pool.zrem.assert_awaited_once()
+    assert "legacy-jid" in mock_pool.zrem.call_args[0]

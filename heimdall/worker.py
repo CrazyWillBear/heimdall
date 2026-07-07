@@ -142,6 +142,7 @@ _MAX_REVIEW_ATTEMPTS = 2
 # Webhook actions that count as an explicit review signal under scope.trigger: on_signal.
 # Any review_requested counts (even one not naming Heimdall) because a GitHub App bot
 # cannot be picked as a PR reviewer — the request is the human's intent to be reviewed.
+# Mirrored in queue.py's _SIGNAL_ACTIONS (kept in sync; not shared to avoid an import cycle).
 _SIGNAL_ACTIONS = frozenset({"ready_for_review", "review_requested"})
 
 # Headroom added on top of the worst-case pipeline budget when sizing arq's job_timeout

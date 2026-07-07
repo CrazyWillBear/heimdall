@@ -12,6 +12,13 @@ from arq import ArqRedis
 from arq.constants import default_queue_name
 from arq.jobs import Job
 
+# Actions that mark a job as an explicit review signal. A queued signal job must
+# survive a later push's cancel_stale_jobs, or the signal is silently lost and the
+# PR never gets activated. Kept in sync with worker.py's _SIGNAL_ACTIONS (same concept);
+# duplicated rather than imported to avoid a queue->worker import cycle (queue is
+# imported by both webhook.py and worker.py).
+_SIGNAL_ACTIONS = frozenset({"ready_for_review", "review_requested"})
+
 
 @dataclass(frozen=True)
 class ReviewJob:
@@ -41,7 +48,11 @@ async def find_pending_jobs(
 ) -> list[Job]:
     """Return Job handles for any queued (not-yet-running) jobs for this PR.
 
-    Scans the Arq queue and matches by the kwargs embedded at enqueue time.
+    Scans the Arq queue and matches by the kwargs embedded at enqueue time. Signal-action
+    jobs (see ``_SIGNAL_ACTIONS``) are excluded: they carry the user's explicit intent to
+    review and must survive to run and activate the PR, so they are never reported as stale.
+    A missing/None ``action`` (legacy jobs enqueued before the kwarg existed) counts as
+    non-signal and stays cancellable — legacy jobs are synchronize-like.
     """
     queued = await pool.queued_jobs()
     jobs: list[Job] = []
@@ -50,6 +61,7 @@ async def find_pending_jobs(
         if (
             kw.get("repo_full_name") == repo_full_name
             and kw.get("pr_number") == pr_number
+            and kw.get("action") not in _SIGNAL_ACTIONS
             and job_def.job_id is not None
         ):
             jobs.append(Job(job_def.job_id, pool))
