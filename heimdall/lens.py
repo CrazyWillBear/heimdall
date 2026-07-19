@@ -453,7 +453,9 @@ def build_claude_argv(
     ]
 
 
-def build_synthesis_argv(*, claude_binary: str, prompt: str) -> list[str]:
+def build_synthesis_argv(
+    *, claude_binary: str, prompt: str, synthesis: LensSpec = SYNTHESIS_LENS
+) -> list[str]:
     """Build the ``claude -p`` argv for the no-tools, no-workspace synthesis pass.
 
     Synthesis only dedups/ranks/tags the three lenses' findings JSON it is handed in
@@ -467,12 +469,16 @@ def build_synthesis_argv(*, claude_binary: str, prompt: str) -> list[str]:
     Args:
         claude_binary: Path or name of the claude executable.
         prompt: The synthesis user prompt carrying the per-lens findings JSON.
+        synthesis: The synthesis lens spec supplying model/effort; defaults to the
+            built-in :data:`SYNTHESIS_LENS`.  Its ``system_prompt`` is always the
+            built-in one — a repo tunes only model/effort (see
+            :func:`heimdall.repo_config.tuned_synthesis`).
 
     Returns:
         The argument vector to pass to the subprocess invoker.
     """
     return _base_claude_argv(
-        claude_binary=claude_binary, lens=SYNTHESIS_LENS, prompt=prompt
+        claude_binary=claude_binary, lens=synthesis, prompt=prompt
     )
 
 
@@ -1502,6 +1508,7 @@ async def run_synthesis(
     env_passthrough: Sequence[str] = (),
     invoker: ClaudeInvoker = run_claude_subprocess,
     blocking: frozenset[Severity] = _BLOCKING_SEVERITIES,
+    synthesis_lens: LensSpec = SYNTHESIS_LENS,
 ) -> SynthesisResult:
     """Run the 4th synthesis ``claude -p`` pass over all lenses' findings.
 
@@ -1554,6 +1561,9 @@ async def run_synthesis(
         invoker: Coroutine that runs the subprocess; injected in tests.
         blocking: The severities that escalate the verdict to REQUEST_CHANGES;
             defaults to high/critical, overridden by the repo config threshold.
+        synthesis_lens: The synthesis lens spec supplying the pass's model/effort;
+            defaults to the built-in :data:`SYNTHESIS_LENS`.  The repo tunes only
+            model/effort (its system prompt stays built-in).
 
     Returns:
         A :class:`SynthesisResult` with the tagged survivors, verdict, body, and the
@@ -1575,6 +1585,7 @@ async def run_synthesis(
             review_summaries,
             own_prior_review,
         ),
+        synthesis=synthesis_lens,
     )
     total_lens_findings = sum(len(r.findings) for r in lens_results)
     logger.info(
