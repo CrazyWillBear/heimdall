@@ -120,14 +120,17 @@ from heimdall.lens import (
 )
 from heimdall.queue import _SIGNAL_ACTIONS
 from heimdall.repo_config import (
+    EffectiveLimits,
     GuardrailCaps,
     RepoConfig,
     RepoConfigError,
     blocking_severities,
     diff_cap_skip_note,
+    effective_limits,
     load_repo_config,
     skip_reason,
     tuned_lenses,
+    tuned_synthesis,
 )
 
 logger = logging.getLogger(__name__)
@@ -758,8 +761,16 @@ async def _run_pipeline_with_retry(
         and the single retry fail (all lenses/synthesis aborted or per-review
         timeout).
     """
-    review_timeout = ctx.get(
-        "review_timeout_seconds", DEFAULT_REVIEW_TIMEOUT_SECONDS
+    # Clamp the operator's resource ceilings by the repo's (tighten-only) overrides once,
+    # up front, so the per-review timeout here and the per-lens cap/timeout threaded into
+    # the pipeline all reflect the same effective limits.
+    limits = effective_limits(
+        config,
+        token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
+        lens_timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+        review_timeout_seconds=ctx.get(
+            "review_timeout_seconds", DEFAULT_REVIEW_TIMEOUT_SECONDS
+        ),
     )
     max_attempts = _MAX_REVIEW_ATTEMPTS  # one initial attempt + exactly one retry
     for attempt in range(1, max_attempts + 1):
@@ -768,11 +779,12 @@ async def _run_pipeline_with_retry(
                 _synthesize_review(
                     ctx,
                     config=config,
+                    limits=limits,
                     installation_id=installation_id,
                     repo_full_name=repo_full_name,
                     pr_number=pr_number,
                 ),
-                timeout=review_timeout,
+                timeout=limits.review_timeout_seconds,
             )
         except SandboxError as exc:
             # An infra/deployment fault (bwrap missing or unrunnable), distinct from a
@@ -829,6 +841,7 @@ async def _synthesize_review(
     ctx: dict[str, Any],
     *,
     config: RepoConfig,
+    limits: EffectiveLimits,
     installation_id: int,
     repo_full_name: str,
     pr_number: int,
@@ -865,6 +878,7 @@ async def _synthesize_review(
         lens_results, dropped_lenses = await _run_lenses(
             ctx,
             config=config,
+            limits=limits,
             workspace_dir=workspace,
             repo_full_name=repo_full_name,
             pr_number=pr_number,
@@ -883,10 +897,11 @@ async def _synthesize_review(
             own_prior_review=pr_context.own_prior_review,
             comments_truncated=pr_context.comments_truncated,
             claude_binary=ctx.get("claude_binary", "claude"),
-            token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
-            timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+            token_cap=limits.token_cap,
+            timeout_seconds=limits.lens_timeout_seconds,
             env_passthrough=ctx.get("claude_env_passthrough", []),
             blocking=blocking_severities(config.severity_threshold),
+            synthesis_lens=tuned_synthesis(config),
         )
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
@@ -910,6 +925,7 @@ async def _run_lenses(
     ctx: dict[str, Any],
     *,
     config: RepoConfig,
+    limits: EffectiveLimits,
     workspace_dir: str,
     repo_full_name: str,
     pr_number: int,
@@ -938,8 +954,8 @@ async def _run_lenses(
                 lens=lens,
                 workspace_dir=workspace_dir,
                 claude_binary=ctx.get("claude_binary", "claude"),
-                token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
-                timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+                token_cap=limits.token_cap,
+                timeout_seconds=limits.lens_timeout_seconds,
                 env_passthrough=ctx.get("claude_env_passthrough", []),
                 bwrap_binary=ctx.get("bwrap_binary", DEFAULT_BWRAP_BINARY),
                 sandbox_extra_read_only_binds=ctx.get("sandbox_extra_read_only_binds", []),

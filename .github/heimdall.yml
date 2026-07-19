@@ -5,5 +5,6 @@
 # an empty file (just this comment) runs all three built-in lenses
 # (security, design, cleanliness) with safe defaults.
 #
-# See heimdall/repo_config.py for the full schema (per-lens model/effort,
-# severity_threshold, scope filters, guardrail caps, docs list).
+# See docs/configuration.md (or heimdall/repo_config.py) for the full schema:
+# per-lens model/effort, custom lenses, synthesis model/effort, tighten-only
+# resource limits, severity_threshold, scope filters, guardrail caps, docs list.

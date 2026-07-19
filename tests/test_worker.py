@@ -23,7 +23,13 @@ from heimdall.lens import (
     SynthesisResult,
     TaggedFinding,
 )
-from heimdall.repo_config import LensConfig, RepoConfig, ScopeFilters
+from heimdall.repo_config import (
+    LensConfig,
+    RepoConfig,
+    ResourceLimits,
+    ScopeFilters,
+    SynthesisConfig,
+)
 from heimdall.worker import (
     _CONCURRENCY_DEFER_SECONDS,
     WorkerSettings,
@@ -242,6 +248,54 @@ async def test_run_review_fans_out_three_lenses_into_synthesis() -> None:
     passed: list[LensResult] = synth_mock.await_args.kwargs["lens_results"]
     names = {r.lens_name for r in passed}
     assert names == {"security", "design", "cleanliness"}
+
+
+@pytest.mark.asyncio
+async def test_run_review_threads_clamped_limits_and_tuned_synthesis() -> None:
+    """A repo's limits/synthesis config reaches run_lens and run_synthesis end-to-end.
+
+    The repo tightens token_cap below the operator ceiling and overrides the synthesis
+    model; both the clamped cap and the tuned synthesis spec must reach the pipeline.
+    """
+    mock_gh_client = _gh_client()
+    # No operator overrides in ctx, so effective_limits clamps against the built-in
+    # defaults; the repo's 100k cap is below that ceiling and must be honored as-is.
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    config = RepoConfig(
+        limits=ResourceLimits(token_cap=100_000),
+        synthesis=SynthesisConfig(model="haiku", effort="low"),
+    )
+    stack, synth_mock = _patch_review_pipeline(
+        config=config,
+        synthesis_result=_synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")]),
+    )
+    run_lens_mock = AsyncMock(return_value=_lens_result([], name="security"))
+    with (
+        stack,
+        patch("heimdall.worker.run_lens", new=run_lens_mock),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    # The clamped per-lens token cap reached every lens run.
+    assert run_lens_mock.await_args is not None
+    assert run_lens_mock.await_args.kwargs["token_cap"] == 100_000
+
+    # The same clamped cap and the tuned synthesis spec reached synthesis.
+    assert synth_mock.await_args is not None
+    assert synth_mock.await_args.kwargs["token_cap"] == 100_000
+    synthesis_lens = synth_mock.await_args.kwargs["synthesis_lens"]
+    assert synthesis_lens.model == "haiku"
+    assert synthesis_lens.effort == "low"
 
 
 @pytest.mark.asyncio
