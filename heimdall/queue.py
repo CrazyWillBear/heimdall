@@ -2,11 +2,20 @@
 
 cancel_stale_jobs must be called before enqueue_review so that an earlier
 queued job for the same PR is removed before the new one is submitted.
+
+enqueue_review serializes its whole decide+cancel+enqueue section per (repo, pr)
+via a Redis lock (``_pr_lock``), so concurrent same-PR webhook deliveries — even
+across multiple app replicas — can't interleave and double-enqueue or drop a signal.
 """
 
 from __future__ import annotations
 
+import asyncio
+import uuid
+from collections.abc import AsyncIterator, Awaitable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import cast
 
 from arq import ArqRedis
 from arq.constants import default_queue_name
@@ -18,6 +27,44 @@ from arq.jobs import Job
 # Single source of truth: worker.py imports this for its on_signal gate, and enqueue_review
 # uses it to fold a pending signal's intent forward onto a superseding push (promotion).
 _SIGNAL_ACTIONS = frozenset({"ready_for_review", "review_requested"})
+
+# Per-(repo, pr) enqueue lock. TTL far exceeds the critical section (a few Redis round
+# trips) but self-heals a crashed holder; the spin backoff yields while another caller holds.
+_LOCK_TTL_MS = 30_000
+_LOCK_RETRY_DELAY_S = 0.01
+# Token-guarded release: delete the key only if it still carries our token, so a caller
+# never frees a lock the TTL already expired and handed to someone else.
+_RELEASE_LOCK_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+"""
+
+
+@asynccontextmanager
+async def _pr_lock(
+    pool: ArqRedis, *, repo_full_name: str, pr_number: int
+) -> AsyncIterator[None]:
+    """Serialize enqueue_review's decide+cancel+enqueue section per (repo, pr).
+
+    A Redis ``SET NX PX`` distributed lock: only one caller (across processes and
+    coroutines) holds the (repo, pr) key at a time, so concurrent same-PR deliveries can
+    never observe an intermediate queue state. No acquire timeout is needed — the ``px``
+    TTL guarantees the key is eventually free even if a holder crashes. Released with a
+    token-guarded delete so a caller never frees a lock the TTL already reassigned.
+    """
+    key = f"heimdall:enqueue-lock:{repo_full_name}:{pr_number}"
+    token = uuid.uuid4().hex
+    while not await pool.set(key, token, nx=True, px=_LOCK_TTL_MS):
+        await asyncio.sleep(_LOCK_RETRY_DELAY_S)
+    try:
+        yield
+    finally:
+        # redis-py types Redis.eval as Union[Awaitable[str], str] (sync/async overload);
+        # on the async pool it is always awaitable, so narrow it for mypy.
+        await cast("Awaitable[str]", pool.eval(_RELEASE_LOCK_SCRIPT, 1, key, token))
 
 
 @dataclass(frozen=True)
@@ -123,8 +170,31 @@ async def cancel_stale_jobs(
 async def enqueue_review(pool: ArqRedis, job: ReviewJob) -> str:
     """Fold any pending signal forward, cancel stale jobs, then enqueue the job.
 
-    Passes the ReviewJob fields as keyword arguments so the worker can receive
-    them and Arq's queue-scanning can match on them.
+    The decide+cancel+enqueue section runs under a per-(repo, pr) Redis lock
+    (``_pr_lock``), so concurrent same-PR deliveries are serialized and cannot double-
+    enqueue or drop a signal — see ``_decide_cancel_enqueue`` for the promotion and
+    same-sha collision contract.
+
+    Args:
+        pool: The connected Arq Redis pool.
+        job: The review job to enqueue.
+
+    Returns:
+        The Arq job ID of the newly enqueued job (empty string if deduplicated, or when a
+        same-sha promotion collides with the already-queued signal job).
+    """
+    async with _pr_lock(
+        pool, repo_full_name=job.repo_full_name, pr_number=job.pr_number
+    ):
+        return await _decide_cancel_enqueue(pool, job)
+
+
+async def _decide_cancel_enqueue(pool: ArqRedis, job: ReviewJob) -> str:
+    """Fold any pending signal forward, cancel stale jobs, then enqueue the job.
+
+    Callers must hold the ``_pr_lock`` for this (repo, pr): this reads the queue, decides
+    a possibly-promoted action, cancels stale jobs, and enqueues — a section that must run
+    without a concurrent same-PR caller interleaving.
 
     Promotion (fold-the-intent-forward): if a signal job (``ready_for_review`` /
     ``review_requested``) is still queued for this PR and the incoming ``job`` is a plain
@@ -143,14 +213,6 @@ async def enqueue_review(pool: ArqRedis, job: ReviewJob) -> str:
     same-id re-enqueue is dropped and zero jobs would remain, silently losing the signal.
     So we leave that job queued, still cancel any OTHER stale jobs, and return the dedup
     sentinel.
-
-    Args:
-        pool: The connected Arq Redis pool.
-        job: The review job to enqueue.
-
-    Returns:
-        The Arq job ID of the newly enqueued job (empty string if deduplicated, or when a
-        same-sha promotion collides with the already-queued signal job).
     """
     action = job.action
     if action not in _SIGNAL_ACTIONS:
