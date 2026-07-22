@@ -101,6 +101,62 @@ def test_parse_findings_unknown_severity_falls_back_to_low() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Robust parsing: salvage findings from truncated / non-enveloped output (#106).
+# The design/cleanliness lenses (sonnet) frequently hit their max output length
+# mid-array, leaving a truncated `{"findings": [...` the strict decoder rejects —
+# so every complete finding emitted before the cut was dropped and the lens fell
+# out of synthesis.  Parsing now recovers those.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_findings_salvages_truncated_findings_array() -> None:
+    """A findings envelope cut off mid-array still yields the complete findings."""
+    raw = (
+        '{"findings": ['
+        '{"severity": "medium", "title": "Tight coupling", '
+        '"message": "module A reaches into B internals", "location": "a.py:9"}, '
+        '{"severity": "low", "title": "Naming", '
+        '"message": "helper name does not match its behaviour and is really quite lo'
+    )  # truncated mid-second-finding, no closing ] or }
+    findings = parse_findings(raw)
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.MEDIUM
+    assert findings[0].title == "Tight coupling"
+    assert findings[0].location == "a.py:9"
+
+
+def test_parse_findings_accepts_bare_findings_array() -> None:
+    """A lens that emits a bare JSON array (envelope omitted) is still parsed."""
+    raw = (
+        '[{"severity": "high", "title": "God object", '
+        '"message": "class does too much", "location": "svc.py:1"}]'
+    )
+    findings = parse_findings(raw)
+    assert len(findings) == 1
+    assert findings[0].severity is Severity.HIGH
+    assert findings[0].title == "God object"
+
+
+def test_parse_findings_salvage_skips_unrelated_leading_object() -> None:
+    """Salvage anchors on the findings array, not an unrelated preceding object."""
+    raw = (
+        '{"note": "some metadata"} '
+        '{"findings": [{"severity": "low", "title": "Dead code", '
+        '"message": "unused import", "location": "x.py:1"}, '
+        '{"severity": "low", "title": "second finding cut off here'
+    )
+    findings = parse_findings(raw)
+    assert len(findings) == 1
+    assert findings[0].title == "Dead code"
+
+
+def test_parse_findings_still_empty_when_truncated_before_first_finding() -> None:
+    """A cut so early no finding is complete recovers nothing (stays a loud failure)."""
+    assert parse_findings('{"findings": [{"severity": "hi') == []
+    assert parse_findings("total garbage, no json at all") == []
+
+
+# ---------------------------------------------------------------------------
 # Verdict mapping
 # ---------------------------------------------------------------------------
 
@@ -623,6 +679,31 @@ async def test_run_lens_raises_on_no_findings_json() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_lens_salvages_truncated_findings() -> None:
+    """A lens whose output was truncated mid-array recovers, not drops (#106)."""
+
+    truncated = (
+        '{"findings": ['
+        '{"severity": "medium", "title": "Layering break", '
+        '"message": "worker imports a web-layer helper", "location": "w.py:3"}, '
+        '{"severity": "low", "title": "Long function", "message": "this one is cut'
+    )
+
+    async def truncating_invoker(
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
+    ) -> ClaudeResult:
+        return _raw_result(truncated, tokens=71_000)
+
+    result = await run_lens(
+        lens=DESIGN_LENS,
+        workspace_dir=_WORKSPACE,
+        invoker=truncating_invoker,
+    )
+    assert isinstance(result, LensResult)
+    assert [f.title for f in result.findings] == ["Layering break"]
+
+
+@pytest.mark.asyncio
 async def test_run_lens_clean_pr_returns_empty_findings() -> None:
     """A genuine clean run (tokens > 0, parseable empty findings) still succeeds."""
 
@@ -670,6 +751,32 @@ async def test_run_synthesis_raises_on_no_findings_json() -> None:
             lens_results=[_lens_result_for_synthesis()],
             invoker=garbage_invoker,
         )
+
+
+@pytest.mark.asyncio
+async def test_run_synthesis_salvages_truncated_findings() -> None:
+    """Synthesis output cut off mid-array recovers its complete survivors (#106)."""
+
+    truncated = (
+        '{"findings": ['
+        '{"severity": "high", "title": "SecretLeak", "message": "key in log", '
+        '"location": "log.py:2", "lens": "security"}, '
+        '{"severity": "low", "title": "Naming", "message": "truncated here and cut'
+    )
+
+    async def truncating_invoker(
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
+    ) -> ClaudeResult:
+        return _raw_result(truncated, tokens=64_000)
+
+    result = await run_synthesis(
+        lens_results=[_lens_result_for_synthesis()],
+        invoker=truncating_invoker,
+    )
+    assert isinstance(result, SynthesisResult)
+    assert [t.finding.title for t in result.tagged_findings] == ["SecretLeak"]
+    assert result.tagged_findings[0].lens == "security"
+    assert result.verdict == "REQUEST_CHANGES"
 
 
 @pytest.mark.asyncio
