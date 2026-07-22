@@ -1384,10 +1384,20 @@ async def run_claude_subprocess(
             proc.communicate(), timeout=timeout_seconds
         )
     except TimeoutError as exc:
-        await _kill(proc)
         raise LensTimeoutError(
             f"Lens run exceeded {timeout_seconds}s wall-clock; subprocess killed"
         ) from exc
+    finally:
+        # Any non-clean exit from the await above — our own TimeoutError, or a
+        # CancelledError delivered by an *outer* timeout/cancellation (e.g.
+        # `_run_pipeline_with_retry`'s wait_for on the whole pipeline) — leaves the
+        # child still running unless we kill it here.  `communicate()` only returns
+        # once the process has exited, so `returncode` is still None past that await
+        # on every non-clean path; a clean return sets it before we get here, so this
+        # is a no-op on success.  Re-raising (implicit for `finally`) preserves
+        # cancellation semantics — the caller still sees the CancelledError.
+        if proc.returncode is None:
+            await _kill(proc)
 
     envelope = _parse_envelope(stdout_bytes)
     total_tokens = _sum_tokens(envelope)

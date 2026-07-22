@@ -38,10 +38,19 @@ def _fake_proc(
     When ``exhausts_wait`` is True, communicate() never returns (simulating a
     hung claude run) so wait_for must time out.  ``returncode``/``stderr`` drive the
     failure-diagnostic path (a non-zero exit or an error written to stderr).
+
+    Mirrors real subprocess semantics: ``returncode`` is ``None`` while the process
+    is still running (the ``exhausts_wait`` case, until something kills it) and only
+    becomes non-``None`` once it has actually exited — killing it sets it, same as
+    asyncio's real process-reaping does.
     """
     proc = MagicMock()
-    proc.returncode = returncode
-    proc.kill = MagicMock()
+    proc.returncode = None if exhausts_wait else returncode
+
+    def _kill(*, _proc: MagicMock = proc) -> None:
+        _proc.returncode = -9  # SIGKILL, once the process has actually exited
+
+    proc.kill = MagicMock(side_effect=_kill)
     proc.wait = AsyncMock()
 
     if exhausts_wait:
@@ -185,6 +194,38 @@ async def test_subprocess_killed_on_wall_clock_timeout() -> None:
         )
 
     proc.kill.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_subprocess_killed_on_outer_cancellation() -> None:
+    """Cancelling the awaiting task mid-communicate() still kills + reaps the child.
+
+    This is the outer-timeout case: `_run_pipeline_with_retry` wraps the whole
+    pipeline in its own `asyncio.wait_for`, so when *that* budget expires first, a
+    `CancelledError` (not our `TimeoutError`) lands inside the suspended
+    `communicate()` await.  Without a cleanup path keyed on cancellation the child
+    is orphaned — never killed, never reaped.
+    """
+    proc = _fake_proc(stdout=b"", exhausts_wait=True)
+
+    with patch(
+        "heimdall.lens._resolve_bwrap", return_value="/usr/bin/bwrap"
+    ), patch(
+        "heimdall.lens.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=proc),
+    ):
+        task = asyncio.ensure_future(
+            run_claude_subprocess(
+                ["claude", "-p"], timeout_seconds=900, token_cap=400_000, cwd="/srv/seed"
+            )
+        )
+        await asyncio.sleep(0)  # let the task reach the communicate() await
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    proc.kill.assert_called_once()
+    proc.wait.assert_awaited_once()
 
 
 @pytest.mark.asyncio
