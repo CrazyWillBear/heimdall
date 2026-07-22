@@ -420,6 +420,43 @@ async def _fetch_pr_data(
     )
 
 
+def _is_tolerable_fetch_error(item: BaseException, *, kind: str) -> bool:
+    """Return True if ``item`` is a fetch error that should be skipped, not raised.
+
+    Tolerable errors, each logged and then omitted rather than aborting the
+    whole gather:
+
+    - ``UnicodeDecodeError`` — a binary file that can't decode as UTF-8.
+    - ``httpx.HTTPStatusError`` — an oversize or otherwise unavailable file;
+      the GitHub Contents API returned an error status.
+    - ``ValueError`` — GitHub served a non-base64 ``encoding`` (e.g. ``"none"``
+      for files too large for the Contents API to inline); see
+      ``GitHubClient.get_file_content``.
+
+    Anything else is unexpected and the caller should re-raise it rather than
+    silently swallowing it.
+    """
+    if isinstance(item, UnicodeDecodeError):
+        logger.warning(
+            "Skipping binary %s in PR context (UnicodeDecodeError): %s", kind, item
+        )
+        return True
+    if isinstance(item, httpx.HTTPStatusError):
+        logger.warning(
+            "Skipping %s in PR context (HTTP %s): %s",
+            kind,
+            item.response.status_code,
+            item.request.url,
+        )
+        return True
+    if isinstance(item, ValueError):
+        logger.warning(
+            "Skipping %s in PR context (unexpected content encoding): %s", kind, item
+        )
+        return True
+    return False
+
+
 async def _fetch_file_contents_and_docs(
     github: GitHubClient,
     *,
@@ -430,11 +467,13 @@ async def _fetch_file_contents_and_docs(
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Fetch changed-file contents and repo docs in parallel.
 
-    Changed files with status "removed" are skipped.  Per-file failures for
-    changed files are isolated: binary files (UnicodeDecodeError) and
-    oversize/unavailable files (HTTPStatusError) are logged and omitted rather
-    than aborting the whole gather.  Docs absent from the repo are silently
-    omitted (404 is tolerated via ``tolerate_missing``).
+    Changed files with status "removed" are skipped.  Per-file failures — for
+    both changed files and docs — are isolated: binary files
+    (UnicodeDecodeError), oversize/unavailable files (HTTPStatusError), and
+    files served with a non-base64 encoding (ValueError; see
+    ``GitHubClient.get_file_content``) are logged and omitted rather than
+    aborting the whole gather.  Docs absent from the repo are silently omitted
+    (404 is tolerated via ``tolerate_missing``).
 
     Args:
         github: Authenticated GitHub API client.
@@ -486,29 +525,21 @@ async def _fetch_file_contents_and_docs(
 
     file_contents: dict[str, str] = {}
     for item in changed_raw:
-        if isinstance(item, UnicodeDecodeError):
-            # Binary file — can't decode as UTF-8; skip with a log entry.
-            logger.warning(
-                "Skipping binary file in PR context (UnicodeDecodeError): %s", item
-            )
-        elif isinstance(item, httpx.HTTPStatusError):
-            # Oversize or unavailable file — GitHub Contents API returned an error.
-            logger.warning(
-                "Skipping file in PR context (HTTP %s): %s",
-                item.response.status_code,
-                item.request.url,
-            )
-        elif isinstance(item, BaseException):
+        if isinstance(item, BaseException):
+            if _is_tolerable_fetch_error(item, kind="file"):
+                continue
             # Unexpected error — re-raise so it isn't silently swallowed.
             raise item
-        else:
-            filename, content = item
-            if content is not None:
-                file_contents[filename] = content
+        filename, content = item
+        if content is not None:
+            file_contents[filename] = content
 
     docs: dict[str, str] = {}
     for item in doc_raw:
         if isinstance(item, BaseException):
+            if _is_tolerable_fetch_error(item, kind="doc"):
+                continue
+            # Unexpected error — re-raise so it isn't silently swallowed.
             raise item
         name, content = item
         if content is not None:
