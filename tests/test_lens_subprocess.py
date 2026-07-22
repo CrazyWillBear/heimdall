@@ -205,27 +205,54 @@ async def test_subprocess_killed_on_outer_cancellation() -> None:
     `CancelledError` (not our `TimeoutError`) lands inside the suspended
     `communicate()` await.  Without a cleanup path keyed on cancellation the child
     is orphaned — never killed, never reaped.
+
+    Central mechanism under test: `_kill` actually terminating and reaping an OS
+    process. A `MagicMock` standing in for the process would let a `kill()`
+    assertion pass even if `_kill` never issued a real termination, so this test
+    substitutes a real long-lived child (`sleep 100`) for the (mocked-away)
+    sandboxed claude invocation and asserts on *its* real exit status.
     """
-    proc = _fake_proc(stdout=b"", exhausts_wait=True)
+    real_create_subprocess_exec = asyncio.create_subprocess_exec
+    spawned: list[asyncio.subprocess.Process] = []
+
+    async def _spawn_real_child(
+        *_argv: str, **kwargs: Any
+    ) -> asyncio.subprocess.Process:
+        # Ignore the bwrap+claude argv the caller built and spawn a real, long-lived
+        # process instead, so the cancellation path's kill()/wait() exercise actual
+        # OS process semantics rather than a mock's recorded call.
+        proc = await real_create_subprocess_exec(
+            "sleep",
+            "100",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        spawned.append(proc)
+        return proc
 
     with patch(
         "heimdall.lens._resolve_bwrap", return_value="/usr/bin/bwrap"
     ), patch(
         "heimdall.lens.asyncio.create_subprocess_exec",
-        new=AsyncMock(return_value=proc),
+        new=AsyncMock(side_effect=_spawn_real_child),
     ):
         task = asyncio.ensure_future(
             run_claude_subprocess(
                 ["claude", "-p"], timeout_seconds=900, token_cap=400_000, cwd="/srv/seed"
             )
         )
-        await asyncio.sleep(0)  # let the task reach the communicate() await
+        await asyncio.sleep(0.05)  # let the task spawn the child and reach communicate()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    proc.kill.assert_called_once()
-    proc.wait.assert_awaited_once()
+    assert len(spawned) == 1
+    proc = spawned[0]
+    # The real child was actually killed (SIGKILL, a negative returncode) and reaped
+    # (returncode is set at all -- a leaked/orphaned child would leave it None since
+    # nothing would have awaited its exit).
+    assert proc.returncode is not None
+    assert proc.returncode < 0
 
 
 @pytest.mark.asyncio
