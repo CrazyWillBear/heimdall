@@ -905,7 +905,12 @@ async def test_run_synthesis_with_real_invoker_runs_sandboxed_not_crashes() -> N
         "result": json.dumps({"findings": []}),
         "usage": {"input_tokens": 1, "output_tokens": 1},
     }
-    proc.communicate = AsyncMock(return_value=(json.dumps(envelope).encode(), b""))
+    # run_claude_subprocess reads stdout/stderr incrementally rather than via
+    # communicate(), so the fake reader yields the payload once, then EOF.
+    proc.stdout = MagicMock()
+    proc.stdout.read = AsyncMock(side_effect=[json.dumps(envelope).encode(), b""])
+    proc.stderr = MagicMock()
+    proc.stderr.read = AsyncMock(side_effect=[b"", b""])
     spawn = AsyncMock(return_value=proc)
 
     with patch(

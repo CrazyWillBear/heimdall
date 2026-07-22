@@ -19,11 +19,36 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from heimdall.lens import (
+    LensOutputCapError,
     LensTimeoutError,
     LensTokenCapError,
     parse_findings,
     run_claude_subprocess,
 )
+
+
+class _FakeStreamReader:
+    """Minimal stand-in for ``asyncio.StreamReader``: chunked ``read()`` + EOF.
+
+    ``run_claude_subprocess`` reads stdout/stderr incrementally (not via
+    ``communicate()``) so the byte cap can be enforced mid-read; this fake feeds
+    the given payload back in fixed-size chunks, or blocks forever when
+    ``hangs`` is set (simulating a stalled/never-closing pipe).
+    """
+
+    def __init__(self, data: bytes, *, chunk_size: int = 4096, hangs: bool = False) -> None:
+        self._data = data
+        self._offset = 0
+        self._chunk_size = chunk_size
+        self._hangs = hangs
+
+    async def read(self, n: int = -1) -> bytes:
+        if self._hangs and self._offset >= len(self._data):
+            await asyncio.Event().wait()  # blocks forever past the fed payload
+        size = self._chunk_size if n < 0 else min(n, self._chunk_size)
+        chunk = self._data[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
 
 
 def _fake_proc(
@@ -33,10 +58,10 @@ def _fake_proc(
     returncode: int = 0,
     stderr: bytes = b"",
 ) -> MagicMock:
-    """Build a fake asyncio subprocess.
+    """Build a fake asyncio subprocess with streaming stdout/stderr readers.
 
-    When ``exhausts_wait`` is True, communicate() never returns (simulating a
-    hung claude run) so wait_for must time out.  ``returncode``/``stderr`` drive the
+    When ``exhausts_wait`` is True, stdout never reaches EOF (simulating a hung
+    claude run) so wait_for must time out.  ``returncode``/``stderr`` drive the
     failure-diagnostic path (a non-zero exit or an error written to stderr).
 
     Mirrors real subprocess semantics: ``returncode`` is ``None`` while the process
@@ -52,15 +77,8 @@ def _fake_proc(
 
     proc.kill = MagicMock(side_effect=_kill)
     proc.wait = AsyncMock()
-
-    if exhausts_wait:
-        async def _never() -> tuple[bytes, bytes]:
-            await asyncio.Event().wait()  # blocks forever
-            return b"", b""
-
-        proc.communicate = _never
-    else:
-        proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    proc.stdout = _FakeStreamReader(stdout, hangs=exhausts_wait)
+    proc.stderr = _FakeStreamReader(stderr)
     return proc
 
 
@@ -308,6 +326,36 @@ async def test_subprocess_logs_returncode_and_stderr_on_failed_run(
     assert result.total_tokens == 0
     assert "529 overloaded_error" in caplog.text
     assert "exit 1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_subprocess_killed_when_stdout_exceeds_byte_cap() -> None:
+    """A child streaming past the byte ceiling is killed, not buffered unbounded.
+
+    Regression for the runaway-transcript risk: proc.communicate() would hold the
+    child's entire stdout in memory before the token cap is ever checked.  Feed a
+    stream that hangs after emitting well past a tiny cap; the process must be
+    killed as soon as the ceiling is crossed rather than blocking forever waiting
+    for EOF.
+    """
+    stdout = b"x" * 10_000
+    proc = _fake_proc(stdout=stdout, exhausts_wait=True)
+
+    with patch(
+        "heimdall.lens._resolve_bwrap", return_value="/usr/bin/bwrap"
+    ), patch(
+        "heimdall.lens.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=proc),
+    ), pytest.raises(LensOutputCapError):
+        await run_claude_subprocess(
+            ["claude", "-p"],
+            timeout_seconds=900,
+            token_cap=400_000,
+            cwd="/srv/seed",
+            output_byte_cap=1_000,
+        )
+
+    proc.kill.assert_called_once()
 
 
 @pytest.mark.asyncio
