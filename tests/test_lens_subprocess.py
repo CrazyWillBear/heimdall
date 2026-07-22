@@ -38,10 +38,19 @@ def _fake_proc(
     When ``exhausts_wait`` is True, communicate() never returns (simulating a
     hung claude run) so wait_for must time out.  ``returncode``/``stderr`` drive the
     failure-diagnostic path (a non-zero exit or an error written to stderr).
+
+    Mirrors real subprocess semantics: ``returncode`` is ``None`` while the process
+    is still running (the ``exhausts_wait`` case, until something kills it) and only
+    becomes non-``None`` once it has actually exited — killing it sets it, same as
+    asyncio's real process-reaping does.
     """
     proc = MagicMock()
-    proc.returncode = returncode
-    proc.kill = MagicMock()
+    proc.returncode = None if exhausts_wait else returncode
+
+    def _kill(*, _proc: MagicMock = proc) -> None:
+        _proc.returncode = -9  # SIGKILL, once the process has actually exited
+
+    proc.kill = MagicMock(side_effect=_kill)
     proc.wait = AsyncMock()
 
     if exhausts_wait:
@@ -185,6 +194,65 @@ async def test_subprocess_killed_on_wall_clock_timeout() -> None:
         )
 
     proc.kill.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_subprocess_killed_on_outer_cancellation() -> None:
+    """Cancelling the awaiting task mid-communicate() still kills + reaps the child.
+
+    This is the outer-timeout case: `_run_pipeline_with_retry` wraps the whole
+    pipeline in its own `asyncio.wait_for`, so when *that* budget expires first, a
+    `CancelledError` (not our `TimeoutError`) lands inside the suspended
+    `communicate()` await.  Without a cleanup path keyed on cancellation the child
+    is orphaned — never killed, never reaped.
+
+    Central mechanism under test: `_kill` actually terminating and reaping an OS
+    process. A `MagicMock` standing in for the process would let a `kill()`
+    assertion pass even if `_kill` never issued a real termination, so this test
+    substitutes a real long-lived child (`sleep 100`) for the (mocked-away)
+    sandboxed claude invocation and asserts on *its* real exit status.
+    """
+    real_create_subprocess_exec = asyncio.create_subprocess_exec
+    spawned: list[asyncio.subprocess.Process] = []
+
+    async def _spawn_real_child(
+        *_argv: str, **kwargs: Any
+    ) -> asyncio.subprocess.Process:
+        # Ignore the bwrap+claude argv the caller built and spawn a real, long-lived
+        # process instead, so the cancellation path's kill()/wait() exercise actual
+        # OS process semantics rather than a mock's recorded call.
+        proc = await real_create_subprocess_exec(
+            "sleep",
+            "100",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        spawned.append(proc)
+        return proc
+
+    with patch(
+        "heimdall.lens._resolve_bwrap", return_value="/usr/bin/bwrap"
+    ), patch(
+        "heimdall.lens.asyncio.create_subprocess_exec",
+        new=AsyncMock(side_effect=_spawn_real_child),
+    ):
+        task = asyncio.ensure_future(
+            run_claude_subprocess(
+                ["claude", "-p"], timeout_seconds=900, token_cap=400_000, cwd="/srv/seed"
+            )
+        )
+        await asyncio.sleep(0.05)  # let the task spawn the child and reach communicate()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert len(spawned) == 1
+    proc = spawned[0]
+    # The real child was actually killed (SIGKILL, a negative returncode) and reaped
+    # (returncode is set at all -- a leaked/orphaned child would leave it None since
+    # nothing would have awaited its exit).
+    assert proc.returncode is not None
+    assert proc.returncode < 0
 
 
 @pytest.mark.asyncio
