@@ -126,6 +126,27 @@ async def test_signal_job_is_returned_as_stale(signal_action: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_find_pending_jobs_excludes_none_job_id() -> None:
+    """A queued JobDef with job_id=None is excluded from the returned pending jobs.
+
+    arq's JobDef contract guarantees a concrete job_id for anything actually queued,
+    but nothing in find_pending_jobs' own logic enforces that — this pins the guard
+    that filters out job_id is None so a refactor that drops or inverts it fails loud.
+    """
+    none_id_job = _queued_job("real-jid")
+    none_id_job.job_id = None
+
+    mock_pool = AsyncMock()
+    mock_pool.queued_jobs = AsyncMock(
+        return_value=[none_id_job, _queued_job("real-jid")]
+    )
+
+    found = await find_pending_jobs(mock_pool, repo_full_name="owner/repo", pr_number=7)
+
+    assert [job.job_id for job in found] == ["real-jid"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("signal_action", ["ready_for_review", "review_requested"])
 async def test_pending_signal_promotes_incoming_sync(
     job: ReviewJob, signal_action: str
