@@ -61,6 +61,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_TOKEN_CAP = 400_000
 # Generous wall-clock timeout; a lens that runs longer is killed.
 DEFAULT_TIMEOUT_SECONDS = 1_800.0
+# Hard ceiling on each of stdout/stderr, read incrementally rather than buffered
+# whole (see run_claude_subprocess): bounds worker memory against a runaway or
+# injection-nudged transcript.  The token cap (checked only once the full output
+# is in hand) loosely bounds this in practice; this is defence in depth ahead of
+# it, sized generously above any real --output-format json envelope.
+DEFAULT_OUTPUT_BYTE_CAP = 50_000_000
+# Chunk size for the incremental stdout/stderr reads below.
+_STREAM_READ_CHUNK_BYTES = 65_536
 # How much of a failed claude run's stderr to keep in the diagnostic log line.
 _STDERR_LOG_TAIL_CHARS = 2_000
 
@@ -229,6 +237,15 @@ class LensTimeoutError(LensError):
 
 class LensTokenCapError(LensError):
     """Raised when a lens run exceeds the cumulative-token cap and is killed."""
+
+
+class LensOutputCapError(LensError):
+    """Raised when a lens run's stdout or stderr exceeds the byte ceiling and is killed.
+
+    Enforced incrementally while the stream is read (not after buffering it whole)
+    so a runaway or injection-nudged transcript can't grow worker memory unbounded
+    while waiting for the token cap to be checked.
+    """
 
 
 class LensOutputError(LensError):
@@ -1057,6 +1074,39 @@ async def _kill(proc: asyncio.subprocess.Process) -> None:
         await proc.wait()
 
 
+async def _read_stream_capped(
+    proc: asyncio.subprocess.Process,
+    stream: asyncio.StreamReader,
+    *,
+    cap_bytes: int,
+    label: str,
+) -> bytes:
+    """Read ``stream`` incrementally, killing ``proc`` and raising past ``cap_bytes``.
+
+    Reads in fixed-size chunks instead of ``communicate()``'s single unbounded
+    buffer-the-whole-thing read, so a runaway transcript is caught — and the child
+    killed — the moment the ceiling is crossed rather than only after it is fully
+    resident in memory.  Killing ``proc`` here (rather than only in the caller)
+    closes both pipes immediately, so a sibling read of the other stream (stdout
+    vs stderr) hits EOF and returns instead of blocking on a still-open pipe.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await stream.read(_STREAM_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > cap_bytes:
+            await _kill(proc)
+            raise LensOutputCapError(
+                f"claude subprocess {label} exceeded {cap_bytes} byte cap; "
+                "killed to bound worker memory"
+            )
+    return b"".join(chunks)
+
+
 # Env vars the claude child always needs: PATH to find node/claude, HOME for its
 # ~/.claude config, ANTHROPIC_API_KEY to authenticate.  Everything else (incl. the
 # App private key and webhook secret) is stripped so a prompt-injected PR cannot read
@@ -1321,6 +1371,7 @@ async def run_claude_subprocess(
     env_passthrough: Sequence[str] = (),
     bwrap_binary: str = DEFAULT_BWRAP_BINARY,
     sandbox_extra_read_only_binds: Sequence[str] = (),
+    output_byte_cap: int = DEFAULT_OUTPUT_BYTE_CAP,
 ) -> ClaudeResult:
     """Default invoker: spawn claude in a bwrap sandbox, enforce timeout + token cap.
 
@@ -1333,9 +1384,15 @@ async def run_claude_subprocess(
     no claude process is ever spawned unsandboxed.
 
     The subprocess is spawned with no shell and is killed (and the failure raised) when
-    the wall-clock timeout elapses or when claude's reported cumulative usage exceeds the
-    cap.  Defence in depth holds beneath the sandbox: a strict allowlisted env (see
-    :func:`_build_subprocess_env`) keeps secrets out of the child.
+    the wall-clock timeout elapses, when either stream's cumulative size crosses
+    ``output_byte_cap``, or when claude's reported cumulative usage exceeds the token
+    cap.  stdout/stderr are read incrementally in fixed-size chunks (never buffered
+    whole via ``communicate()``) so the byte ceiling bounds worker memory *while the
+    child is still running* rather than only after its entire transcript is resident —
+    defense in depth ahead of the token cap, which is checked once the (now
+    ceiling-bounded) output is fully read.  Defence in depth also holds beneath the
+    sandbox: a strict allowlisted env (see :func:`_build_subprocess_env`) keeps secrets
+    out of the child.
 
     Args:
         argv: The argument vector from :func:`build_claude_argv` (claude binary first;
@@ -1347,6 +1404,8 @@ async def run_claude_subprocess(
         bwrap_binary: Path/name of the bwrap executable (default: found on PATH).
         sandbox_extra_read_only_binds: Extra host paths to bind read-only (nonstandard
             claude/node/CA installs); each surfaces as a ``--ro-bind`` flag.
+        output_byte_cap: Byte ceiling on each of stdout/stderr; crossing it kills the
+            subprocess mid-read.
 
     Returns:
         A :class:`ClaudeResult` with stdout (claude's ``result`` text) and tokens.
@@ -1354,6 +1413,8 @@ async def run_claude_subprocess(
     Raises:
         SandboxError: The bwrap wrap could not be built (fail-closed; never spawned).
         LensTimeoutError: The run exceeded ``timeout_seconds`` (subprocess killed).
+        LensOutputCapError: stdout or stderr exceeded ``output_byte_cap`` (subprocess
+            killed mid-read, before the full transcript is ever buffered).
         LensTokenCapError: The run exceeded ``token_cap`` (subprocess killed).
     """
     # Defence in depth: cwd is required by the type, but a falsy/empty value would
@@ -1379,15 +1440,41 @@ async def run_claude_subprocess(
         cwd=cwd,
         env=_build_subprocess_env(env_passthrough),
     )
+    assert proc.stdout is not None  # noqa: S101 - PIPE above guarantees a reader
+    assert proc.stderr is not None  # noqa: S101 - PIPE above guarantees a reader
     try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout_seconds
+        # return_exceptions=True lets both reads run to completion (rather than
+        # gather dropping the sibling read the moment one side raises), so a
+        # LensOutputCapError from one stream is never left racing an unreaped read
+        # of the other.  Killing proc inside _read_stream_capped closes both pipes,
+        # so the sibling read hits EOF (or its own cap) almost immediately either way.
+        results: tuple[bytes | BaseException, bytes | BaseException] = await asyncio.wait_for(
+            asyncio.gather(
+                _read_stream_capped(
+                    proc, proc.stdout, cap_bytes=output_byte_cap, label="stdout"
+                ),
+                _read_stream_capped(
+                    proc, proc.stderr, cap_bytes=output_byte_cap, label="stderr"
+                ),
+                return_exceptions=True,
+            ),
+            timeout=timeout_seconds,
         )
     except TimeoutError as exc:
         await _kill(proc)
         raise LensTimeoutError(
             f"Lens run exceeded {timeout_seconds}s wall-clock; subprocess killed"
         ) from exc
+
+    stdout_result, stderr_result = results
+    if isinstance(stdout_result, BaseException):
+        raise stdout_result
+    if isinstance(stderr_result, BaseException):
+        raise stderr_result
+    stdout_bytes, stderr_bytes = stdout_result, stderr_result
+    # communicate() reaps the child once both pipes are drained; the incremental
+    # reads above don't, so do it explicitly to set the real returncode below.
+    await proc.wait()
 
     envelope = _parse_envelope(stdout_bytes)
     total_tokens = _sum_tokens(envelope)

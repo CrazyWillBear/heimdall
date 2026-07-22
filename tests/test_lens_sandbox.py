@@ -30,6 +30,18 @@ from heimdall.lens import (
 _FAKE_BWRAP = "/usr/bin/bwrap"
 
 
+def _fake_stream(data: bytes) -> MagicMock:
+    """Build a stand-in ``asyncio.StreamReader``: one chunk, then EOF.
+
+    run_claude_subprocess reads stdout/stderr incrementally rather than via
+    communicate(), so tests feed a reader whose read() yields the payload once
+    and empty bytes (EOF) after.
+    """
+    reader = MagicMock()
+    reader.read = AsyncMock(side_effect=[data, b""])
+    return reader
+
+
 def test_sandbox_error_is_an_infra_fault_not_a_lens_error() -> None:
     """SandboxError is a distinct infra/deploy fault, NOT a per-lens LensError.
 
@@ -128,18 +140,20 @@ async def test_subprocess_spawns_bwrap_prefixed_argv() -> None:
     """run_claude_subprocess spawns bwrap-prefixed argv with the seed-only bind set."""
     captured: dict[str, object] = {}
 
-    async def _fake_exec(*argv: str, **kwargs: object) -> MagicMock:
+    async def _fake_spawn(*argv: str, **kwargs: object) -> MagicMock:
         captured["argv"] = list(argv)
         captured["cwd"] = kwargs.get("cwd")
         proc = MagicMock()
+        proc.returncode = 0
         proc.kill = MagicMock()
         proc.wait = AsyncMock()
-        proc.communicate = AsyncMock(return_value=(b'{"result": "{}"}', b""))
+        proc.stdout = _fake_stream(b'{"result": "{}"}')
+        proc.stderr = _fake_stream(b"")
         return proc
 
     claude_argv = ["/real/claude", "-p", "review", "--add-dir", SANDBOX_WORKSPACE_PATH]
     with _patch_bwrap_found(), patch(
-        "heimdall.lens.asyncio.create_subprocess_exec", new=_fake_exec
+        "heimdall.lens.asyncio.create_subprocess_exec", new=_fake_spawn
     ):
         await run_claude_subprocess(
             claude_argv,
