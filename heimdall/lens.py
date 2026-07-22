@@ -1291,6 +1291,17 @@ def build_bwrap_prefix(
     for path in _dedup(_claude_home(), *extra_read_only_binds):
         prefix += ["--ro-bind", path, path]
 
+    # Defence-in-depth (review of #89): the read allowlist already denies the child
+    # any read of ~/.claude/.credentials.json, but the child authenticates via
+    # ANTHROPIC_API_KEY and never needs that OAuth token file, so mask it with
+    # /dev/null — stacked ON TOP of the ~/.claude bind above — to keep the token out
+    # of the sandbox filesystem entirely, so an allowlist gap can't surrender the
+    # OAuth token on top of the API key. Added only when the file exists on the host:
+    # bwrap cannot create a mountpoint for a missing target under a read-only bind.
+    creds_file = str(Path(_claude_home()) / ".credentials.json")
+    if os.path.exists(creds_file):
+        prefix += ["--ro-bind", "/dev/null", creds_file]
+
     prefix += [
         "--tmpfs",
         "/tmp",  # noqa: S108 - in-sandbox tmpfs, not a host temp path
