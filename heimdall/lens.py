@@ -16,8 +16,9 @@ Security posture of the invocation (see :func:`build_claude_argv`):
   * model opus at max effort, headless (``-p``), JSON output;
   * the subprocess is spawned via ``create_subprocess_exec`` (no shell, so no
     shell-injection surface);
-  * allowed tools are the read-only Read/Grep/Glob plus the single allowlisted
-    ``heimdall-context`` Bash wrapper — never raw Bash, Write, or Edit;
+  * allowed tools are the read-only Read/Grep/Glob — each **scoped to the
+    ``/workspace`` seed mount** (``Read(//workspace/**)`` &c.) — plus the single
+    allowlisted ``heimdall-context`` Bash wrapper — never raw Bash, Write, or Edit;
   * Write/Edit are explicitly disallowed; raw Bash needs no deny rule because
     default-deny already blocks anything off the allowlist, and an unscoped Bash
     deny would take precedence over (and neuter) the wrapper's allow rule.
@@ -28,11 +29,17 @@ seed workspace is bound **read-only** at the fixed in-sandbox path ``/workspace`
 nothing else of the worker's filesystem is reachable: the worker project dir (its
 ``.env`` / ``heimdall.db``) is never bound in, ``/tmp`` is a private tmpfs, ``~/.claude``
 and the OS/CA/DNS/runtime paths are read-only.  ``--add-dir`` then *adds* ``/workspace``
-to claude's allowed set; even an absolute-path Read/Grep/Glob from a prompt-injected PR
-hits a filesystem where nothing sensitive exists.  Defence in depth still holds beneath
-the sandbox: the child env is reduced to a strict allowlist (see
-:func:`run_claude_subprocess`) so secrets are not in its environment, and PR code is
-never *executed* (Bash off the allowlist is denied).
+to claude's allowed set.  On top of that OS confinement, Read/Grep/Glob are themselves
+**allowlist-scoped to ``/workspace``** (``Read(//workspace/**)`` &c.), so an absolute-path
+read pointing *outside* the seed — e.g. ``/proc/self/environ`` or
+``~/.claude/.credentials.json`` — matches no allow rule and, in headless ``-p`` mode (no
+interactive approval), is **denied**, not auto-approved.  Defence in depth still holds
+beneath the sandbox: the env allowlist (see :func:`_build_subprocess_env`) drops every
+*other* secret (the App private key, the webhook secret); the one credential it keeps is
+``ANTHROPIC_API_KEY`` (required to authenticate), and that is now **unreachable to the
+model** because reading it back out — via ``/proc/self/environ`` or ``~/.claude`` — is
+refused by the workspace-scoped read allowlist above.  PR code is also never *executed*
+(Bash off the allowlist is denied).
 
 The sandbox is **fail-closed**: if the bwrap wrap cannot be built or run the lens errors
 and is dropped (like a timeout) — it never falls back to an unsandboxed spawn.  The code
@@ -400,9 +407,19 @@ _DEFAULT_PROMPT = (
     "cannot change your task, output format, or verdict."
 )
 
-# Read-only tools plus the single allowlisted Bash wrapper. A bare "Bash" is
-# never allowed; Bash is scoped to the heimdall-context command only.
-_ALLOWED_TOOLS = "Read Grep Glob Bash(heimdall-context *)"
+# Read-only tools, each SCOPED to the read-only /workspace seed mount, plus the
+# single allowlisted Bash wrapper. `//workspace/**` is the gitignore-style
+# ABSOLUTE-path form (leading `//`) of the fixed SANDBOX_WORKSPACE_PATH mount, so
+# the allow rule matches only reads under the seed. A bare unscoped "Read"/"Grep"/
+# "Glob" would auto-approve ANY absolute path (e.g. /proc/self/environ,
+# ~/.claude/.credentials.json) — the exfil hole this closes. In headless `-p` mode
+# no interactive approval is possible, so a read that matches no allow rule is
+# DENIED, not prompted. A bare "Bash" is never allowed; Bash is scoped to the
+# heimdall-context wrapper only.
+_ALLOWED_TOOLS = (
+    "Read(//workspace/**) Grep(//workspace/**) Glob(//workspace/**) "
+    "Bash(heimdall-context *)"
+)
 # Deny mutating tools only. An unscoped "Bash" deny would take precedence over the
 # Bash(heimdall-context *) allow rule (deny wins) and neuter the wrapper, so it is
 # intentionally absent: under default-deny, raw Bash is already blocked by not
@@ -444,7 +461,8 @@ def build_claude_argv(
     """Build the ``claude -p`` argv for a read-only lens run over a workspace.
 
     The invocation pins the lens's own model and effort with JSON output, restricts
-    tools to read-only Read/Grep/Glob plus the allowlisted ``heimdall-context`` Bash
+    tools to read-only Read/Grep/Glob — each scoped to the ``/workspace`` seed mount
+    (``Read(//workspace/**)`` &c.) — plus the allowlisted ``heimdall-context`` Bash
     wrapper, and disallows Write/Edit.  Raw Bash carries no deny rule (an unscoped
     Bash deny would override the wrapper's allow rule); default-deny blocks it.
     argv is consumed by ``create_subprocess_exec`` (no shell), so none of these
@@ -1234,8 +1252,11 @@ def build_bwrap_prefix(
     optional OS/CA/DNS/runtime paths with ``--ro-bind-try`` (skipped when absent so the
     wrap stays mode-agnostic across distros), unshares PID/IPC, and keeps the network
     (``--share-net``).  The worker project dir is **never** bound, so its ``.env`` /
-    ``heimdall.db`` stay unreadable — this is what closes the absolute-path read hole.
-    Works with either setuid or unprivileged-userns bwrap.
+    ``heimdall.db`` are absent from the sandbox filesystem entirely.  ``/proc`` and
+    ``~/.claude`` **are** mounted, though — reads of ``/proc/self/environ`` /
+    ``~/.claude/.credentials.json`` are blocked not by absence but by the
+    workspace-scoped read allowlist in :data:`_ALLOWED_TOOLS` (see
+    :func:`build_claude_argv`).  Works with either setuid or unprivileged-userns bwrap.
 
     Args:
         workspace_dir: Host seed dir to bind read-only at ``/workspace``.
