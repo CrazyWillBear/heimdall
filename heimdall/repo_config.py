@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
@@ -33,6 +34,7 @@ from heimdall.lens import (
     CLEANLINESS_LENS,
     DESIGN_LENS,
     SECURITY_LENS,
+    SYNTHESIS_LENS,
     LensSpec,
     Severity,
 )
@@ -113,6 +115,52 @@ class CustomLensConfig(BaseModel):
     system_prompt: str
     model: str = "sonnet"
     effort: str = "high"
+
+
+class SynthesisConfig(BaseModel):
+    """Per-repo override of the synthesis pass's Claude model/effort.
+
+    Only ``model`` and ``effort`` are exposed.  The synthesis pass cannot be disabled
+    (it is the single dedup / suppression / verdict authority — dropping it would leave
+    no reviewed output) and it takes no repo-supplied prompt: a custom synthesis prompt
+    could instruct it to suppress every finding, so its built-in system prompt is fixed.
+    Model and effort only tune the reasoning tier, so they carry no injection surface.
+
+    Attributes:
+        model: Overrides the synthesis pass's default Claude model when set.
+        effort: Overrides the synthesis pass's default reasoning effort when set.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    model: str | None = None
+    effort: str | None = None
+
+
+class ResourceLimits(BaseModel):
+    """Per-repo overrides of the operator's resource ceilings (env :class:`Settings`).
+
+    Each knob mirrors the same-named field in :class:`heimdall.config.Settings`.  A repo
+    may only TIGHTEN a limit: :func:`effective_limits` caps every override at the
+    operator's value, so a repo can ask for cheaper/faster reviews but can never raise a
+    ceiling to abuse the operator's compute.  An absent knob leaves the operator value
+    untouched.  Values must be positive; the clamp against the operator ceiling is applied
+    at use, not here, because the ceiling is a runtime service setting.
+
+    Attributes:
+        token_cap: Per-lens cumulative-token cap; clamped down to the operator's
+            ``lens_token_cap``.
+        lens_timeout_seconds: Per-lens wall-clock timeout; clamped down to the operator's
+            ``lens_timeout_seconds``.
+        review_timeout_seconds: Per-review wall-clock timeout across the whole pipeline;
+            clamped down to the operator's ``review_timeout_seconds``.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    token_cap: int | None = Field(default=None, gt=0)
+    lens_timeout_seconds: float | None = Field(default=None, gt=0)
+    review_timeout_seconds: float | None = Field(default=None, gt=0)
 
 
 class ScopeFilters(BaseModel):
@@ -250,6 +298,10 @@ class RepoConfig(BaseModel):
             Lenses absent from the map keep their built-in defaults.
         custom_lenses: User-defined lenses that run alongside the built-ins and whose
             findings reach synthesis tagged by their name.
+        synthesis: Per-repo override of the synthesis pass's model/effort (only — the
+            pass can't be disabled and takes no repo prompt).  See :func:`tuned_synthesis`.
+        limits: Per-repo resource-limit overrides (token cap, per-lens timeout, per-review
+            timeout) that may only TIGHTEN the operator ceilings; see :func:`effective_limits`.
         severity_threshold: The lowest severity that blocks the PR
             (REQUEST_CHANGES); findings below it only comment.
         scope: Scope filters deciding whether the PR is reviewed at all.
@@ -269,6 +321,8 @@ class RepoConfig(BaseModel):
 
     lenses: dict[str, LensConfig] = Field(default_factory=dict)
     custom_lenses: list[CustomLensConfig] = Field(default_factory=list)
+    synthesis: SynthesisConfig = Field(default_factory=SynthesisConfig)
+    limits: ResourceLimits = Field(default_factory=ResourceLimits)
     severity_threshold: Severity = Severity.HIGH
     scope: ScopeFilters = Field(default_factory=ScopeFilters)
     caps: GuardrailCaps = Field(default_factory=GuardrailCaps)
@@ -549,6 +603,89 @@ def tuned_lenses(config: RepoConfig) -> tuple[LensSpec, ...]:
             )
         )
     return tuple(tuned)
+
+
+def tuned_synthesis(config: RepoConfig) -> LensSpec:
+    """Return the synthesis :class:`LensSpec` with the repo's model/effort override.
+
+    Only ``model``/``effort`` are taken from ``config.synthesis``; the built-in synthesis
+    system prompt is preserved verbatim (a repo cannot supply synthesis prompt text — see
+    :class:`SynthesisConfig`).  An unset override keeps the built-in default.
+
+    Args:
+        config: The repo configuration.
+
+    Returns:
+        The synthesis lens spec, model/effort tuned to the config.
+    """
+    synth = config.synthesis
+    return LensSpec(
+        name=SYNTHESIS_LENS.name,
+        system_prompt=SYNTHESIS_LENS.system_prompt,
+        model=synth.model or SYNTHESIS_LENS.model,
+        effort=synth.effort or SYNTHESIS_LENS.effort,
+    )
+
+
+@dataclass(frozen=True)
+class EffectiveLimits:
+    """The resource limits actually applied to a review after the repo/operator clamp.
+
+    Produced by :func:`effective_limits`: each field is the repo override capped at the
+    operator's ceiling (repo may tighten, never loosen), or the operator value when the
+    repo set no override.
+
+    Attributes:
+        token_cap: Per-lens cumulative-token cap in effect.
+        lens_timeout_seconds: Per-lens wall-clock timeout in effect.
+        review_timeout_seconds: Per-review wall-clock timeout in effect.
+    """
+
+    token_cap: int
+    lens_timeout_seconds: float
+    review_timeout_seconds: float
+
+
+def effective_limits(
+    config: RepoConfig,
+    *,
+    token_cap: int,
+    lens_timeout_seconds: float,
+    review_timeout_seconds: float,
+) -> EffectiveLimits:
+    """Clamp the repo's resource-limit overrides against the operator ceilings.
+
+    A repo may only TIGHTEN a limit: an override above the operator's value is capped
+    down to it (``min``), and an absent override leaves the operator value.  This is the
+    single enforcement point that keeps a repo from raising a ceiling to abuse the
+    operator's compute — the trust ref already prevents a fork from setting these, and
+    the clamp bounds even a trusted repo.
+
+    Args:
+        config: The repo configuration (its ``limits`` block).
+        token_cap: The operator's per-lens token-cap ceiling.
+        lens_timeout_seconds: The operator's per-lens timeout ceiling.
+        review_timeout_seconds: The operator's per-review timeout ceiling.
+
+    Returns:
+        The clamped :class:`EffectiveLimits` to apply to this review.
+    """
+    limits = config.limits
+    return EffectiveLimits(
+        token_cap=(
+            token_cap if limits.token_cap is None else min(limits.token_cap, token_cap)
+        ),
+        lens_timeout_seconds=(
+            lens_timeout_seconds
+            if limits.lens_timeout_seconds is None
+            else min(limits.lens_timeout_seconds, lens_timeout_seconds)
+        ),
+        review_timeout_seconds=(
+            review_timeout_seconds
+            if limits.review_timeout_seconds is None
+            else min(limits.review_timeout_seconds, review_timeout_seconds)
+        ),
+    )
 
 
 # Severities ordered low-to-high so a threshold maps to "this severity and worse".

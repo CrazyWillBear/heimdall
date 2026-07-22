@@ -39,6 +39,21 @@ custom_lenses:                    # user-defined lenses that run alongside the b
     model: sonnet                 # optional. Default: sonnet
     effort: high                  # optional. Default: high
 
+synthesis:                        # the final dedup/verdict pass — model/effort only
+  model: opus                     # override the synthesis model (else built-in: opus)
+  effort: max                     # override the synthesis effort (else built-in: max)
+                                  # NOTE: no prompt/enable knob — synthesis can't be
+                                  # disabled and takes no repo prompt (injection guard).
+
+limits:                           # per-repo resource overrides — TIGHTEN-ONLY.
+  token_cap: 400000               # per-lens cumulative-token cap; clamped DOWN to the
+                                  # operator's LENS_TOKEN_CAP (a repo may lower, never raise).
+  lens_timeout_seconds: 1800      # per-lens wall-clock timeout; clamped down to the
+                                  # operator's LENS_TIMEOUT_SECONDS.
+  review_timeout_seconds: 2400    # per-review wall-clock timeout across the whole pipeline;
+                                  # clamped down to the operator's REVIEW_TIMEOUT_SECONDS.
+                                  # An unset knob leaves the operator value. All must be > 0.
+
 scope:                            # filters that skip the PR entirely
   base_branches: []               # allowlist of base branches; empty = any. Default: []
   paths: []                       # fnmatch allowlist of changed paths; empty = any. Default: []
@@ -74,6 +89,8 @@ comments:                         # fold PR discussion into the review seed
 | -------------------- | -------------------------- | ------- | ------------------------------------------------------------------- |
 | `lenses`             | map of name → lens config  | `{}`    | Per-built-in-lens overrides; absent lenses keep their defaults.     |
 | `custom_lenses`      | list of custom lenses      | `[]`    | User-defined lenses that run alongside the built-ins.               |
+| `synthesis`          | synthesis override         | all defaults | Model/effort of the final dedup/verdict pass (model/effort only). |
+| `limits`             | resource overrides         | all defaults | Tighten-only per-repo caps on tokens/timeouts (clamped to operator ceilings). |
 | `severity_threshold` | `critical`/`high`/`medium`/`low` | `high` | Lowest severity that blocks (REQUEST_CHANGES); below it comments. |
 | `scope`              | scope filters              | all defaults | Whether the PR is reviewed at all.                             |
 | `caps`               | guardrail caps             | all defaults | Resource ceilings on review work.                             |
@@ -105,6 +122,29 @@ inject a custom-lens prompt.
 
 A custom-lens `name` that shadows a built-in (`security` / `design` / `cleanliness`) or
 duplicates another custom lens is **rejected at load time**.
+
+**Synthesis override (`synthesis`, `SynthesisConfig`)** — tunes the final dedup/verdict pass.
+Only `model`/`effort` are exposed: the pass **cannot be disabled** (it is the single
+dedup/suppression/verdict authority) and takes **no repo-supplied prompt** — a custom synthesis
+prompt could tell it to suppress every finding, so its system prompt is fixed. An unknown key
+(e.g. `system_prompt`) is rejected at load.
+
+| Field    | Type   | Default | Meaning                                              |
+| -------- | ------ | ------- | ---------------------------------------------------- |
+| `model`  | string | unset (built-in `opus`) | Overrides the synthesis pass's Claude model.   |
+| `effort` | string | unset (built-in `max`)  | Overrides the synthesis pass's reasoning effort. |
+
+**Resource limits (`limits`, `ResourceLimits`)** — per-repo overrides of the operator's env
+ceilings. **Tighten-only**: each override is clamped down to the operator's value (`min`), so a
+repo may ask for cheaper/faster reviews but can never raise a ceiling to abuse the operator's
+compute. An absent knob leaves the operator value; all values must be `> 0`. (Forks already read
+config from the base ref, and the clamp bounds even a trusted repo.)
+
+| Field                    | Type  | Default | Meaning                                                          |
+| ------------------------ | ----- | ------- | ---------------------------------------------------------------- |
+| `token_cap`              | int   | unset (operator `LENS_TOKEN_CAP`) | Per-lens cumulative-token cap; clamped down to the operator value. |
+| `lens_timeout_seconds`   | float | unset (operator `LENS_TIMEOUT_SECONDS`) | Per-lens wall-clock timeout; clamped down to the operator value. |
+| `review_timeout_seconds` | float | unset (operator `REVIEW_TIMEOUT_SECONDS`) | Per-review wall-clock timeout; clamped down to the operator value. |
 
 **Scope filters (`scope`, `ScopeFilters`)** — applied in order; the first failing filter skips
 the PR (silently).

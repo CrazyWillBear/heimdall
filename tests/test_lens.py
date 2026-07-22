@@ -15,6 +15,7 @@ import pytest
 from heimdall.lens import (
     CLEANLINESS_LENS,
     DESIGN_LENS,
+    SANDBOX_WORKSPACE_PATH,
     SECURITY_LENS,
     ClaudeResult,
     Finding,
@@ -277,6 +278,33 @@ def test_argv_scopes_session_to_workspace() -> None:
     assert _WORKSPACE in argv
 
 
+def test_argv_scopes_reads_to_workspace_denying_out_of_tree() -> None:
+    """Read/Grep/Glob are allow-listed ONLY under the /workspace seed mount.
+
+    A bare unscoped Read/Grep/Glob would auto-approve any absolute path (e.g.
+    /proc/self/environ), letting a prompt-injected PR exfiltrate host secrets. The
+    allow rule must instead scope each read tool to the workspace mount, so an
+    out-of-tree absolute read matches no rule and — in headless `-p`, where no
+    approval prompt is possible — is refused.
+    """
+    argv = build_claude_argv(
+        claude_binary="claude",
+        workspace_dir=SANDBOX_WORKSPACE_PATH,
+        lens=SECURITY_LENS,
+    )
+    allowed = argv[argv.index("--allowedTools") + 1]
+    tokens = allowed.split()
+    scoped = f"//{SANDBOX_WORKSPACE_PATH.lstrip('/')}/**"  # -> //workspace/**
+    for tool in ("Read", "Grep", "Glob"):
+        # No bare, unscoped grant that would auto-approve an arbitrary abs path.
+        assert tool not in tokens
+        # Present only in the workspace-scoped form.
+        assert f"{tool}({scoped})" in allowed
+    # No allow rule whitelists an out-of-tree path like /proc/self/environ.
+    assert "/proc" not in allowed
+    assert "self/environ" not in allowed
+
+
 # ---------------------------------------------------------------------------
 # Lenses see the full PR discussion as untrusted context via the heimdall-context
 # wrapper: comments, review-threads, review-summaries, and own-prior. The payload
@@ -366,8 +394,8 @@ def test_lens_comments_payload_not_embedded_in_argv() -> None:
 def test_lens_comments_visibility_grants_no_new_tool() -> None:
     """Surfacing comments to the lenses leaves the tool allowlist unchanged.
 
-    The sandbox posture is fixed: read-only Read/Grep/Glob plus the single
-    `heimdall-context` Bash wrapper — comments ride that existing wrapper, so no
+    The sandbox posture is fixed: workspace-scoped read-only Read/Grep/Glob plus the
+    single `heimdall-context` Bash wrapper — comments ride that existing wrapper, so no
     new tool appears on the allow list.
     """
     argv = build_claude_argv(
@@ -376,7 +404,10 @@ def test_lens_comments_visibility_grants_no_new_tool() -> None:
         lens=SECURITY_LENS,
     )
     allowed = argv[argv.index("--allowedTools") + 1]
-    assert allowed == "Read Grep Glob Bash(heimdall-context *)"
+    assert allowed == (
+        "Read(//workspace/**) Grep(//workspace/**) Glob(//workspace/**) "
+        "Bash(heimdall-context *)"
+    )
 
 
 # ---------------------------------------------------------------------------

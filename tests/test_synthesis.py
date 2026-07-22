@@ -23,6 +23,7 @@ from heimdall.lens import (
     ClaudeResult,
     Finding,
     LensResult,
+    LensSpec,
     Severity,
     SuppressedFinding,
     SynthesisResult,
@@ -109,6 +110,21 @@ def test_synthesis_argv_grants_no_tools() -> None:
     allowed = argv[argv.index("--allowedTools") + 1] if "--allowedTools" in argv else ""
     for tool in ("Read", "Grep", "Glob", "Bash"):
         assert tool not in allowed
+
+
+def test_synthesis_argv_threads_tuned_synthesis_model_and_effort() -> None:
+    """A tuned synthesis spec overrides the pass's model/effort in the argv."""
+    tuned = LensSpec(
+        name=SYNTHESIS_LENS.name,
+        system_prompt=SYNTHESIS_LENS.system_prompt,
+        model="sonnet",
+        effort="high",
+    )
+    argv = build_synthesis_argv(claude_binary="claude", prompt="synthesize", synthesis=tuned)
+    assert argv[argv.index("--model") + 1] == "sonnet"
+    assert argv[argv.index("--effort") + 1] == "high"
+    # System prompt is still the built-in one — only the tier changed.
+    assert argv[argv.index("--append-system-prompt") + 1] == SYNTHESIS_LENS.system_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +239,37 @@ async def test_run_synthesis_passes_all_lens_findings_to_claude() -> None:
     assert "security" in prompt
     assert "design" in prompt
     assert "cleanliness" in prompt
+
+
+@pytest.mark.asyncio
+async def test_run_synthesis_threads_tuned_synthesis_lens_into_argv() -> None:
+    """A tuned synthesis_lens sets the model/effort of the actual synthesis call."""
+    captured: dict[str, Any] = {}
+
+    async def fake_invoker(
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
+    ) -> ClaudeResult:
+        captured["argv"] = argv
+        return ClaudeResult(stdout=json.dumps({"findings": []}), total_tokens=10)
+
+    tuned = LensSpec(
+        name=SYNTHESIS_LENS.name,
+        system_prompt=SYNTHESIS_LENS.system_prompt,
+        model="sonnet",
+        effort="high",
+    )
+    await run_synthesis(
+        lens_results=[_lens_result("security", [_finding(Severity.HIGH)])],
+        claude_binary="claude",
+        token_cap=400_000,
+        timeout_seconds=900,
+        invoker=fake_invoker,
+        synthesis_lens=tuned,
+    )
+
+    argv = captured["argv"]
+    assert argv[argv.index("--model") + 1] == "sonnet"
+    assert argv[argv.index("--effort") + 1] == "high"
 
 
 @pytest.mark.asyncio
@@ -858,7 +905,12 @@ async def test_run_synthesis_with_real_invoker_runs_sandboxed_not_crashes() -> N
         "result": json.dumps({"findings": []}),
         "usage": {"input_tokens": 1, "output_tokens": 1},
     }
-    proc.communicate = AsyncMock(return_value=(json.dumps(envelope).encode(), b""))
+    # run_claude_subprocess reads stdout/stderr incrementally rather than via
+    # communicate(), so the fake reader yields the payload once, then EOF.
+    proc.stdout = MagicMock()
+    proc.stdout.read = AsyncMock(side_effect=[json.dumps(envelope).encode(), b""])
+    proc.stderr = MagicMock()
+    proc.stderr.read = AsyncMock(side_effect=[b"", b""])
     spawn = AsyncMock(return_value=proc)
 
     with patch(

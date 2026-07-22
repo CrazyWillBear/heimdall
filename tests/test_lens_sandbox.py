@@ -30,6 +30,18 @@ from heimdall.lens import (
 _FAKE_BWRAP = "/usr/bin/bwrap"
 
 
+def _fake_stream(data: bytes) -> MagicMock:
+    """Build a stand-in ``asyncio.StreamReader``: one chunk, then EOF.
+
+    run_claude_subprocess reads stdout/stderr incrementally rather than via
+    communicate(), so tests feed a reader whose read() yields the payload once
+    and empty bytes (EOF) after.
+    """
+    reader = MagicMock()
+    reader.read = AsyncMock(side_effect=[data, b""])
+    return reader
+
+
 def test_sandbox_error_is_an_infra_fault_not_a_lens_error() -> None:
     """SandboxError is a distinct infra/deploy fault, NOT a per-lens LensError.
 
@@ -52,6 +64,15 @@ def _ro_bind_targets(argv: list[str]) -> list[str]:
         if token == "--ro-bind":
             sources.append(argv[index + 1])
     return sources
+
+
+def _ro_bind_triples(argv: list[str]) -> list[tuple[int, str, str]]:
+    """Return ``(index, source, dest)`` for every ``--ro-bind`` triple in ``argv``."""
+    triples: list[tuple[int, str, str]] = []
+    for index, token in enumerate(argv):
+        if token == "--ro-bind":
+            triples.append((index, argv[index + 1], argv[index + 2]))
+    return triples
 
 
 def test_prefix_binds_seed_readonly_at_fixed_workspace() -> None:
@@ -91,6 +112,51 @@ def test_prefix_mounts_claude_home_readonly() -> None:
     assert "/home/worker/.claude" in _ro_bind_targets(prefix)
 
 
+def test_prefix_masks_credentials_file_when_present(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """When ~/.claude/.credentials.json exists it is masked with /dev/null.
+
+    Defence-in-depth over #89: the read allowlist already denies the child any read
+    of the OAuth creds, but the child authenticates via ANTHROPIC_API_KEY and never
+    needs that file, so it is overlaid with /dev/null to keep the token out of the
+    sandbox filesystem entirely. The mask must come AFTER the ~/.claude ro-bind so it
+    stacks on top of it rather than being clobbered by it.
+    """
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    creds = str(claude_dir / ".credentials.json")
+    (claude_dir / ".credentials.json").write_text("{}")
+    with _patch_bwrap_found(), patch.dict(
+        "os.environ", {"HOME": str(tmp_path)}, clear=False
+    ):
+        prefix = build_bwrap_prefix(workspace_dir="/srv/seed")
+
+    triples = _ro_bind_triples(prefix)
+    mask = [(i, src) for i, src, dst in triples if dst == creds]
+    assert mask == [(mask[0][0], "/dev/null")], "creds file not masked with /dev/null"
+    claude_home_index = next(
+        i for i, _src, dst in triples if dst == str(claude_dir)
+    )
+    assert mask[0][0] > claude_home_index, "mask must be applied after the ~/.claude bind"
+
+
+def test_prefix_omits_credentials_mask_when_absent(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """No /dev/null mask is emitted when the creds file does not exist on the host.
+
+    bwrap cannot create a mountpoint for a missing target under a read-only bind, and
+    there is nothing to mask when the file is absent, so the mask is added only when
+    the file is present.
+    """
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    creds = str(claude_dir / ".credentials.json")
+    with _patch_bwrap_found(), patch.dict(
+        "os.environ", {"HOME": str(tmp_path)}, clear=False
+    ):
+        prefix = build_bwrap_prefix(workspace_dir="/srv/seed")
+
+    assert creds not in [dst for _i, _src, dst in _ro_bind_triples(prefix)]
+
+
 def test_prefix_never_binds_worker_project_dir(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """The worker project dir (holding .env / heimdall.db) is never bound in."""
     project_dir = str(tmp_path)
@@ -128,18 +194,20 @@ async def test_subprocess_spawns_bwrap_prefixed_argv() -> None:
     """run_claude_subprocess spawns bwrap-prefixed argv with the seed-only bind set."""
     captured: dict[str, object] = {}
 
-    async def _fake_exec(*argv: str, **kwargs: object) -> MagicMock:
+    async def _fake_spawn(*argv: str, **kwargs: object) -> MagicMock:
         captured["argv"] = list(argv)
         captured["cwd"] = kwargs.get("cwd")
         proc = MagicMock()
+        proc.returncode = 0
         proc.kill = MagicMock()
         proc.wait = AsyncMock()
-        proc.communicate = AsyncMock(return_value=(b'{"result": "{}"}', b""))
+        proc.stdout = _fake_stream(b'{"result": "{}"}')
+        proc.stderr = _fake_stream(b"")
         return proc
 
     claude_argv = ["/real/claude", "-p", "review", "--add-dir", SANDBOX_WORKSPACE_PATH]
     with _patch_bwrap_found(), patch(
-        "heimdall.lens.asyncio.create_subprocess_exec", new=_fake_exec
+        "heimdall.lens.asyncio.create_subprocess_exec", new=_fake_spawn
     ):
         await run_claude_subprocess(
             claude_argv,

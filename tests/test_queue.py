@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from arq import ArqRedis
 
 from heimdall.queue import (
     ReviewJob,
@@ -123,6 +128,27 @@ async def test_signal_job_is_returned_as_stale(signal_action: str) -> None:
     found = await find_pending_jobs(mock_pool, repo_full_name="owner/repo", pr_number=7)
 
     assert [job.job_id for job in found] == ["signal-jid"]
+
+
+@pytest.mark.asyncio
+async def test_find_pending_jobs_excludes_none_job_id() -> None:
+    """A queued JobDef with job_id=None is excluded from the returned pending jobs.
+
+    arq's JobDef contract guarantees a concrete job_id for anything actually queued,
+    but nothing in find_pending_jobs' own logic enforces that — this pins the guard
+    that filters out job_id is None so a refactor that drops or inverts it fails loud.
+    """
+    none_id_job = _queued_job("real-jid")
+    none_id_job.job_id = None
+
+    mock_pool = AsyncMock()
+    mock_pool.queued_jobs = AsyncMock(
+        return_value=[none_id_job, _queued_job("real-jid")]
+    )
+
+    found = await find_pending_jobs(mock_pool, repo_full_name="owner/repo", pr_number=7)
+
+    assert [job.job_id for job in found] == ["real-jid"]
 
 
 @pytest.mark.asyncio
@@ -278,3 +304,99 @@ async def test_legacy_job_without_action_still_cancelled() -> None:
 
     mock_pool.zrem.assert_awaited_once()
     assert "legacy-jid" in mock_pool.zrem.call_args[0]
+
+
+class _FakePool:
+    """In-process pool with faithfully shared, mutating state.
+
+    This is NOT a mock of the lock — it implements the real ``SET NX PX`` and
+    token-guarded-release contracts the lock relies on, plus a mutating queue, so two
+    concurrent ``enqueue_review`` coroutines actually observe each other's effects.
+    """
+
+    def __init__(self, initial_jobs: list[SimpleNamespace] | None = None) -> None:
+        self._jobs: list[SimpleNamespace] = list(initial_jobs or [])
+        self._store: dict[str, str] = {}  # lock keys -> token
+        self._seen_ids: set[str] = set()  # arq:job:{id} dedup markers
+
+    async def queued_jobs(self) -> list[SimpleNamespace]:
+        # Forced interleave point: yield to the event loop before returning the
+        # snapshot so a concurrent coroutine observes the pre-enqueue queue state.
+        await asyncio.sleep(0)
+        return list(self._jobs)
+
+    async def set(
+        self,
+        name: str,
+        value: str,
+        *,
+        nx: bool = False,
+        px: int | None = None,
+    ) -> bool | None:
+        # SET NX: no await inside, so acquisition is atomic vs other coroutines,
+        # mirroring real Redis. Returns None when the key is already held.
+        if nx and name in self._store:
+            return None
+        self._store[name] = value
+        return True
+
+    async def eval(self, script: str, numkeys: int, *args: str) -> int:
+        # Mirrors _RELEASE_LOCK_SCRIPT: token-guarded delete (ignores script text).
+        key, token = args[0], args[1]
+        if self._store.get(key) == token:
+            del self._store[key]
+            return 1
+        return 0
+
+    async def zrem(self, queue_name: str, job_id: str) -> None:
+        # Faithful to arq: the arq:job:{id} marker in _seen_ids survives a ZREM.
+        self._jobs = [j for j in self._jobs if j.job_id != job_id]
+
+    async def enqueue_job(
+        self, function: str, *, _job_id: str, **kwargs: object
+    ) -> SimpleNamespace | None:
+        if _job_id in self._seen_ids:
+            return None  # dedup: id already known
+        # Widen the interleave window: yield after the cancel+decide but before the
+        # append, so an unserialized concurrent caller can slip its own cancel in
+        # between (removing this job's not-yet-appended peer) and double-enqueue.
+        await asyncio.sleep(0)
+        self._seen_ids.add(_job_id)
+        self._jobs.append(SimpleNamespace(job_id=_job_id, kwargs=kwargs))
+        return SimpleNamespace(job_id=_job_id)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_pr_enqueues_serialized(job: ReviewJob) -> None:
+    """Two same-PR enqueues run concurrently and leave exactly one folded survivor.
+
+    Must FAIL on the pre-lock code: the ``queued_jobs`` interleave point lets both
+    coroutines read the same pre-enqueue snapshot, so each cancels the other's view and
+    both ``enqueue_job`` land -> two survivors. With ``_pr_lock`` serializing the
+    decide+cancel+enqueue section, the loser spins on ``SET NX`` until the winner
+    releases, then re-reads the mutated queue (winner's promoted ``review_requested`` job
+    present), folds again, cancels the winner's job, and enqueues its own -> exactly one
+    survivor carrying ``review_requested`` at one of the incoming pushes' shas.
+    """
+    signal_job = SimpleNamespace(
+        job_id="review:owner/repo:7:sha0:review_requested",
+        kwargs={
+            "repo_full_name": "owner/repo",
+            "pr_number": 7,
+            "action": "review_requested",
+        },
+    )
+    pool = _FakePool(initial_jobs=[signal_job])
+
+    sync1 = replace(job, head_sha="sha1", action="synchronize")
+    sync2 = replace(job, head_sha="sha2", action="synchronize")
+
+    arq_pool = cast(ArqRedis, pool)
+    await asyncio.gather(
+        enqueue_review(arq_pool, sync1), enqueue_review(arq_pool, sync2)
+    )
+
+    assert len(pool._jobs) == 1
+    survivor = pool._jobs[0]
+    assert survivor.kwargs["action"] == "review_requested"  # signal folded forward
+    assert survivor.kwargs["head_sha"] in {"sha1", "sha2"}  # a push won, never sha0

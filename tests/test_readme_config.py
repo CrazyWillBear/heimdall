@@ -24,7 +24,9 @@ from heimdall.repo_config import (
     GuardrailCaps,
     LensConfig,
     RepoConfig,
+    ResourceLimits,
     ScopeFilters,
+    SynthesisConfig,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -41,6 +43,8 @@ _CONFIG_MODELS = (
     RepoConfig,
     LensConfig,
     CustomLensConfig,
+    SynthesisConfig,
+    ResourceLimits,
     ScopeFilters,
     GuardrailCaps,
     CommentIncorporation,

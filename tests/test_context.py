@@ -1425,6 +1425,44 @@ async def test_assemble_pr_context_normal_files_fetched_alongside_bad() -> None:
     assert "huge.dat" not in ctx.file_contents
 
 
+@pytest.mark.asyncio
+async def test_assemble_pr_context_skips_non_base64_encoded_file() -> None:
+    """A changed file GitHub serves with a non-base64 encoding (ValueError from
+    GitHubClient.get_file_content, e.g. "none" for a >1-100MB file) is skipped
+    rather than crashing the whole assembly (issue #91)."""
+    oversize_files = [
+        {"filename": "giant.bin", "status": "modified"},
+        {"filename": "foo.py", "status": "modified"},
+    ]
+
+    def _file_content_side_effect(
+        *, repo_full_name: str, path: str, ref: str, tolerate_missing: bool = False
+    ) -> str | None:
+        if path == "giant.bin":
+            raise ValueError("unexpected content encoding 'none' for giant.bin@abc123")
+        if tolerate_missing:
+            return None  # docs not present in this test
+        return _FILE_CONTENT
+
+    mock_client = _make_mock_github_client(files=oversize_files)
+    mock_client.get_file_content = AsyncMock(side_effect=_file_content_side_effect)
+
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+
+    # Normal file is present; the review is not silently dropped.
+    assert "foo.py" in ctx.file_contents
+    assert ctx.file_contents["foo.py"] == _FILE_CONTENT
+    # The non-base64-encoded file is omitted, not raised.
+    assert "giant.bin" not in ctx.file_contents
+
+
 # ---------------------------------------------------------------------------
 # docs: populated from repo at head_sha
 # ---------------------------------------------------------------------------
@@ -1496,6 +1534,42 @@ async def test_assemble_pr_context_docs_missing_tolerated() -> None:
     assert "CLAUDE.md" in ctx.docs
     assert "STYLEGUIDE.md" not in ctx.docs
     assert "README.md" not in ctx.docs
+
+
+@pytest.mark.asyncio
+async def test_assemble_pr_context_skips_bad_doc_instead_of_raising() -> None:
+    """A configured doc that errors (binary, oversize, or non-base64 encoding)
+    is omitted rather than aborting the whole assembly (issue #91). Previously
+    the docs loop re-raised any exception unconditionally."""
+
+    def _get_file_content(
+        *,
+        repo_full_name: str,
+        path: str,
+        ref: str,
+        tolerate_missing: bool = False,
+    ) -> str | None:
+        if path == "STYLEGUIDE.md":
+            raise ValueError("unexpected content encoding 'none' for STYLEGUIDE.md@abc")
+        if path == "CLAUDE.md":
+            return _DOCS["CLAUDE.md"]
+        return None  # README.md, AGENTS.md missing
+
+    mock_client = _make_mock_github_client_with_docs()
+    mock_client.get_file_content = AsyncMock(side_effect=_get_file_content)
+
+    with patch("heimdall.context.GitHubClient", return_value=mock_client):
+        ctx = await assemble_pr_context(
+            app_id=1,
+            private_key="key",
+            installation_id=42,
+            repo_full_name=_REPO,
+            pr_number=_PR_NUMBER,
+        )
+
+    # The bad doc is omitted, not raised; the good doc still comes through.
+    assert "STYLEGUIDE.md" not in ctx.docs
+    assert ctx.docs["CLAUDE.md"] == _DOCS["CLAUDE.md"]
 
 
 @pytest.mark.asyncio
