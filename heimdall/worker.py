@@ -230,59 +230,18 @@ async def run_review(
         installation_id=installation_id,
     )
     try:
-        last_sha = await get_last_reviewed_sha(
-            db, repo_full_name=repo_full_name, pr_number=pr_number
-        )
-        if last_sha == head_sha:
-            logger.info(
-                "Skipping already-reviewed SHA %s for %s#%d",
-                head_sha,
-                repo_full_name,
-                pr_number,
-            )
-            return
-
-        config = await _gate_review(
-            github_client, repo_full_name=repo_full_name, pr_number=pr_number
+        config = await _should_skip_review(
+            db,
+            github_client,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            action=action,
         )
         if config is None:
-            # Opt-in absent, scope filters excluded the PR, or the diff-size cap
-            # fired (which already posted its own note) — skip cleanly, recording
-            # no SHA (a later in-scope push still gets reviewed).
-            return
-
-        if action in _SIGNAL_ACTIONS:
-            # Record activation in BOTH trigger modes (cheap, sticky): a repo that later
-            # flips auto -> on_signal keeps reviewing PRs that were already signaled.
-            await set_pr_activated(db, repo_full_name=repo_full_name, pr_number=pr_number)
-        # Short-circuit order matters: is_pr_activated is consulted ONLY under on_signal
-        # for a non-signal action, so auto mode never touches the activation table.
-        if (
-            config.scope.trigger == "on_signal"
-            and action not in _SIGNAL_ACTIONS
-            and not await is_pr_activated(
-                db, repo_full_name=repo_full_name, pr_number=pr_number
-            )
-        ):
-            logger.info(
-                "Skipping review for %s#%d: trigger=on_signal and no signal yet "
-                "(action=%s)",
-                repo_full_name,
-                pr_number,
-                action,
-            )
-            # No SHA recorded — like the scope skips, so a post-activation delivery
-            # for this same sha still reviews.
-            return
-
-        # Per-repo budget/rate guardrail: too many reviews in the rolling window
-        # means skip this one (no SHA recorded, so a later push can still review).
-        if await _over_rate_budget(db, repo_full_name=repo_full_name, caps=config.caps):
-            logger.info(
-                "Skipping review for %s#%d: per-repo rate/budget exceeded",
-                repo_full_name,
-                pr_number,
-            )
+            # Every guard already logged its own skip reason (idempotency, opt-in/
+            # scope/diff-cap, on_signal gating, or the rate budget) — nothing left
+            # to do but return without recording a SHA.
             return
 
         # Per-installation concurrency guardrail: claim an in-flight slot, and if the
@@ -344,6 +303,81 @@ async def run_review(
             await release_inflight(db, installation_id=installation_id)
     finally:
         await github_client.aclose()
+
+
+async def _should_skip_review(
+    db: Database,
+    github_client: GitHubClient,
+    *,
+    repo_full_name: str,
+    pr_number: int,
+    head_sha: str,
+    action: str,
+) -> RepoConfig | None:
+    """Run run_review's sequential pre-flight guards.
+
+    In order: the idempotency guard (same SHA already reviewed), the opt-in/scope/
+    diff-cap gate (:func:`_gate_review`), the ``on_signal`` activation bookkeeping
+    and short-circuit, and the per-repo rate/budget check.  Each guard logs its own
+    skip reason before returning.  Returns the loaded :class:`RepoConfig` when the
+    review should proceed to the concurrency gate, or None when any guard skips it.
+    """
+    last_sha = await get_last_reviewed_sha(
+        db, repo_full_name=repo_full_name, pr_number=pr_number
+    )
+    if last_sha == head_sha:
+        logger.info(
+            "Skipping already-reviewed SHA %s for %s#%d",
+            head_sha,
+            repo_full_name,
+            pr_number,
+        )
+        return None
+
+    config = await _gate_review(
+        github_client, repo_full_name=repo_full_name, pr_number=pr_number
+    )
+    if config is None:
+        # Opt-in absent, scope filters excluded the PR, or the diff-size cap
+        # fired (which already posted its own note) — skip cleanly, recording
+        # no SHA (a later in-scope push still gets reviewed).
+        return None
+
+    if action in _SIGNAL_ACTIONS:
+        # Record activation in BOTH trigger modes (cheap, sticky): a repo that later
+        # flips auto -> on_signal keeps reviewing PRs that were already signaled.
+        await set_pr_activated(db, repo_full_name=repo_full_name, pr_number=pr_number)
+    # Short-circuit order matters: is_pr_activated is consulted ONLY under on_signal
+    # for a non-signal action, so auto mode never touches the activation table.
+    if (
+        config.scope.trigger == "on_signal"
+        and action not in _SIGNAL_ACTIONS
+        and not await is_pr_activated(
+            db, repo_full_name=repo_full_name, pr_number=pr_number
+        )
+    ):
+        logger.info(
+            "Skipping review for %s#%d: trigger=on_signal and no signal yet "
+            "(action=%s)",
+            repo_full_name,
+            pr_number,
+            action,
+        )
+        # No SHA recorded — like the scope skips, so a post-activation delivery
+        # for this same sha still reviews.
+        return None
+
+    # Per-repo budget/rate guardrail: too many reviews in the rolling window
+    # means skip this one (no SHA recorded, so a later push can still review).
+    if await _over_rate_budget(db, repo_full_name=repo_full_name, caps=config.caps):
+        logger.info(
+            "Skipping review for %s#%d: per-repo rate/budget exceeded",
+            repo_full_name,
+            pr_number,
+        )
+        return None
+
+    return config
 
 
 async def _over_rate_budget(
