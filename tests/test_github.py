@@ -11,6 +11,7 @@ import pytest
 
 from heimdall.github import (
     _MAX_PAGINATION_PAGES,
+    _MAX_READ_ATTEMPTS,
     GitHubClient,
     make_jwt,
     parse_linked_issues_from_body,
@@ -1720,3 +1721,102 @@ async def test_get_file_content_rejects_non_base64_encoding() -> None:
             await client.get_file_content(
                 repo_full_name="owner/repo", path="big.bin", ref="abc123"
             )
+
+
+# ---------------------------------------------------------------------------
+# Timeout + read-path retry (transient network / 5xx resilience)
+# ---------------------------------------------------------------------------
+
+
+def test_owned_http_client_has_explicit_timeout_above_five_seconds() -> None:
+    """The client's own httpx.AsyncClient sets explicit read/write timeouts.
+
+    httpx's bare default (5s connect/read/write/pool) drops a routine slow GitHub
+    response; read/write must be raised well above it so ordinary latency doesn't
+    raise ReadTimeout.
+    """
+    client = GitHubClient(app_id=1, private_key="key", installation_id=42)
+    timeout = client._http.timeout
+    assert timeout.connect == 5.0
+    assert timeout.read is not None and timeout.read >= 30.0
+    assert timeout.write is not None and timeout.write >= 30.0
+
+
+@pytest.mark.asyncio
+async def test_get_pr_retries_transient_transport_failure_then_succeeds() -> None:
+    """A transport that fails transiently then succeeds is retried and the call succeeds.
+
+    Uses a REAL httpx.AsyncClient wired to a MockTransport so the retry loop is
+    exercised against actual httpx call semantics, not a mocked-away retry.
+    """
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] < _MAX_READ_ATTEMPTS:
+            raise httpx.ConnectError("connection reset", request=request)
+        return httpx.Response(200, json={"number": 5, "title": "ok"})
+
+    real_http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ), patch("heimdall.github.asyncio.sleep", new=AsyncMock()):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=real_http
+        )
+        result = await client.get_pr(repo_full_name="owner/repo", pr_number=5)
+    await real_http.aclose()
+
+    assert result["number"] == 5
+    assert call_count["n"] == _MAX_READ_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_get_pr_retries_transient_5xx_then_succeeds() -> None:
+    """A transient 5xx response is retried, distinct from a transport-level failure."""
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"number": 9})
+
+    real_http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ), patch("heimdall.github.asyncio.sleep", new=AsyncMock()):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=real_http
+        )
+        result = await client.get_pr(repo_full_name="owner/repo", pr_number=9)
+    await real_http.aclose()
+
+    assert result["number"] == 9
+    assert call_count["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_pr_persistent_transport_failure_surfaces_after_retry_bound() -> None:
+    """A persistently failing transport still raises once the retry bound is spent."""
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        raise httpx.ConnectError("connection reset", request=request)
+
+    real_http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    with patch.object(
+        GitHubClient, "get_installation_token", new=AsyncMock(return_value="ghs_tok")
+    ), patch("heimdall.github.asyncio.sleep", new=AsyncMock()):
+        client = GitHubClient(
+            app_id=1, private_key="key", installation_id=42, http_client=real_http
+        )
+        with pytest.raises(httpx.ConnectError):
+            await client.get_pr(repo_full_name="owner/repo", pr_number=5)
+    await real_http.aclose()
+
+    assert call_count["n"] == _MAX_READ_ATTEMPTS

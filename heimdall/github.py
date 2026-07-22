@@ -7,9 +7,12 @@ fetching PR metadata, diffs, file lists, and file contents for seed-context asse
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 import re
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -25,6 +28,74 @@ logger = logging.getLogger(__name__)
 # (resource-exhaustion hardening). Hitting it logs a WARNING so the resulting
 # truncation is never silent.
 _MAX_PAGINATION_PAGES = 50
+
+# httpx's bare default (5s connect/read/write/pool) is well under GitHub's routine
+# response latency for a large diff or a paginated fetch, so a plain
+# ``httpx.AsyncClient()`` drops a healthy review to a bare ReadTimeout. Connect stays
+# tight (a dead/unreachable host should fail fast); read/write get real headroom.
+_DEFAULT_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0)
+
+# Bound on read-path HTTP attempts (one initial attempt + up to 2 retries). arq does
+# NOT auto-retry a plain exception raised from a job (only an explicit ``Retry``
+# participates in ``max_tries`` — see heimdall/worker.py), so without a retry HERE a
+# single transient blip fails the whole review job permanently, silently dropping
+# that push's review. Writes (post_review, dismiss_review, minimize_review,
+# delete_review_comment) are deliberately excluded — retrying a non-idempotent POST
+# risks a duplicate side effect (e.g. a review posted twice).
+_MAX_READ_ATTEMPTS = 3
+_RETRY_BASE_DELAY_SECONDS = 0.5
+_RETRYABLE_STATUS_CODES = frozenset({500, 502, 503, 504})
+
+
+async def _retry_read(
+    send: Callable[[], Awaitable[httpx.Response]],
+    *,
+    label: str,
+) -> httpx.Response:
+    """Run one read-path GitHub HTTP call with bounded retry on transient failures.
+
+    Retries a transport-level error (connection reset, ReadTimeout, …) or a 5xx
+    response up to :data:`_MAX_READ_ATTEMPTS` total attempts, with exponential
+    backoff and full jitter between attempts, so routine GitHub latency or a
+    momentary 5xx doesn't drop an otherwise-healthy review. A failure that persists
+    past the bound is returned (a 5xx) or re-raised (a transport error) so the
+    caller's existing error handling (``raise_for_status`` / job-level retry) still
+    applies.
+
+    Args:
+        send: Zero-arg callable issuing one HTTP request attempt.
+        label: Human-readable caller tag for the retry WARNING log.
+
+    Returns:
+        The first response whose status isn't a retryable 5xx, or the final
+        attempt's response once the bound is spent.
+
+    Raises:
+        httpx.TransportError: If every attempt raises a transport-level error.
+    """
+    delay = _RETRY_BASE_DELAY_SECONDS
+    for attempt in range(1, _MAX_READ_ATTEMPTS + 1):
+        last_attempt = attempt == _MAX_READ_ATTEMPTS
+        try:
+            response = await send()
+        except httpx.TransportError:
+            if last_attempt:
+                raise
+        else:
+            if last_attempt or response.status_code not in _RETRYABLE_STATUS_CODES:
+                return response
+        logger.warning(
+            "%s: transient failure on attempt %d/%d; retrying",
+            label,
+            attempt,
+            _MAX_READ_ATTEMPTS,
+        )
+        # Full jitter: uniform(0, delay) rather than a fixed backoff, so concurrent
+        # retries from multiple in-flight reviews don't all retry in lockstep.
+        await asyncio.sleep(delay * random.random())
+        delay *= 2
+    # Unreachable: the final iteration (last_attempt=True) always returns or raises.
+    raise AssertionError("_retry_read: exhausted attempts without returning")
 
 
 def parse_linked_issues_from_body(body: str) -> list[dict[str, Any]]:
@@ -273,7 +344,11 @@ class GitHubClient:
         self._installation_id = installation_id
         # Track ownership so aclose() only closes clients we created, not injected ones.
         self._owns_http = http_client is None
-        self._http = http_client if http_client is not None else httpx.AsyncClient()
+        self._http = (
+            http_client
+            if http_client is not None
+            else httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT)
+        )
         self._cached_token: str | None = None
 
     async def aclose(self) -> None:
@@ -297,13 +372,14 @@ class GitHubClient:
         """Exchange the App JWT for a short-lived installation access token."""
         app_jwt = make_jwt(app_id=self._app_id, private_key=self._private_key)
         url = f"{self._BASE}/app/installations/{self._installation_id}/access_tokens"
-        response = await self._http.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {app_jwt}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
+        headers = {
+            "Authorization": f"Bearer {app_jwt}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        response = await _retry_read(
+            lambda: self._http.post(url, headers=headers),
+            label="get_installation_token",
         )
         response.raise_for_status()
         token: str = response.json()["token"]
@@ -498,7 +574,11 @@ class GitHubClient:
             Parsed JSON of the PR object from the GitHub REST API.
         """
         url = f"{self._BASE}/repos/{repo_full_name}/pulls/{pr_number}"
-        response = await self._http.get(url, headers=await self._gh_headers())
+        headers = await self._gh_headers()
+        response = await _retry_read(
+            lambda: self._http.get(url, headers=headers),
+            label=f"get_pr for {repo_full_name}#{pr_number}",
+        )
         response.raise_for_status()
         result: dict[str, Any] = response.json()
         return result
@@ -522,7 +602,10 @@ class GitHubClient:
         headers = await self._gh_headers()
         # Request diff media type to get the raw unified diff
         headers["Accept"] = "application/vnd.github.diff"
-        response = await self._http.get(url, headers=headers)
+        response = await _retry_read(
+            lambda: self._http.get(url, headers=headers),
+            label=f"get_pr_diff for {repo_full_name}#{pr_number}",
+        )
         response.raise_for_status()
         return response.text
 
@@ -585,7 +668,14 @@ class GitHubClient:
             if first_page:
                 kwargs["params"] = {"per_page": 100}
                 first_page = False
-            response = await self._http.get(next_url, **kwargs)
+            page_url = next_url
+
+            async def send(
+                page_url: str = page_url, kwargs: dict[str, Any] = kwargs
+            ) -> httpx.Response:
+                return await self._http.get(page_url, **kwargs)
+
+            response = await _retry_read(send, label=label)
             response.raise_for_status()
             items.extend(response.json())
             next_url = self._next_page_url(response.headers.get("link", ""))
@@ -805,18 +895,26 @@ class GitHubClient:
         page_count = 0
         try:
             while True:
-                response = await self._http.post(
-                    f"{self._BASE}/graphql",
-                    headers=await self._gh_headers(),
-                    json={
-                        "query": query,
-                        "variables": {
-                            "owner": owner,
-                            "name": name,
-                            "number": pr_number,
-                            "after": after,
-                        },
-                    },
+                headers = await self._gh_headers()
+                variables = {
+                    "owner": owner,
+                    "name": name,
+                    "number": pr_number,
+                    "after": after,
+                }
+                async def send(
+                    headers: dict[str, str] = headers,
+                    variables: dict[str, Any] = variables,
+                ) -> httpx.Response:
+                    return await self._http.post(
+                        f"{self._BASE}/graphql",
+                        headers=headers,
+                        json={"query": query, "variables": variables},
+                    )
+
+                response = await _retry_read(
+                    send,
+                    label=f"get_review_thread_resolutions for {repo_full_name}#{pr_number}",
                 )
                 response.raise_for_status()
                 payload: dict[str, Any] = response.json()
