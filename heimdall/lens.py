@@ -78,6 +78,8 @@ DEFAULT_OUTPUT_BYTE_CAP = 50_000_000
 _STREAM_READ_CHUNK_BYTES = 65_536
 # How much of a failed claude run's stderr to keep in the diagnostic log line.
 _STDERR_LOG_TAIL_CHARS = 2_000
+# How much of an un-parseable lens stdout to keep when logging why parsing failed.
+_UNPARSEABLE_LOG_TAIL_CHARS = 2_000
 
 
 class Severity(Enum):
@@ -285,7 +287,9 @@ _SECURITY_SYSTEM_PROMPT = (
     "Do not modify anything. Report findings as a single "
     'JSON object on its own line: {"findings": [{"severity": "critical|high|medium|low", '
     '"title": "...", "message": "...", "location": "path:line"}]}. '
-    "Emit an empty findings list when the PR introduces no security concern."
+    "Your final message must be ONLY that JSON object — no preamble, no explanation, and "
+    "no markdown fence — and keep each finding's message concise so the JSON is never "
+    "truncated. Emit an empty findings list when the PR introduces no security concern."
 )
 
 SECURITY_LENS = LensSpec(
@@ -298,8 +302,10 @@ SECURITY_LENS = LensSpec(
 _FINDINGS_JSON_CONTRACT = (
     'Report findings as a single JSON object on its own line: {"findings": '
     '[{"severity": "critical|high|medium|low", "title": "...", "message": "...", '
-    '"location": "path:line"}]}. Emit an empty findings list when the PR is clean '
-    "through your lens."
+    '"location": "path:line"}]}. Your final message must be ONLY that JSON object — no '
+    "preamble, no explanation, and no markdown fence — and keep each finding's message "
+    "concise so the JSON is never truncated. Emit an empty findings list when the PR is "
+    "clean through your lens."
 )
 
 _DESIGN_SYSTEM_PROMPT = (
@@ -527,15 +533,25 @@ def _coerce_severity(value: object) -> Severity:
     return Severity.LOW
 
 
-def _extract_findings_json(text: str) -> dict[str, object] | None:
-    """Return the first ``{...}`` object in ``text`` that parses to a findings dict.
+# Keys that mark a decoded object as a finding (rather than some unrelated JSON
+# object): used to accept a bare findings array — an envelope-less ``[{...}]`` — without
+# mistaking an arbitrary array elsewhere in the output for the findings.
+_FINDING_MARKER_KEYS = frozenset({"severity", "title", "message", "location"})
 
-    Claude may wrap the findings JSON in prose, so we scan for opening braces and
-    try to decode each candidate.  Returns None when no findings object exists.
+
+def _looks_like_finding(obj: object) -> bool:
+    """True when a decoded value is a dict carrying at least one finding field."""
+    return isinstance(obj, dict) and any(k in obj for k in _FINDING_MARKER_KEYS)
+
+
+def _complete_findings_envelope(text: str) -> dict[str, object] | None:
+    """Return the first complete ``{...}`` object carrying a ``findings`` key.
+
+    Scans for opening braces and decodes each candidate, tolerating prose (or a
+    markdown fence) around the JSON.  Returns None when no complete envelope exists.
     """
     decoder = json.JSONDecoder()
-    index = 0
-    length = len(text)
+    index, length = 0, len(text)
     while index < length:
         brace = text.find("{", index)
         if brace == -1:
@@ -549,6 +565,92 @@ def _extract_findings_json(text: str) -> dict[str, object] | None:
             return obj
         index = brace + 1
     return None
+
+
+def _complete_bare_findings_array(text: str) -> dict[str, object] | None:
+    """Return a ``{"findings": [...]}`` envelope for a complete bare findings array.
+
+    Some runs emit the findings as a top-level JSON array with the ``{"findings": ...}``
+    wrapper omitted.  Scans for opening brackets, decodes each candidate, and accepts
+    the first list that holds at least one finding-shaped object (so an unrelated array
+    is not mistaken for findings).  Returns None when none is present.
+    """
+    decoder = json.JSONDecoder()
+    index, length = 0, len(text)
+    while index < length:
+        bracket = text.find("[", index)
+        if bracket == -1:
+            return None
+        try:
+            obj, _ = decoder.raw_decode(text, bracket)
+        except json.JSONDecodeError:
+            index = bracket + 1
+            continue
+        if isinstance(obj, list) and any(_looks_like_finding(item) for item in obj):
+            return {"findings": obj}
+        index = bracket + 1
+    return None
+
+
+def _salvage_finding_objects(text: str, start: int) -> list[object]:
+    """Decode as many complete ``{...}`` objects as possible from an array body.
+
+    Scans from ``start`` (just past an opening ``[``), decoding successive objects until
+    the array closes (``]``), the input ends, or a decode fails at a truncation point —
+    returning every complete object recovered before the cut.  This is what rescues a
+    findings array whose output was truncated mid-object (the sonnet design/cleanliness
+    lenses routinely hit their max output length, dropping the whole lens otherwise).
+    """
+    decoder = json.JSONDecoder()
+    items: list[object] = []
+    i, n = start, len(text)
+    while i < n:
+        while i < n and text[i] in " \t\r\n,":
+            i += 1
+        if i >= n or text[i] != "{":
+            break  # array closed (]), input ended, or truncated mid-token
+        try:
+            obj, i = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            break  # truncation point — keep what was already recovered
+        items.append(obj)
+    return items
+
+
+def _salvaged_findings_envelope(text: str) -> dict[str, object] | None:
+    """Salvage complete findings from a truncated envelope or bare array.
+
+    Prefers the array that follows a ``"findings"`` key (the truncated-envelope case);
+    falls back to the first ``[`` in the text (a truncated bare array).  Returns an
+    envelope only when at least one complete, finding-shaped object survives, so a run
+    cut off before any finding completed stays a loud failure rather than a false clean
+    review.
+    """
+    key = text.find('"findings"')
+    bracket = text.find("[", key) if key != -1 else -1
+    if bracket == -1:
+        bracket = text.find("[")
+    if bracket == -1:
+        return None
+    salvaged = [item for item in _salvage_finding_objects(text, bracket + 1)
+                if _looks_like_finding(item)]
+    return {"findings": salvaged} if salvaged else None
+
+
+def _extract_findings_json(text: str) -> dict[str, object] | None:
+    """Return a findings envelope from ``text``, tolerating prose and truncation.
+
+    Three passes, strictest first: (1) the first complete ``{...}`` object carrying a
+    ``findings`` key (prose or a markdown fence around it is fine); (2) a complete bare
+    findings array with the envelope omitted; (3) salvage — when the output was cut off
+    mid-array, recover every complete finding emitted before the truncation point.
+    Returns None only when nothing usable is present (still a loud failure upstream).
+    """
+    return (
+        _complete_findings_envelope(text)
+        or _complete_bare_findings_array(text)
+        or _salvaged_findings_envelope(text)
+    )
 
 
 def _finding_from_raw(item: dict[str, object]) -> Finding:
@@ -603,6 +705,16 @@ def _require_lens_output(
         )
     obj = _extract_findings_json(stdout)
     if obj is None:
+        # Log a bounded tail of the offending stdout: this failure has tokens > 0 and a
+        # zero exit, so run_claude_subprocess logs nothing, and the raw output is
+        # otherwise unrecoverable — leaving a recurring drop undiagnosable (#106).
+        tail = stdout.strip()[-_UNPARSEABLE_LOG_TAIL_CHARS:] if stdout.strip() else "<empty>"
+        logger.warning(
+            "%s produced no parseable findings JSON (%d chars); stdout tail: %s",
+            label,
+            len(stdout),
+            tail,
+        )
         raise LensOutputError(
             f"{label} produced no parseable findings JSON; treating as a failed run, "
             "not a clean review"
